@@ -514,6 +514,8 @@ pub(crate) struct ChatWidget {
     current_rollout_path: Option<PathBuf>,
     external_editor_state: ExternalEditorState,
     rawr_auto_compaction_state: RawrAutoCompactionState,
+    rawr_saw_commit_this_turn: bool,
+    rawr_saw_plan_checkpoint_this_turn: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,6 +542,160 @@ enum RawrAutoCompactionMode {
 enum RawrAutoCompactionPacketAuthor {
     Watcher,
     Agent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawrAutoCompactionBoundary {
+    Commit,
+    PlanCheckpoint,
+    AgentDone,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[derive(Default)]
+struct RawrAutoCompactionPromptFrontmatter {
+    version: Option<u32>,
+    trigger: RawrAutoCompactionTriggerRules,
+    packet: RawrAutoCompactionPacketRules,
+}
+
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawrAutoCompactionTriggerRules {
+    percent_remaining_lt: i64,
+    emergency_percent_remaining_lt: i64,
+    auto_requires_any_boundary: Vec<RawrAutoCompactionBoundary>,
+}
+
+impl Default for RawrAutoCompactionTriggerRules {
+    fn default() -> Self {
+        Self {
+            percent_remaining_lt: 75,
+            emergency_percent_remaining_lt: 15,
+            auto_requires_any_boundary: vec![
+                RawrAutoCompactionBoundary::Commit,
+                RawrAutoCompactionBoundary::PlanCheckpoint,
+                RawrAutoCompactionBoundary::AgentDone,
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawrAutoCompactionPacketRules {
+    max_tail_chars: usize,
+}
+
+impl Default for RawrAutoCompactionPacketRules {
+    fn default() -> Self {
+        Self {
+            max_tail_chars: 1200,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RawrAutoCompactionSettings {
+    mode: RawrAutoCompactionMode,
+    packet_author: RawrAutoCompactionPacketAuthor,
+    prompt_frontmatter: RawrAutoCompactionPromptFrontmatter,
+    agent_packet_prompt: String,
+}
+
+impl RawrAutoCompactionSettings {
+    fn default_with_mode(
+        mode: RawrAutoCompactionMode,
+        packet_author: RawrAutoCompactionPacketAuthor,
+    ) -> Self {
+        let prompt_frontmatter = RawrAutoCompactionPromptFrontmatter::default();
+        Self {
+            mode,
+            packet_author,
+            prompt_frontmatter,
+            agent_packet_prompt: default_rawr_agent_packet_prompt(),
+        }
+    }
+}
+
+fn default_rawr_agent_packet_prompt() -> String {
+    [
+        "[rawr] Before we compact this thread, produce a **continuation context packet** for yourself.",
+        "",
+        "Requirements:",
+        "- Keep it short and structured.",
+        "- Include: overarching goal, current state, next steps, invariants/decisions, and a final directive to continue after compaction.",
+        "- Do not include secrets; redact tokens/keys.",
+    ]
+    .join("\n")
+}
+
+fn rawr_command_looks_like_git_commit(command: &[String]) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+
+    let joined = command.join(" ").to_ascii_lowercase();
+    if joined.contains("git commit") {
+        return true;
+    }
+
+    fn basename(s: &str) -> &str {
+        std::path::Path::new(s)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or(s)
+    }
+
+    command
+        .windows(2)
+        .any(|pair| basename(pair[0].as_str()) == "git" && pair[1].eq_ignore_ascii_case("commit"))
+}
+
+fn rawr_agent_message_looks_done(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    if lower.contains("not done")
+        || lower.contains("not completed")
+        || lower.contains("not finished")
+    {
+        return false;
+    }
+    ["done", "completed", "finished", "shipped", "pushed"]
+        .into_iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn split_yaml_frontmatter(contents: &str) -> (Option<&str>, &str) {
+    let mut iter = contents.split_inclusive('\n');
+    let Some(first_line) = iter.next() else {
+        return (None, contents);
+    };
+    if first_line.trim_end_matches(['\r', '\n']) != "---" {
+        return (None, contents);
+    }
+
+    let frontmatter_start = first_line.len();
+    let mut cursor = frontmatter_start;
+
+    for piece in iter {
+        let piece_start = cursor;
+        let line = piece.trim_end_matches(['\r', '\n']);
+        if line == "---" {
+            let frontmatter = &contents[frontmatter_start..piece_start];
+            let body_start = piece_start.saturating_add(piece.len());
+            let body = contents.get(body_start..).unwrap_or("");
+            return (Some(frontmatter), body);
+        }
+        cursor = cursor.saturating_add(piece.len());
+    }
+
+    (None, contents)
 }
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
@@ -888,6 +1044,8 @@ impl ChatWidget {
     fn on_task_started(&mut self) {
         self.agent_turn_running = true;
         self.saw_plan_update_this_turn = false;
+        self.rawr_saw_commit_this_turn = false;
+        self.rawr_saw_plan_checkpoint_this_turn = false;
         self.bottom_pane.clear_quit_shortcut_hint();
         self.quit_shortcut_expires_at = None;
         self.quit_shortcut_key = None;
@@ -956,6 +1114,15 @@ impl ChatWidget {
     }
 
     fn maybe_rawr_auto_compact(&mut self, last_agent_message: Option<&str>) {
+        let settings = self.rawr_load_auto_compaction_settings();
+        self.maybe_rawr_auto_compact_with_settings(last_agent_message, settings);
+    }
+
+    fn maybe_rawr_auto_compact_with_settings(
+        &mut self,
+        last_agent_message: Option<&str>,
+        settings: RawrAutoCompactionSettings,
+    ) {
         if !self.config.features.enabled(Feature::RawrAutoCompaction) {
             return;
         }
@@ -989,8 +1156,8 @@ impl ChatWidget {
             }
             RawrAutoCompactionState::Compacting {
                 packet,
-                trigger_percent_remaining: _,
                 saw_context_compacted,
+                ..
             } => {
                 if saw_context_compacted {
                     self.rawr_inject_post_compact_packet(packet);
@@ -1013,15 +1180,37 @@ impl ChatWidget {
             return;
         };
 
-        const TRIGGER_PERCENT_REMAINING: i64 = 75;
-        if percent_remaining >= TRIGGER_PERCENT_REMAINING {
+        let trigger_percent_remaining = settings.prompt_frontmatter.trigger.percent_remaining_lt;
+        if percent_remaining >= trigger_percent_remaining {
             return;
         }
 
-        let mode = self.rawr_auto_compaction_mode();
-        let author = self.rawr_auto_compaction_packet_author();
+        let agent_done = last_agent_message.is_some_and(rawr_agent_message_looks_done);
+        let has_any_required_boundary = settings
+            .prompt_frontmatter
+            .trigger
+            .auto_requires_any_boundary
+            .is_empty()
+            || settings
+                .prompt_frontmatter
+                .trigger
+                .auto_requires_any_boundary
+                .iter()
+                .any(|boundary| match boundary {
+                    RawrAutoCompactionBoundary::Commit => self.rawr_saw_commit_this_turn,
+                    RawrAutoCompactionBoundary::PlanCheckpoint => {
+                        self.rawr_saw_plan_checkpoint_this_turn
+                    }
+                    RawrAutoCompactionBoundary::AgentDone => agent_done,
+                });
 
-        match mode {
+        let emergency_percent_remaining = settings
+            .prompt_frontmatter
+            .trigger
+            .emergency_percent_remaining_lt;
+        let is_emergency = percent_remaining < emergency_percent_remaining;
+
+        match settings.mode {
             RawrAutoCompactionMode::Tag => {
                 self.add_info_message(
                     format!(
@@ -1038,24 +1227,42 @@ impl ChatWidget {
                     None,
                 );
             }
-            RawrAutoCompactionMode::Auto => match author {
-                RawrAutoCompactionPacketAuthor::Watcher => {
-                    let packet =
-                        self.rawr_build_post_compact_packet(percent_remaining, last_agent_message);
-                    self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
-                        packet,
-                        trigger_percent_remaining: percent_remaining,
-                        saw_context_compacted: false,
-                    };
-                    self.rawr_trigger_compact();
+            RawrAutoCompactionMode::Auto => {
+                if !is_emergency && !has_any_required_boundary {
+                    self.add_info_message(
+                        format!(
+                            "[rawr] auto-compaction watcher: skipping auto compact (no natural boundary). Context window: {percent_remaining}% left. Run `/compact` or edit prompts to adjust boundary gating."
+                        ),
+                        None,
+                    );
+                    return;
                 }
-                RawrAutoCompactionPacketAuthor::Agent => {
-                    self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingPacket {
-                        trigger_percent_remaining: percent_remaining,
-                    };
-                    self.rawr_request_packet_from_agent();
+
+                match settings.packet_author {
+                    RawrAutoCompactionPacketAuthor::Watcher => {
+                        let packet = self.rawr_build_post_compact_packet(
+                            percent_remaining,
+                            last_agent_message,
+                            settings.prompt_frontmatter.packet.max_tail_chars,
+                            self.rawr_saw_commit_this_turn,
+                            self.rawr_saw_plan_checkpoint_this_turn,
+                            agent_done,
+                        );
+                        self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                            packet,
+                            trigger_percent_remaining: percent_remaining,
+                            saw_context_compacted: false,
+                        };
+                        self.rawr_trigger_compact();
+                    }
+                    RawrAutoCompactionPacketAuthor::Agent => {
+                        self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingPacket {
+                            trigger_percent_remaining: percent_remaining,
+                        };
+                        self.rawr_request_packet_from_agent(settings.agent_packet_prompt);
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -1125,16 +1332,7 @@ impl ChatWidget {
         self.add_to_history(history_cell::new_user_prompt(text, Vec::new(), Vec::new()));
     }
 
-    fn rawr_request_packet_from_agent(&mut self) {
-        let prompt = [
-            "[rawr] Before we compact this thread, produce a **continuation context packet** for yourself.",
-            "",
-            "Requirements:",
-            "- Keep it short and structured.",
-            "- Include: overarching goal, current state, next steps, invariants/decisions, and a final directive to continue after compaction.",
-            "- Do not include secrets; redact tokens/keys.",
-        ]
-        .join("\n");
+    fn rawr_request_packet_from_agent(&mut self, prompt: String) {
         self.rawr_submit_injected_user_turn(prompt);
     }
 
@@ -1142,11 +1340,14 @@ impl ChatWidget {
         &self,
         trigger_percent_remaining: i64,
         last_agent_message: Option<&str>,
+        max_tail_chars: usize,
+        saw_commit: bool,
+        saw_plan_checkpoint: bool,
+        agent_done: bool,
     ) -> String {
         let mut tail = last_agent_message.unwrap_or("").trim().to_string();
-        const MAX_TAIL_CHARS: usize = 1200;
-        if tail.len() > MAX_TAIL_CHARS {
-            tail.truncate(MAX_TAIL_CHARS);
+        if tail.len() > max_tail_chars {
+            tail.truncate(max_tail_chars);
             tail.push('…');
         }
 
@@ -1159,6 +1360,9 @@ impl ChatWidget {
         lines.push("Why compaction happened".to_string());
         lines.push(format!(
             "- Triggered by rawr auto-compaction watcher at {trigger_percent_remaining}% context remaining."
+        ));
+        lines.push(format!(
+            "- Natural boundary signals: commit={saw_commit}, plan_checkpoint={saw_plan_checkpoint}, agent_done={agent_done}"
         ));
         lines.push(String::new());
         lines.push("Last agent output (memory trigger)".to_string());
@@ -1174,6 +1378,43 @@ impl ChatWidget {
         );
 
         lines.join("\n")
+    }
+
+    fn rawr_load_auto_compaction_settings(&self) -> RawrAutoCompactionSettings {
+        let mode = self.rawr_auto_compaction_mode();
+        let packet_author = self.rawr_auto_compaction_packet_author();
+        let mut settings = RawrAutoCompactionSettings::default_with_mode(mode, packet_author);
+
+        let prompt_path = self
+            .config
+            .codex_home
+            .join("prompts")
+            .join("rawr-auto-compact.md");
+        let Ok(contents) = std::fs::read_to_string(&prompt_path) else {
+            return settings;
+        };
+
+        let (frontmatter_str, body) = split_yaml_frontmatter(&contents);
+        if let Some(frontmatter_str) = frontmatter_str {
+            match serde_yaml::from_str::<RawrAutoCompactionPromptFrontmatter>(frontmatter_str) {
+                Ok(frontmatter) => {
+                    settings.prompt_frontmatter = frontmatter;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to parse rawr auto-compaction prompt frontmatter at {}: {err}",
+                        prompt_path.display()
+                    );
+                }
+            }
+        }
+
+        let body_prompt = body.trim();
+        if !body_prompt.is_empty() {
+            settings.agent_packet_prompt = body_prompt.to_string();
+        }
+
+        settings
     }
 
     fn maybe_prompt_plan_implementation(&mut self, last_agent_message: Option<&str>) {
@@ -1548,6 +1789,13 @@ impl ChatWidget {
 
     fn on_plan_update(&mut self, update: UpdatePlanArgs) {
         self.saw_plan_update_this_turn = true;
+        self.rawr_saw_plan_checkpoint_this_turn = self.rawr_saw_plan_checkpoint_this_turn
+            || update.plan.iter().any(|item| {
+                matches!(
+                    item.status,
+                    codex_protocol::plan_tool::StepStatus::Completed
+                )
+            });
         self.add_to_history(history_cell::new_plan_update(update));
     }
 
@@ -1949,6 +2197,10 @@ impl ChatWidget {
         let is_unified_exec_interaction =
             matches!(source, ExecCommandSource::UnifiedExecInteraction);
 
+        if ev.exit_code == 0 && rawr_command_looks_like_git_commit(&command) {
+            self.rawr_saw_commit_this_turn = true;
+        }
+
         let needs_new = self
             .active_cell
             .as_ref()
@@ -2291,6 +2543,8 @@ impl ChatWidget {
             current_rollout_path: None,
             external_editor_state: ExternalEditorState::Closed,
             rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
+            rawr_saw_commit_this_turn: false,
+            rawr_saw_plan_checkpoint_this_turn: false,
         };
 
         widget.prefetch_rate_limits();
@@ -2416,6 +2670,8 @@ impl ChatWidget {
             current_rollout_path: None,
             external_editor_state: ExternalEditorState::Closed,
             rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
+            rawr_saw_commit_this_turn: false,
+            rawr_saw_plan_checkpoint_this_turn: false,
         };
 
         widget.prefetch_rate_limits();
@@ -2542,6 +2798,8 @@ impl ChatWidget {
             current_rollout_path: None,
             external_editor_state: ExternalEditorState::Closed,
             rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
+            rawr_saw_commit_this_turn: false,
+            rawr_saw_plan_checkpoint_this_turn: false,
         };
 
         widget.prefetch_rate_limits();

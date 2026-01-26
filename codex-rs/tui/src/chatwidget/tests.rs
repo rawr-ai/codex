@@ -895,6 +895,7 @@ async fn make_chatwidget_manual(
         feedback_audience: FeedbackAudience::External,
         current_rollout_path: None,
         external_editor_state: ExternalEditorState::Closed,
+        rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)

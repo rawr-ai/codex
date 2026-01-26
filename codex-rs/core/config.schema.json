@@ -196,6 +196,9 @@
             "powershell_utf8": {
               "type": "boolean"
             },
+            "rawr_auto_compaction": {
+              "type": "boolean"
+            },
             "remote_compaction": {
               "type": "boolean"
             },
@@ -1100,7 +1103,7 @@
       ]
     }
   },
-  "description": "Base config deserialized from ~/.codex/config.toml.",
+  "description": "Base config deserialized from ~/.codex-rawr/config.toml.",
   "properties": {
     "agents": {
       "allOf": [
@@ -1218,6 +1221,9 @@
         "powershell_utf8": {
           "type": "boolean"
         },
+        "rawr_auto_compaction": {
+          "type": "boolean"
+        },
         "remote_compaction": {
           "type": "boolean"
         },
@@ -1322,7 +1328,7 @@
         }
       ],
       "default": null,
-      "description": "Settings that govern if and what will be written to `~/.codex/history.jsonl`."
+      "description": "Settings that govern if and what will be written to `~/.codex-rawr/history.jsonl`."
     },
     "instructions": {
       "description": "System instructions.",

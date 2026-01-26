@@ -129,6 +129,9 @@ pub enum Feature {
     Personality,
     /// Use the Responses API WebSocket transport for OpenAI by default.
     ResponsesWebsockets,
+
+    /// rawr-ai fork: enable in-TUI auto-compaction watcher (feature-flagged).
+    RawrAutoCompaction,
 }
 
 impl Feature {
@@ -579,6 +582,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::ResponsesWebsockets,
         key: "responses_websockets",
         stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::RawrAutoCompaction,
+        key: "rawr_auto_compaction",
+        stage: Stage::Beta,
         default_enabled: false,
     },
 ];

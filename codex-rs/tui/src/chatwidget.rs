@@ -609,6 +609,33 @@ pub(crate) struct ChatWidget {
     // True once we've attempted a branch lookup for the current CWD.
     status_line_branch_lookup_complete: bool,
     external_editor_state: ExternalEditorState,
+    rawr_auto_compaction_state: RawrAutoCompactionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RawrAutoCompactionState {
+    Idle,
+    AwaitingPacket {
+        trigger_percent_remaining: i64,
+    },
+    Compacting {
+        packet: String,
+        trigger_percent_remaining: i64,
+        saw_context_compacted: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawrAutoCompactionMode {
+    Tag,
+    Suggest,
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawrAutoCompactionPacketAuthor {
+    Watcher,
+    Agent,
 }
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
@@ -1304,12 +1331,16 @@ impl ChatWidget {
         self.request_redraw();
 
         if !from_replay && self.queued_user_messages.is_empty() {
-            self.maybe_prompt_plan_implementation();
+            self.maybe_prompt_plan_implementation(last_agent_message.as_deref());
         }
         // Keep this flag for replayed completion events so a subsequent live TurnComplete can
         // still show the prompt once after thread switch replay.
         if !from_replay {
+            self.saw_plan_update_this_turn = false;
             self.saw_plan_item_this_turn = false;
+        }
+        if !from_replay {
+            self.maybe_rawr_auto_compact(last_agent_message.as_deref());
         }
         // If there is a queued user message, send exactly one now to begin the next turn.
         self.maybe_send_next_queued_input();
@@ -1321,7 +1352,253 @@ impl ChatWidget {
         self.maybe_show_pending_rate_limit_prompt();
     }
 
-    fn maybe_prompt_plan_implementation(&mut self) {
+    fn rawr_auto_compaction_mode(&self) -> RawrAutoCompactionMode {
+        match std::env::var("RAWR_AUTO_COMPACTION_MODE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "auto" => RawrAutoCompactionMode::Auto,
+            "tag" => RawrAutoCompactionMode::Tag,
+            _ => RawrAutoCompactionMode::Suggest,
+        }
+    }
+
+    fn rawr_auto_compaction_packet_author(&self) -> RawrAutoCompactionPacketAuthor {
+        match std::env::var("RAWR_AUTO_COMPACTION_PACKET_AUTHOR")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "agent" => RawrAutoCompactionPacketAuthor::Agent,
+            _ => RawrAutoCompactionPacketAuthor::Watcher,
+        }
+    }
+
+    fn maybe_rawr_auto_compact(&mut self, last_agent_message: Option<&str>) {
+        if !self.config.features.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+        if self.bottom_pane.is_task_running() || self.agent_turn_running {
+            return;
+        }
+        if !self.queued_user_messages.is_empty() || self.is_review_mode {
+            return;
+        }
+
+        match std::mem::replace(
+            &mut self.rawr_auto_compaction_state,
+            RawrAutoCompactionState::Idle,
+        ) {
+            RawrAutoCompactionState::Idle => {
+                self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+            }
+            RawrAutoCompactionState::AwaitingPacket {
+                trigger_percent_remaining,
+            } => {
+                let packet = last_agent_message
+                    .unwrap_or("Continue the remaining work after compaction.")
+                    .to_string();
+                self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                    packet,
+                    trigger_percent_remaining,
+                    saw_context_compacted: false,
+                };
+                self.rawr_trigger_compact();
+                return;
+            }
+            RawrAutoCompactionState::Compacting {
+                packet,
+                trigger_percent_remaining: _,
+                saw_context_compacted,
+            } => {
+                if saw_context_compacted {
+                    self.rawr_inject_post_compact_packet(packet);
+                } else {
+                    self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+                    self.add_info_message(
+                        "[rawr] auto-compaction watcher: compaction did not complete; skipping post-compact injection."
+                            .to_string(),
+                        None,
+                    );
+                }
+                return;
+            }
+        }
+
+        let Some(info) = self.token_info.as_ref() else {
+            return;
+        };
+        let Some(percent_remaining) = self.context_remaining_percent(info) else {
+            return;
+        };
+
+        const TRIGGER_PERCENT_REMAINING: i64 = 75;
+        if percent_remaining >= TRIGGER_PERCENT_REMAINING {
+            return;
+        }
+
+        let mode = self.rawr_auto_compaction_mode();
+        let author = self.rawr_auto_compaction_packet_author();
+
+        match mode {
+            RawrAutoCompactionMode::Tag => {
+                self.add_info_message(
+                    format!(
+                        "[rawr] auto-compaction watcher: would compact now (tag). Context window: {percent_remaining}% left."
+                    ),
+                    None,
+                );
+            }
+            RawrAutoCompactionMode::Suggest => {
+                self.add_info_message(
+                    format!(
+                        "[rawr] auto-compaction watcher: recommend compact now (suggest). Context window: {percent_remaining}% left. Run `/compact` to proceed, or set `RAWR_AUTO_COMPACTION_MODE=auto` for automatic compaction."
+                    ),
+                    None,
+                );
+            }
+            RawrAutoCompactionMode::Auto => match author {
+                RawrAutoCompactionPacketAuthor::Watcher => {
+                    let packet =
+                        self.rawr_build_post_compact_packet(percent_remaining, last_agent_message);
+                    self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                        packet,
+                        trigger_percent_remaining: percent_remaining,
+                        saw_context_compacted: false,
+                    };
+                    self.rawr_trigger_compact();
+                }
+                RawrAutoCompactionPacketAuthor::Agent => {
+                    self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingPacket {
+                        trigger_percent_remaining: percent_remaining,
+                    };
+                    self.rawr_request_packet_from_agent();
+                }
+            },
+        }
+    }
+
+    fn rawr_trigger_compact(&mut self) {
+        self.clear_token_usage();
+        self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
+    }
+
+    fn rawr_on_context_compacted(&mut self) {
+        if !self.config.features.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+        if let RawrAutoCompactionState::Compacting {
+            packet,
+            trigger_percent_remaining,
+            ..
+        } = &self.rawr_auto_compaction_state
+        {
+            self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                packet: packet.clone(),
+                trigger_percent_remaining: *trigger_percent_remaining,
+                saw_context_compacted: true,
+            };
+        }
+    }
+
+    fn rawr_inject_post_compact_packet(&mut self, packet: String) {
+        self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+        self.rawr_submit_injected_user_turn(packet);
+    }
+
+    fn rawr_submit_injected_user_turn(&mut self, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+
+        let items = vec![UserInput::Text {
+            text: text.clone(),
+            text_elements: Vec::new(),
+        }];
+
+        let effective_mode = self.effective_collaboration_mode();
+        let collaboration_mode = if self.collaboration_modes_enabled() {
+            self.active_collaboration_mask
+                .as_ref()
+                .map(|_| effective_mode.clone())
+        } else {
+            None
+        };
+        let op = Op::UserTurn {
+            items,
+            cwd: self.config.cwd.clone(),
+            approval_policy: self.config.approval_policy.value(),
+            sandbox_policy: self.config.sandbox_policy.get().clone(),
+            model: effective_mode.model().to_string(),
+            effort: effective_mode.reasoning_effort(),
+            summary: self.config.model_reasoning_summary,
+            final_output_json_schema: None,
+            collaboration_mode,
+            personality: None,
+        };
+
+        self.codex_op_tx.send(op).unwrap_or_else(|e| {
+            tracing::error!("failed to send injected message: {e}");
+        });
+
+        self.add_to_history(history_cell::new_user_prompt(text, Vec::new(), Vec::new()));
+    }
+
+    fn rawr_request_packet_from_agent(&mut self) {
+        let prompt = [
+            "[rawr] Before we compact this thread, produce a **continuation context packet** for yourself.",
+            "",
+            "Requirements:",
+            "- Keep it short and structured.",
+            "- Include: overarching goal, current state, next steps, invariants/decisions, and a final directive to continue after compaction.",
+            "- Do not include secrets; redact tokens/keys.",
+        ]
+        .join("\n");
+        self.rawr_submit_injected_user_turn(prompt);
+    }
+
+    fn rawr_build_post_compact_packet(
+        &self,
+        trigger_percent_remaining: i64,
+        last_agent_message: Option<&str>,
+    ) -> String {
+        let mut tail = last_agent_message.unwrap_or("").trim().to_string();
+        const MAX_TAIL_CHARS: usize = 1200;
+        if tail.len() > MAX_TAIL_CHARS {
+            tail.truncate(MAX_TAIL_CHARS);
+            tail.push('…');
+        }
+
+        let mut lines = Vec::new();
+        lines.push("**Continuation context packet (post-compaction injection)**".to_string());
+        lines.push(String::new());
+        lines.push("Overarching goal".to_string());
+        lines.push("- Continue the work you were doing immediately before compaction.".to_string());
+        lines.push(String::new());
+        lines.push("Why compaction happened".to_string());
+        lines.push(format!(
+            "- Triggered by rawr auto-compaction watcher at {trigger_percent_remaining}% context remaining."
+        ));
+        lines.push(String::new());
+        lines.push("Last agent output (memory trigger)".to_string());
+        lines.push(if tail.is_empty() {
+            "- (none)".to_string()
+        } else {
+            format!("- {tail}")
+        });
+        lines.push(String::new());
+        lines.push("Directive".to_string());
+        lines.push(
+            "- Continue with the remaining work now; do not restart from scratch.".to_string(),
+        );
+
+        lines.join("\n")
+    }
+
+    fn maybe_prompt_plan_implementation(&mut self, last_agent_message: Option<&str>) {
         if !self.collaboration_modes_enabled() {
             return;
         }
@@ -1331,7 +1608,8 @@ impl ChatWidget {
         if self.active_mode_kind() != ModeKind::Plan {
             return;
         }
-        if !self.saw_plan_item_this_turn {
+        let has_message = last_agent_message.is_some_and(|message| !message.trim().is_empty());
+        if !has_message && !self.saw_plan_update_this_turn {
             return;
         }
         if !self.bottom_pane.no_modal_or_popup_active() {
@@ -1349,8 +1627,8 @@ impl ChatWidget {
     }
 
     fn open_plan_implementation_prompt(&mut self) {
-        let default_mask = collaboration_modes::default_mode_mask(self.models_manager.as_ref());
-        let (implement_actions, implement_disabled_reason) = match default_mask {
+        let code_mask = collaboration_modes::code_mask(self.models_manager.as_ref());
+        let (implement_actions, implement_disabled_reason) = match code_mask {
             Some(mask) => {
                 let user_text = PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string();
                 let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
@@ -1361,13 +1639,13 @@ impl ChatWidget {
                 })];
                 (actions, None)
             }
-            None => (Vec::new(), Some("Default mode unavailable".to_string())),
+            None => (Vec::new(), Some("Code mode unavailable".to_string())),
         };
 
         let items = vec![
             SelectionItem {
                 name: PLAN_IMPLEMENTATION_YES.to_string(),
-                description: Some("Switch to Default and start coding.".to_string()),
+                description: Some("Switch to Code and start coding.".to_string()),
                 selected_description: None,
                 is_current: false,
                 actions: implement_actions,
@@ -2582,6 +2860,7 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
         };
 
         widget.prefetch_rate_limits();
@@ -2744,6 +3023,7 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
         };
 
         widget.prefetch_rate_limits();
@@ -2895,6 +3175,7 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
         };
 
         widget.prefetch_rate_limits();
@@ -3879,7 +4160,10 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request, from_replay)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
-            EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
+            EventMsg::ContextCompacted(_) => {
+                self.rawr_on_context_compacted();
+                self.on_agent_message("Context compacted".to_owned());
+            }
             EventMsg::CollabAgentSpawnBegin(_) => {}
             EventMsg::CollabAgentSpawnEnd(ev) => self.on_collab_event(collab::spawn_end(ev)),
             EventMsg::CollabAgentInteractionBegin(_) => {}

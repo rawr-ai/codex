@@ -2910,10 +2910,17 @@ pub(crate) async fn run_turn(
     }
 
     let model_info = turn_context.client.get_model_info();
-    let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
-    let total_usage_tokens = sess.get_total_token_usage().await;
-    if total_usage_tokens >= auto_compact_limit {
-        run_auto_compact(&sess, &turn_context).await;
+    let rawr_auto_compaction_enabled = sess.enabled(Feature::RawrAutoCompaction);
+    let auto_compact_limit = if rawr_auto_compaction_enabled {
+        i64::MAX
+    } else {
+        model_info.auto_compact_token_limit().unwrap_or(i64::MAX)
+    };
+    if !rawr_auto_compaction_enabled {
+        let total_usage_tokens = sess.get_total_token_usage().await;
+        if total_usage_tokens >= auto_compact_limit {
+            run_auto_compact(&sess, &turn_context).await;
+        }
     }
     let event = EventMsg::TurnStarted(TurnStartedEvent {
         model_context_window: turn_context.client.get_model_context_window(),
@@ -3002,7 +3009,7 @@ pub(crate) async fn run_turn(
                 let token_limit_reached = total_usage_tokens >= auto_compact_limit;
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
-                if token_limit_reached && needs_follow_up {
+                if token_limit_reached && needs_follow_up && !rawr_auto_compaction_enabled {
                     run_auto_compact(&sess, &turn_context).await;
                     continue;
                 }

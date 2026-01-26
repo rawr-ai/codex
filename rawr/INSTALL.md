@@ -31,5 +31,11 @@ Optional env vars:
 - `RAWR_AUTO_COMPACTION_MODE=tag|suggest|auto` (default: `suggest`)
 - `RAWR_AUTO_COMPACTION_PACKET_AUTHOR=watcher|agent` (default: `watcher`, only used in `auto` mode)
 
+## Heuristics prompt (auditable/editable)
+Copy the template `codex/rawr/prompts/rawr-auto-compact.md` into:
+- `~/.codex-rawr/prompts/rawr-auto-compact.md`
+
+The YAML frontmatter controls thresholds and “auto requires boundary” gating; the Markdown body is used as the prompt when `RAWR_AUTO_COMPACTION_PACKET_AUTHOR=agent`.
+
 ## Update flow (keep rebases boring)
 See `codex/rawr/UPDATING.md`.

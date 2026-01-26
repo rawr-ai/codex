@@ -896,6 +896,8 @@ async fn make_chatwidget_manual(
         current_rollout_path: None,
         external_editor_state: ExternalEditorState::Closed,
         rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
+        rawr_saw_commit_this_turn: false,
+        rawr_saw_plan_checkpoint_this_turn: false,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)
@@ -984,6 +986,47 @@ fn make_token_info(total_tokens: i64, context_window: i64) -> TokenUsageInfo {
         last_token_usage: usage(total_tokens),
         model_context_window: Some(context_window),
     }
+}
+
+fn drain_for_compact(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> bool {
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(ev, AppEvent::CodexOp(Op::Compact)) {
+            return true;
+        }
+    }
+    false
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_auto_mode_requires_boundary_unless_emergency() {
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+
+    // 50% remaining (below default 75 trigger), but no boundary -> should not auto compact.
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+    let mut settings = RawrAutoCompactionSettings::default_with_mode(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+    chat.maybe_rawr_auto_compact_with_settings(None, settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), false);
+
+    // If a commit boundary is present, auto mode should compact.
+    chat.rawr_saw_commit_this_turn = true;
+    chat.maybe_rawr_auto_compact_with_settings(None, settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // Emergency threshold should compact even without boundaries.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    // ~10% remaining: (20k window, 12k baseline, 8k effective, 7.2k used => 10% left).
+    chat.set_token_info(Some(make_token_info(19_200, 20_000)));
+    chat.maybe_rawr_auto_compact_with_settings(None, settings);
+    assert_eq!(drain_for_compact(&mut rx), true);
 }
 
 #[tokio::test]

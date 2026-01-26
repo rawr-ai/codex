@@ -21,8 +21,15 @@ Edit `~/.codex-rawr/config.toml`:
 rawr_auto_compaction = true
 ```
 
+When enabled:
+- This fork owns compaction timing (Codex’s built-in auto-compaction is bypassed).
+- The watcher only runs at natural boundaries (turn completion) and will not compact mid-turn.
+
 Default behavior: suggest mode (prints a recommendation once context window drops below 75% remaining).
 
 Optional env vars:
 - `RAWR_AUTO_COMPACTION_MODE=tag|suggest|auto` (default: `suggest`)
 - `RAWR_AUTO_COMPACTION_PACKET_AUTHOR=watcher|agent` (default: `watcher`, only used in `auto` mode)
+
+## Update flow (keep rebases boring)
+See `codex/rawr/UPDATING.md`.

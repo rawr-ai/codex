@@ -561,7 +561,6 @@ struct RawrAutoCompactionPromptFrontmatter {
     packet: RawrAutoCompactionPacketRules,
 }
 
-
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawrAutoCompactionTriggerRules {

@@ -64,7 +64,7 @@ import re
 from pathlib import Path
 
 text = Path("codex-rs/Cargo.toml").read_text(encoding="utf-8")
-m = re.search(r'(?m)^\\[workspace\\.package\\]\\n(?:.*\\n)*?^version\\s*=\\s*\"([^\"]+)\"\\s*$', text)
+m = re.search(r'(?m)^\[workspace\.package\]\n(?:.*\n)*?^version\s*=\s*"([^"]+)"\s*$', text)
 print(m.group(1) if m else "")
 PY
 )"
@@ -88,7 +88,7 @@ text = path.read_text(encoding="utf-8")
 def repl(match: re.Match[str]) -> str:
     block = match.group(0)
     block = re.sub(
-        r'(?m)^version\\s*=\\s*\"[^\"]+\"\\s*$',
+        r'(?m)^version\s*=\s*"[^"]+"\s*$',
         'version = \"${fork_version}\"',
         block,
         count=1,
@@ -96,7 +96,7 @@ def repl(match: re.Match[str]) -> str:
     return block
 
 new_text, n = re.subn(
-    r'(?ms)^\\[workspace\\.package\\].*?(?=^\\[|\\Z)',
+    r'(?ms)^\[workspace\.package\].*?(?=^\[|\Z)',
     repl,
     text,
     count=1,

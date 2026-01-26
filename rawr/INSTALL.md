@@ -78,9 +78,9 @@ happy daemon start
 ```
 
 ### MCP compatibility note
-Happy Coder spawns Codex’s MCP server by running either `codex mcp-server` or `codex mcp` depending on the output of `codex --version`. When building from source, `codex --version` may report `codex-cli 0.0.0`, which can cause Happy to choose `codex mcp` (without a subcommand) and fail to connect.
+Happy Coder launches Codex’s MCP server using `codex mcp-server` (stdio transport). Older version-based heuristics can pick `codex mcp` (the management command) when `codex --version` is `0.0.0`.
 
-This fork includes a compatibility shim: when invoked non-interactively as `codex mcp` (no subcommand), it behaves like `codex mcp-server`. When invoked from a terminal, it shows `codex mcp --help`.
+This fork avoids that by keeping `codex --version` ahead of upstream (see `rawr/bump-fork-version.sh`), so launchers can reliably select `mcp-server` without shims.
 
 ## Update flow (keep rebases boring)
 See `codex/rawr/UPDATING.md`.

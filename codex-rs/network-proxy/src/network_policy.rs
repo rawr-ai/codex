@@ -127,7 +127,13 @@ mod tests {
 
     #[tokio::test]
     async fn evaluate_host_policy_invokes_decider_for_not_allowed() {
-        let state = network_proxy_state_for_policy(NetworkPolicy::default());
+        let state = network_proxy_state_for_policy(NetworkPolicy {
+            // This test is about the decider override path for `not_allowed` decisions. Ensure
+            // we're not blocked earlier by the local/private-address guard (which can vary based
+            // on ambient DNS behavior).
+            allow_local_binding: true,
+            ..NetworkPolicy::default()
+        });
         let calls = Arc::new(AtomicUsize::new(0));
         let decider: Arc<dyn NetworkPolicyDecider> = Arc::new({
             let calls = calls.clone();

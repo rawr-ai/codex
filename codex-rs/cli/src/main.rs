@@ -550,26 +550,12 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
-    // Compatibility shim for Happy Coder:
-    // Some launchers run `codex mcp` (with no subcommand) to start Codex as an MCP server.
-    // In Codex, `mcp` is a management command that requires a subcommand, while the server is
-    // `mcp-server`. When invoked non-interactively, treat `codex mcp` as `codex mcp-server`.
-    // When invoked from a terminal, show help instead of erroring.
-    let mut argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if argv.len() == 2 && argv[1] == "mcp" {
-        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-            argv.push("--help".into());
-        } else {
-            argv[1] = "mcp-server".into();
-        }
-    }
-
     let MultitoolCli {
         config_overrides: mut root_config_overrides,
         feature_toggles,
         mut interactive,
         subcommand,
-    } = MultitoolCli::parse_from(argv);
+    } = MultitoolCli::parse();
 
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;

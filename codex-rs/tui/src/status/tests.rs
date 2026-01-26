@@ -64,7 +64,24 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
     lines
         .into_iter()
         .map(|line| {
-            if let (Some(dir_pos), Some(pipe_idx)) = (line.find("Directory: "), line.rfind('│')) {
+            let original_len = line.len();
+
+            // Normalize the displayed Codex version so snapshots stay stable across releases.
+            let mut line = line;
+            if let Some(start) = line.find("(v") {
+                if let Some(end_rel) = line[start..].find(')') {
+                    let end = start + end_rel;
+                    let mut rebuilt = String::with_capacity(line.len());
+                    rebuilt.push_str(&line[..start]);
+                    rebuilt.push_str("(v0.0.0)");
+                    rebuilt.push_str(&line[end + 1..]);
+                    line = rebuilt;
+                }
+            }
+
+            let line = if let (Some(dir_pos), Some(pipe_idx)) =
+                (line.find("Directory: "), line.rfind('│'))
+            {
                 let prefix = &line[..dir_pos + "Directory: ".len()];
                 let suffix = &line[pipe_idx..];
                 let content_width = pipe_idx.saturating_sub(dir_pos + "Directory: ".len());
@@ -76,6 +93,23 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
                 }
                 rebuilt.push_str(suffix);
                 rebuilt
+            } else {
+                line
+            };
+
+            // If we shortened a line by normalizing the version, pad before the right border so
+            // the box stays aligned.
+            if line.len() < original_len {
+                let diff = original_len - line.len();
+                if let Some(pipe_idx) = line.rfind('│') {
+                    let mut rebuilt = String::with_capacity(original_len);
+                    rebuilt.push_str(&line[..pipe_idx]);
+                    rebuilt.push_str(&" ".repeat(diff));
+                    rebuilt.push_str(&line[pipe_idx..]);
+                    rebuilt
+                } else {
+                    format!("{line}{}", " ".repeat(diff))
+                }
             } else {
                 line
             }

@@ -23,3 +23,11 @@ git push --force-with-lease origin rawr/main
 Notes:
 - Use `--force-with-lease` (not `--force`) so you don’t accidentally overwrite someone else’s work.
 - If rebases get painful, the fork delta is too big: split features into smaller commits and/or remove experimental changes.
+
+## Fork versioning
+
+This fork keeps `codex --version` ahead of upstream by computing:
+
+`fork_version = (latest upstream rust-v tag) + 1 minor`
+
+`rawr/sync-upstream.sh` runs `rawr/bump-fork-version.sh --commit` after rebasing so the version stays ahead automatically.

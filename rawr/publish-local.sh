@@ -7,6 +7,7 @@ link_codex=0
 link_bun=0
 restart_happy=0
 force=0
+bump_version=1
 
 usage() {
   cat <<'EOF'
@@ -15,6 +16,7 @@ Usage: rawr/publish-local.sh [OPTIONS]
 Builds and installs the fork binary as ~/.local/bin/codex-rawr.
 
 Options:
+  --no-bump-version   Skip bumping fork version before build.
   --link-codex         Install/overwrite ~/.local/bin/codex wrapper that runs codex-rawr.
   --link-bun           Symlink ~/.bun/bin/codex -> ~/.local/bin/codex (helps Happy Coder resolve it).
   --happy              Equivalent to: --link-codex --link-bun --restart-happy
@@ -32,6 +34,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --link-bun)
       link_bun=1
+      shift
+      ;;
+    --no-bump-version)
+      bump_version=0
       shift
       ;;
     --restart-happy)
@@ -59,6 +65,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$bump_version" -eq 1 ]]; then
+  "$ROOT/bump-fork-version.sh" --apply
+fi
 
 "$ROOT/install-local.sh"
 
@@ -106,3 +116,19 @@ if [[ "$restart_happy" -eq 1 ]]; then
   fi
 fi
 
+echo
+echo "Verification:"
+if command -v codex >/dev/null 2>&1; then
+  echo "  codex: $(command -v codex)"
+  codex --version || true
+else
+  echo "  codex: not found in PATH"
+fi
+if [[ -x "$HOME/.local/bin/codex-rawr" ]]; then
+  echo "  codex-rawr: $HOME/.local/bin/codex-rawr"
+  "$HOME/.local/bin/codex-rawr" --version || true
+fi
+if [[ -e "$HOME/.bun/bin/codex" ]]; then
+  echo "  bun codex: $(readlink "$HOME/.bun/bin/codex" || echo "$HOME/.bun/bin/codex")"
+  "$HOME/.bun/bin/codex" --version || true
+fi

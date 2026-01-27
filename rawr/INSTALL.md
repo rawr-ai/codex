@@ -27,6 +27,23 @@ To also point Happy at the fork (overwrites `~/.local/bin/codex`):
 bash rawr/publish-local.sh --happy --force
 ```
 
+Notes:
+- `publish-local.sh` now bumps the fork version before building (to keep `codex --version` ahead of upstream so Happy selects `mcp-server`).
+- If you need to skip version bumping, use `--no-bump-version`.
+
+## Release builds (golden path)
+Use a dedicated release command for deterministic local releases:
+
+```bash
+bash rawr/release-local.sh
+```
+
+If you want an explicit tag for traceability:
+
+```bash
+bash rawr/release-local.sh --tag rawr-local-YYYYMMDD-HHMM
+```
+
 ## Make `codex` run the fork (optional)
 If you want `codex` to resolve to the fork without uninstalling upstream, the simplest approach is a symlink (or wrapper) earlier in your `PATH`.
 

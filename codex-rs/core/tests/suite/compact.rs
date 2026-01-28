@@ -6,9 +6,12 @@ use codex_core::ThreadManager;
 use codex_core::built_in_model_providers;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARY_PREFIX;
+use codex_core::compaction_audit;
 use codex_core::config::Config;
 use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
+use codex_core::protocol::CompactionPacketAuthor;
+use codex_core::protocol::CompactionTrigger;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
 use codex_core::protocol::RolloutItem;
@@ -347,12 +350,22 @@ async fn manual_compact_uses_custom_prompt() {
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
     );
-    let codex = thread_manager
+    let NewThread {
+        thread: codex,
+        session_configured,
+        ..
+    } = thread_manager
         .start_thread(config)
         .await
-        .expect("create conversation")
-        .thread;
+        .expect("create conversation");
 
+    let expected_trigger = CompactionTrigger::AutoWatcher {
+        trigger_percent_remaining: 42,
+        saw_commit: true,
+        saw_plan_checkpoint: false,
+        packet_author: CompactionPacketAuthor::Agent,
+    };
+    compaction_audit::set_next_compaction_trigger(expected_trigger.clone());
     codex.submit(Op::Compact).await.expect("trigger compact");
     let warning_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
     let EventMsg::Warning(WarningEvent { message }) = warning_event else {
@@ -396,6 +409,37 @@ async fn manual_compact_uses_custom_prompt() {
             "summarization prompt should not appear if compaction omits a prompt"
         );
     }
+
+    codex.submit(Op::Shutdown).await.unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
+
+    let rollout_path = session_configured.rollout_path.expect("rollout path");
+    let rollout_text = std::fs::read_to_string(&rollout_path).unwrap_or_else(|e| {
+        panic!(
+            "failed to read rollout file {}: {e}",
+            rollout_path.display()
+        )
+    });
+    let mut saw_trigger = false;
+    for line in rollout_text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        let Ok(entry) = serde_json::from_str::<RolloutLine>(line) else {
+            continue;
+        };
+        if let RolloutItem::Compacted(compacted) = entry.item
+            && compacted.trigger == Some(expected_trigger.clone())
+        {
+            saw_trigger = true;
+            break;
+        }
+    }
+    assert!(
+        saw_trigger,
+        "expected compaction trigger to be persisted in rollout"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

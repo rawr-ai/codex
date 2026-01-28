@@ -4,7 +4,10 @@ use std::fs;
 
 use anyhow::Result;
 use codex_core::CodexAuth;
+use codex_core::compaction_audit;
 use codex_core::features::Feature;
+use codex_core::protocol::CompactionPacketAuthor;
+use codex_core::protocol::CompactionTrigger;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
 use codex_core::protocol::RolloutItem;
@@ -284,6 +287,13 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
+    let expected_trigger = CompactionTrigger::AutoWatcher {
+        trigger_percent_remaining: 7,
+        saw_commit: false,
+        saw_plan_checkpoint: true,
+        packet_author: CompactionPacketAuthor::Watcher,
+    };
+    compaction_audit::set_next_compaction_trigger(expected_trigger.clone());
     codex.submit(Op::Compact).await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -306,6 +316,7 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
         if let RolloutItem::Compacted(compacted) = entry.item
             && compacted.message.is_empty()
             && compacted.replacement_history.as_ref() == Some(&compacted_history)
+            && compacted.trigger == Some(expected_trigger.clone())
         {
             saw_compacted_history = true;
             break;

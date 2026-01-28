@@ -847,6 +847,7 @@ async fn make_chatwidget_manual(
         rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
         rawr_saw_commit_this_turn: false,
         rawr_saw_plan_checkpoint_this_turn: false,
+        rawr_preflight_compaction_pending: None,
     };
     (widget, rx, op_rx)
 }
@@ -1081,6 +1082,67 @@ async fn rawr_auto_compaction_injects_packet_when_turn_complete_arrives_before_c
 }
 
 #[tokio::test]
+async fn rawr_auto_compaction_defers_to_next_user_turn_when_turn_complete_boundary_enabled() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_core::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        approval_policy: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::ReadOnly,
+        cwd: PathBuf::from("/home/user/project"),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "configured".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    while rx.try_recv().is_ok() {}
+
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::TurnComplete];
+
+    // Turn completed and we're low on context. With the turn-complete boundary enabled, the
+    // watcher should defer compaction until the next user message arrives.
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), false);
+    assert!(chat.rawr_preflight_compaction_pending.is_some());
+
+    // Next user message triggers compaction before starting any work.
+    chat.queue_user_message(UserMessage::from("next user message"));
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // When the compaction turn completes, the queued user message is submitted.
+    inject_context_compacted(&mut chat);
+    chat.on_task_complete(None, false);
+    let submitted = next_submit_op(&mut op_rx);
+    let Op::UserTurn { items, .. } = submitted else {
+        panic!("expected Op::UserTurn");
+    };
+    let text = match &items[0] {
+        UserInput::Text { text, .. } => text.clone(),
+        other => panic!("expected UserInput::Text, got {other:?}"),
+    };
+    assert_eq!(text, "next user message");
+}
+
+#[tokio::test]
 async fn rawr_auto_compaction_auto_agent_packet_e2e() {
     let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
     chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
@@ -1128,7 +1190,7 @@ async fn rawr_auto_compaction_auto_agent_packet_e2e() {
 }
 
 #[tokio::test]
-async fn rawr_auto_compaction_never_compacts_when_queued_or_review() {
+async fn rawr_auto_compaction_compacts_before_queued_user_messages_but_never_in_review() {
     let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
     chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
     chat.rawr_saw_commit_this_turn = true;
@@ -1143,11 +1205,11 @@ async fn rawr_auto_compaction_never_compacts_when_queued_or_review() {
         .trigger
         .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
 
-    // If there are queued messages, do nothing.
+    // If there are queued messages, compaction can still run before sending the queued message.
     chat.queued_user_messages
         .push_back(UserMessage::from("queued message"));
     chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings.clone());
-    assert_eq!(drain_for_compact(&mut rx), false);
+    assert_eq!(drain_for_compact(&mut rx), true);
 
     // If in review mode, do nothing.
     chat.queued_user_messages.clear();

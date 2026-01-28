@@ -1269,6 +1269,67 @@ async fn rawr_auto_compaction_defers_to_next_user_turn_when_turn_complete_bounda
 }
 
 #[tokio::test]
+async fn rawr_auto_compaction_preflight_does_not_run_for_local_shell_commands() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_core::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        approval_policy: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::ReadOnly,
+        cwd: PathBuf::from("/home/user/project"),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "configured".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    while rx.try_recv().is_ok() {}
+
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::TurnComplete];
+
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings);
+    assert!(chat.rawr_preflight_compaction_pending.is_some());
+
+    // Local shell commands should not trigger preflight compaction.
+    chat.queue_user_message(UserMessage::from("!echo hello"));
+    assert_eq!(drain_for_compact(&mut rx), false);
+    assert!(chat.rawr_preflight_compaction_pending.is_some());
+    loop {
+        match op_rx.try_recv() {
+            Ok(Op::RunUserShellCommand { command }) => {
+                assert_eq!(command, "echo hello");
+                break;
+            }
+            Ok(_) => continue,
+            Err(TryRecvError::Empty) => panic!("expected Op::RunUserShellCommand"),
+            Err(TryRecvError::Disconnected) => panic!("expected Op::RunUserShellCommand"),
+        }
+    }
+
+    // Next normal user message should trigger preflight compaction.
+    chat.queue_user_message(UserMessage::from("hello"));
+    assert_eq!(drain_for_compact(&mut rx), true);
+}
+
+#[tokio::test]
 async fn rawr_auto_compaction_auto_agent_packet_e2e() {
     let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
     chat.set_feature_enabled(Feature::RawrAutoCompaction, true);

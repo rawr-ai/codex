@@ -16,6 +16,7 @@ pub mod codex;
 pub use codex::SteerInputError;
 mod codex_thread;
 mod compact_remote;
+pub mod compaction_audit;
 pub use codex_thread::CodexThread;
 pub use codex_thread::ThreadConfigSnapshot;
 mod agent;

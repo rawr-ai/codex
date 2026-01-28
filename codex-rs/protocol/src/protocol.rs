@@ -1616,6 +1616,31 @@ pub struct CompactedItem {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_history: Option<Vec<ResponseItem>>,
+    /// If present, indicates why this compaction occurred (e.g. rawr auto-watcher).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<CompactionTrigger>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    AutoWatcher {
+        /// Remaining context window percent at the time the watcher triggered compaction.
+        trigger_percent_remaining: i64,
+        /// Whether the watcher observed a successful `git commit` boundary this turn.
+        saw_commit: bool,
+        /// Whether the watcher observed a plan checkpoint boundary this turn.
+        saw_plan_checkpoint: bool,
+        /// Who authored the post-compact continuation packet (when applicable).
+        packet_author: CompactionPacketAuthor,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionPacketAuthor {
+    Watcher,
+    Agent,
 }
 
 impl From<CompactedItem> for ResponseItem {

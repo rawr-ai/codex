@@ -40,6 +40,7 @@ async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
 ) -> CodexResult<()> {
+    let compaction_trigger = crate::compaction_audit::take_next_compaction_trigger();
     let history = sess.clone_history().await;
 
     // Required to keep `/undo` available after compaction
@@ -73,6 +74,7 @@ async fn run_remote_compact_task_inner_impl(
     let compacted_item = CompactedItem {
         message: String::new(),
         replacement_history: Some(new_history),
+        trigger: compaction_trigger,
     };
     sess.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
         .await;

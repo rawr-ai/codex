@@ -4798,6 +4798,7 @@ mod tests {
         rollout_items.push(RolloutItem::Compacted(CompactedItem {
             message: summary1.to_string(),
             replacement_history: None,
+            trigger: None,
         }));
 
         let user2 = ResponseItem::Message {
@@ -4834,6 +4835,7 @@ mod tests {
         rollout_items.push(RolloutItem::Compacted(CompactedItem {
             message: summary2.to_string(),
             replacement_history: None,
+            trigger: None,
         }));
 
         let user3 = ResponseItem::Message {

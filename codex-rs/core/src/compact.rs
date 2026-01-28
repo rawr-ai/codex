@@ -71,6 +71,7 @@ async fn run_compact_task_inner(
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
 ) {
+    let compaction_trigger = crate::compaction_audit::take_next_compaction_trigger();
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
@@ -190,6 +191,7 @@ async fn run_compact_task_inner(
     let rollout_item = RolloutItem::Compacted(CompactedItem {
         message: summary_text.clone(),
         replacement_history: None,
+        trigger: compaction_trigger,
     });
     sess.persist_rollout_items(&[rollout_item]).await;
 

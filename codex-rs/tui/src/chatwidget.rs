@@ -596,6 +596,7 @@ enum RawrAutoCompactionState {
         packet: String,
         trigger_percent_remaining: i64,
         saw_context_compacted: bool,
+        saw_turn_complete: bool,
     },
 }
 
@@ -1214,6 +1215,19 @@ impl ChatWidget {
         self.otel_manager.reset_runtime_metrics();
         self.rawr_saw_commit_this_turn = false;
         self.rawr_saw_plan_checkpoint_this_turn = false;
+        if let RawrAutoCompactionState::Compacting {
+            saw_context_compacted: false,
+            saw_turn_complete: true,
+            ..
+        } = self.rawr_auto_compaction_state
+        {
+            self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+            self.add_info_message(
+                "[rawr] auto-compaction watcher: compaction did not complete; skipping post-compact injection."
+                    .to_string(),
+                None,
+            );
+        }
         self.bottom_pane.clear_quit_shortcut_hint();
         self.quit_shortcut_expires_at = None;
         self.quit_shortcut_key = None;
@@ -1344,6 +1358,7 @@ impl ChatWidget {
                     packet,
                     trigger_percent_remaining,
                     saw_context_compacted: false,
+                    saw_turn_complete: false,
                 };
                 self.rawr_trigger_compact();
                 return;
@@ -1351,17 +1366,18 @@ impl ChatWidget {
             RawrAutoCompactionState::Compacting {
                 packet,
                 saw_context_compacted,
+                trigger_percent_remaining,
                 ..
             } => {
                 if saw_context_compacted {
                     self.rawr_inject_post_compact_packet(packet);
                 } else {
-                    self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
-                    self.add_info_message(
-                        "[rawr] auto-compaction watcher: compaction did not complete; skipping post-compact injection."
-                            .to_string(),
-                        None,
-                    );
+                    self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                        packet,
+                        trigger_percent_remaining,
+                        saw_context_compacted: false,
+                        saw_turn_complete: true,
+                    };
                 }
                 return;
             }
@@ -1446,6 +1462,7 @@ impl ChatWidget {
                             packet,
                             trigger_percent_remaining: percent_remaining,
                             saw_context_compacted: false,
+                            saw_turn_complete: false,
                         };
                         self.rawr_trigger_compact();
                     }
@@ -1491,17 +1508,30 @@ impl ChatWidget {
         if !self.config.features.enabled(Feature::RawrAutoCompaction) {
             return;
         }
-        if let RawrAutoCompactionState::Compacting {
-            packet,
-            trigger_percent_remaining,
-            ..
-        } = &self.rawr_auto_compaction_state
-        {
-            self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
-                packet: packet.clone(),
-                trigger_percent_remaining: *trigger_percent_remaining,
-                saw_context_compacted: true,
-            };
+        match std::mem::replace(
+            &mut self.rawr_auto_compaction_state,
+            RawrAutoCompactionState::Idle,
+        ) {
+            RawrAutoCompactionState::Compacting {
+                packet,
+                trigger_percent_remaining,
+                saw_turn_complete,
+                ..
+            } => {
+                if saw_turn_complete {
+                    self.rawr_inject_post_compact_packet(packet);
+                } else {
+                    self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                        packet,
+                        trigger_percent_remaining,
+                        saw_context_compacted: true,
+                        saw_turn_complete,
+                    };
+                }
+            }
+            other => {
+                self.rawr_auto_compaction_state = other;
+            }
         }
     }
 

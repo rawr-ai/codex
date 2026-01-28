@@ -1167,6 +1167,46 @@ async fn rawr_auto_compaction_auto_watcher_packet_e2e() {
 }
 
 #[tokio::test]
+async fn rawr_auto_compaction_injects_packet_when_turn_complete_arrives_before_context_compacted() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.rawr_saw_commit_this_turn = true;
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+    settings.prompt_frontmatter.packet.max_tail_chars = 200;
+
+    // Trigger compaction.
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // Compaction turn completes first (out-of-order relative to ContextCompacted).
+    chat.maybe_rawr_auto_compact_with_settings(None, settings.clone());
+
+    // Later, we receive the actual ContextCompacted event; the watcher should still inject.
+    inject_context_compacted(&mut chat);
+    let injected = next_submit_op(&mut op_rx);
+    let Op::UserTurn { items, .. } = injected else {
+        panic!("expected Op::UserTurn");
+    };
+    let text = match &items[0] {
+        UserInput::Text { text, .. } => text.clone(),
+        other => panic!("expected UserInput::Text, got {other:?}"),
+    };
+    assert!(
+        text.contains("Continuation context packet"),
+        "expected packet header, got: {text}"
+    );
+}
+
+#[tokio::test]
 async fn rawr_auto_compaction_auto_agent_packet_e2e() {
     let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
     chat.set_feature_enabled(Feature::RawrAutoCompaction, true);

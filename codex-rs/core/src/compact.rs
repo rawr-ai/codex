@@ -77,6 +77,7 @@ async fn run_compact_task_inner(
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
+    let compaction_trigger = crate::compaction_audit::take_next_compaction_trigger();
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
@@ -207,6 +208,7 @@ async fn run_compact_task_inner(
     let rollout_item = RolloutItem::Compacted(CompactedItem {
         message: summary_text.clone(),
         replacement_history: None,
+        trigger: compaction_trigger,
     });
     sess.persist_rollout_items(&[rollout_item]).await;
 

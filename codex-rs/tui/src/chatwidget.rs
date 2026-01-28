@@ -1461,6 +1461,28 @@ impl ChatWidget {
     }
 
     fn rawr_trigger_compact(&mut self) {
+        if let RawrAutoCompactionState::Compacting {
+            trigger_percent_remaining,
+            ..
+        } = &self.rawr_auto_compaction_state
+        {
+            let packet_author = match self.rawr_auto_compaction_packet_author() {
+                RawrAutoCompactionPacketAuthor::Watcher => {
+                    codex_core::protocol::CompactionPacketAuthor::Watcher
+                }
+                RawrAutoCompactionPacketAuthor::Agent => {
+                    codex_core::protocol::CompactionPacketAuthor::Agent
+                }
+            };
+            codex_core::compaction_audit::set_next_compaction_trigger(
+                codex_core::protocol::CompactionTrigger::AutoWatcher {
+                    trigger_percent_remaining: *trigger_percent_remaining,
+                    saw_commit: self.rawr_saw_commit_this_turn,
+                    saw_plan_checkpoint: self.rawr_saw_plan_checkpoint_this_turn,
+                    packet_author,
+                },
+            );
+        }
         self.clear_token_usage();
         self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
     }

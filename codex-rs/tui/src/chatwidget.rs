@@ -584,6 +584,7 @@ pub(crate) struct ChatWidget {
     rawr_auto_compaction_state: RawrAutoCompactionState,
     rawr_saw_commit_this_turn: bool,
     rawr_saw_plan_checkpoint_this_turn: bool,
+    rawr_preflight_compaction_pending: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -597,6 +598,7 @@ enum RawrAutoCompactionState {
         trigger_percent_remaining: i64,
         saw_context_compacted: bool,
         saw_turn_complete: bool,
+        should_inject_packet: bool,
     },
 }
 
@@ -619,6 +621,7 @@ enum RawrAutoCompactionBoundary {
     Commit,
     PlanCheckpoint,
     AgentDone,
+    TurnComplete,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1337,9 +1340,10 @@ impl ChatWidget {
         if self.bottom_pane.is_task_running() || self.agent_turn_running {
             return;
         }
-        if !self.queued_user_messages.is_empty() || self.is_review_mode {
+        if self.is_review_mode {
             return;
         }
+        let has_queued_user_messages = !self.queued_user_messages.is_empty();
 
         match std::mem::replace(
             &mut self.rawr_auto_compaction_state,
@@ -1359,6 +1363,7 @@ impl ChatWidget {
                     trigger_percent_remaining,
                     saw_context_compacted: false,
                     saw_turn_complete: false,
+                    should_inject_packet: true,
                 };
                 self.rawr_trigger_compact();
                 return;
@@ -1367,16 +1372,22 @@ impl ChatWidget {
                 packet,
                 saw_context_compacted,
                 trigger_percent_remaining,
+                should_inject_packet,
                 ..
             } => {
                 if saw_context_compacted {
-                    self.rawr_inject_post_compact_packet(packet);
+                    if should_inject_packet {
+                        self.rawr_inject_post_compact_packet(packet);
+                    } else {
+                        self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+                    }
                 } else {
                     self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
                         packet,
                         trigger_percent_remaining,
                         saw_context_compacted: false,
                         saw_turn_complete: true,
+                        should_inject_packet,
                     };
                 }
                 return;
@@ -1412,6 +1423,7 @@ impl ChatWidget {
                         self.rawr_saw_plan_checkpoint_this_turn
                     }
                     RawrAutoCompactionBoundary::AgentDone => agent_done,
+                    RawrAutoCompactionBoundary::TurnComplete => true,
                 });
 
         let emergency_percent_remaining = settings
@@ -1450,6 +1462,32 @@ impl ChatWidget {
 
                 match settings.packet_author {
                     RawrAutoCompactionPacketAuthor::Watcher => {
+                        if has_queued_user_messages {
+                            self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                                packet: String::new(),
+                                trigger_percent_remaining: percent_remaining,
+                                saw_context_compacted: false,
+                                saw_turn_complete: false,
+                                should_inject_packet: false,
+                            };
+                            self.rawr_trigger_compact();
+                            return;
+                        }
+
+                        let should_defer_to_next_user_turn = settings
+                            .prompt_frontmatter
+                            .trigger
+                            .auto_requires_any_boundary
+                            .iter()
+                            .any(|boundary| *boundary == RawrAutoCompactionBoundary::TurnComplete);
+                        if should_defer_to_next_user_turn
+                            && self.rawr_preflight_compaction_pending.is_none()
+                        {
+                            self.rawr_preflight_compaction_pending = Some(percent_remaining);
+                            self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+                            return;
+                        }
+
                         let packet = self.rawr_build_post_compact_packet(
                             percent_remaining,
                             last_agent_message,
@@ -1463,6 +1501,7 @@ impl ChatWidget {
                             trigger_percent_remaining: percent_remaining,
                             saw_context_compacted: false,
                             saw_turn_complete: false,
+                            should_inject_packet: true,
                         };
                         self.rawr_trigger_compact();
                     }
@@ -1508,6 +1547,7 @@ impl ChatWidget {
         if !self.config.features.enabled(Feature::RawrAutoCompaction) {
             return;
         }
+        self.rawr_preflight_compaction_pending = None;
         match std::mem::replace(
             &mut self.rawr_auto_compaction_state,
             RawrAutoCompactionState::Idle,
@@ -1516,9 +1556,10 @@ impl ChatWidget {
                 packet,
                 trigger_percent_remaining,
                 saw_turn_complete,
+                should_inject_packet,
                 ..
             } => {
-                if saw_turn_complete {
+                if saw_turn_complete && should_inject_packet {
                     self.rawr_inject_post_compact_packet(packet);
                 } else {
                     self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
@@ -1526,6 +1567,7 @@ impl ChatWidget {
                         trigger_percent_remaining,
                         saw_context_compacted: true,
                         saw_turn_complete,
+                        should_inject_packet,
                     };
                 }
             }
@@ -2914,6 +2956,7 @@ impl ChatWidget {
             rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
             rawr_saw_commit_this_turn: false,
             rawr_saw_plan_checkpoint_this_turn: false,
+            rawr_preflight_compaction_pending: None,
         };
 
         widget.prefetch_rate_limits();
@@ -3063,6 +3106,7 @@ impl ChatWidget {
             rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
             rawr_saw_commit_this_turn: false,
             rawr_saw_plan_checkpoint_this_turn: false,
+            rawr_preflight_compaction_pending: None,
         };
 
         widget.prefetch_rate_limits();
@@ -3201,6 +3245,7 @@ impl ChatWidget {
             rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
             rawr_saw_commit_this_turn: false,
             rawr_saw_plan_checkpoint_this_turn: false,
+            rawr_preflight_compaction_pending: None,
         };
 
         widget.prefetch_rate_limits();
@@ -3847,6 +3892,31 @@ impl ChatWidget {
             return;
         }
 
+        if self.config.features.enabled(Feature::RawrAutoCompaction)
+            && !self.bottom_pane.is_task_running()
+            && !self.agent_turn_running
+            && !self.is_review_mode
+            && self
+                .rawr_preflight_compaction_pending
+                .is_some_and(|_| !user_message.text.trim_start().starts_with('!'))
+        {
+            let trigger_percent_remaining = self
+                .rawr_preflight_compaction_pending
+                .take()
+                .expect("preflight compaction pending should be set");
+            self.queued_user_messages.push_front(user_message);
+            self.refresh_queued_user_messages();
+            self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                packet: String::new(),
+                trigger_percent_remaining,
+                saw_context_compacted: false,
+                saw_turn_complete: false,
+                should_inject_packet: false,
+            };
+            self.rawr_trigger_compact();
+            return;
+        }
+
         let UserMessage {
             text,
             local_images,
@@ -4324,6 +4394,31 @@ impl ChatWidget {
 
     // If idle and there are queued inputs, submit exactly one to start the next turn.
     fn maybe_send_next_queued_input(&mut self) {
+        if matches!(
+            self.rawr_auto_compaction_state,
+            RawrAutoCompactionState::Compacting {
+                saw_context_compacted: false,
+                ..
+            }
+        ) {
+            return;
+        }
+        if self.rawr_preflight_compaction_pending.is_some() && !self.queued_user_messages.is_empty()
+        {
+            let trigger_percent_remaining = self
+                .rawr_preflight_compaction_pending
+                .take()
+                .expect("preflight compaction pending should be set");
+            self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                packet: String::new(),
+                trigger_percent_remaining,
+                saw_context_compacted: false,
+                saw_turn_complete: false,
+                should_inject_packet: false,
+            };
+            self.rawr_trigger_compact();
+            return;
+        }
         if self.bottom_pane.is_task_running() {
             return;
         }

@@ -21,6 +21,9 @@ use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintError;
+use codex_core::config::types::RawrAutoCompactionBoundary;
+use codex_core::config::types::RawrAutoCompactionMode;
+use codex_core::config::types::RawrAutoCompactionPacketAuthor;
 use codex_core::config_loader::RequirementSource;
 use codex_core::features::Feature;
 use codex_core::models_manager::manager::ModelsManager;
@@ -914,6 +917,7 @@ async fn make_chatwidget_manual(
         session_header: SessionHeader::new(resolved_model.clone()),
         initial_user_message: None,
         token_info: None,
+        status_token_info: None,
         rate_limit_snapshot: None,
         plan_type: None,
         rate_limit_warnings: RateLimitWarningState::default(),
@@ -972,6 +976,7 @@ async fn make_chatwidget_manual(
         rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
         rawr_saw_commit_this_turn: false,
         rawr_saw_plan_checkpoint_this_turn: false,
+        rawr_saw_pr_checkpoint_this_turn: false,
         rawr_preflight_compaction_pending: None,
     };
     widget.set_model(&resolved_model);
@@ -1189,7 +1194,7 @@ async fn rawr_auto_compaction_injects_packet_when_turn_complete_arrives_before_c
     assert_eq!(drain_for_compact(&mut rx), true);
 
     // Compaction turn completes first (out-of-order relative to ContextCompacted).
-    chat.maybe_rawr_auto_compact_with_settings(None, settings.clone());
+    chat.maybe_rawr_auto_compact_with_settings(None, settings);
 
     // Later, we receive the actual ContextCompacted event; the watcher should still inject.
     inject_context_compacted(&mut chat);
@@ -1246,7 +1251,7 @@ async fn rawr_auto_compaction_defers_to_next_user_turn_when_turn_complete_bounda
 
     // Turn completed and we're low on context. With the turn-complete boundary enabled, the
     // watcher should defer compaction until the next user message arrives.
-    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings.clone());
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings);
     assert_eq!(drain_for_compact(&mut rx), false);
     assert!(chat.rawr_preflight_compaction_pending.is_some());
 

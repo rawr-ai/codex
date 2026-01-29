@@ -82,8 +82,6 @@ packet_author = "agent" # watcher | agent
 early_percent_remaining_lt = 85
 ready_percent_remaining_lt = 75
 asap_percent_remaining_lt = 65
-# Back-compat: older configs used a single threshold.
-percent_remaining_lt = 75
 emergency_percent_remaining_lt = 15
 auto_requires_any_boundary = ["commit", "pr_checkpoint", "plan_checkpoint", "agent_done"]
 

@@ -65,7 +65,9 @@ Additionally, implement the “ask agent for packet” flow using the editable p
 
 ### C) Make YAML knobs the single source of truth (with config overrides)
 - Keep default trigger values in YAML:
-  - `percent_remaining_lt`
+  - `early_percent_remaining_lt`
+  - `ready_percent_remaining_lt`
+  - `asap_percent_remaining_lt`
   - `emergency_percent_remaining_lt`
   - `auto_requires_any_boundary`
 - Allow config overrides for explicit, per-user control.

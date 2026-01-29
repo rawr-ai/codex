@@ -47,9 +47,40 @@ This spec defines a **golden path** and then enumerates **required behavior chan
 - **Watcher**: client-side orchestrator that decides *when* to compact and manages the sequence (TUI watcher today).
 - **Compactor**: the compaction task that rewrites the thread history (local compaction or remote provider).
 - **Continuation packet**: a structured “where we are / what we did / what’s next” packet meant to survive compaction and re-seed the agent.
+- **Pre-compact request**: a first-class “do this before compaction” request scheduled by the watcher and fulfilled before compaction proceeds.
 - **Boundary**: a signal that a meaningful transition might exist (plan checkpoint/update, done/concluding/topic-shift, commit, PR, etc.).
 - **Heuristics / contextual assessment**: additional logic that decides whether a boundary is “significant enough” to compact *now*.
 - **Synthetic turn**: a turn injected by the watcher (e.g., heads-up, packet-request prompt, post-compaction handoff message).
+
+---
+
+## Pre-compact requests (new concept)
+
+Auto-compaction should never be a “hard cliff” where valuable details disappear. Before any auto-compaction runs, the watcher schedules one or more **pre-compact requests** to preserve context.
+
+Pre-compact requests are ordered and must be fulfilled in order before compaction proceeds.
+
+### Required request types (v0)
+
+1. **Continuation packet creation** (`CONTINUATION_PACKET`) — required
+   - The existing continuation/context packet.
+   - Always scheduled, always the final pre-compact step immediately before compaction.
+
+2. **Scratch write** (`SCRATCH_WRITE`) — conditional
+   - A request to write a verbatim “scratchpad” (research notes, drafts, WIP details) to a file.
+   - Intended to preserve details that should survive compaction but don’t necessarily belong in the continuation packet.
+   - File convention:
+     - Directory: `.scratch/` (created if missing)
+     - Filename: `agent-<name>.scratch.md` (e.g., `agent-codex.scratch.md`)
+   - When scheduled, it must run **before** continuation packet creation.
+
+### Scheduling rules
+
+- Simplest case: only `CONTINUATION_PACKET`.
+- Common case: `SCRATCH_WRITE` then `CONTINUATION_PACKET` (continuation always last).
+- A configuration boolean controls whether scratch writes are enabled for auto-compaction:
+  - `rawr_auto_compaction.scratch_write_enabled = true`
+- When a scratch write occurs, the post-compaction handoff must explicitly include a link/path to the scratch file so the agent can refer to it after compaction.
 
 ---
 
@@ -180,12 +211,15 @@ sequenceDiagram
     W-->>A: (no special message; continue normal turns)
   else should_compact_now = yes
     U->>A: Heads-up: pause, write continuation packet, then compaction, then resume
+    Note over A: Pre-compact request (optional): SCRATCH_WRITE
+    A->>A: Write scratchpad file (.scratch/agent-…)<br/>(verbatim notes/draft)
+    Note over A: Pre-compact request (required): CONTINUATION_PACKET
     A->>U: Continuation packet (what/now/next + key constraints)
     Note over W,C: Handoff: watcher triggers compaction AFTER packet exists
     W->>C: Start compaction
     C-->>W: Context compacted (history rewritten)
     Note over U,A: Handoff: user re-seeds agent with packet post-compaction
-    U->>A: Handoff: “Here’s your packet back; continue” + packet
+    U->>A: Handoff: “Here’s your packet back; continue” + packet<br/>(+ scratch file link when present)
     A-->>U: Continue next plan step
   end
 ```
@@ -290,8 +324,12 @@ stateDiagram-v2
   Assessing --> Idle: should_compact_now = false
   Assessing --> HeadsUpInjected: should_compact_now = true
 
-  HeadsUpInjected --> AwaitingPacket: Variant A<br/>(request packet from agent)
-  HeadsUpInjected --> AssemblingPacket: Variant B<br/>(watcher assembles packet)
+  HeadsUpInjected --> AwaitingScratchWrite: SCRATCH_WRITE scheduled
+  HeadsUpInjected --> AwaitingPacket: Variant A<br/>(request packet from agent)<br/>(no scratch)
+  HeadsUpInjected --> AssemblingPacket: Variant B<br/>(watcher assembles packet)<br/>(no scratch)
+
+  AwaitingScratchWrite --> AwaitingPacket: scratch complete<br/>(Variant A)
+  AwaitingScratchWrite --> AssemblingPacket: scratch complete<br/>(Variant B)
 
   AwaitingPacket --> Compacting: packet available
   AwaitingPacket --> Compacting: OnTimeout<br/>(fallback packet)
@@ -322,6 +360,13 @@ sequenceDiagram
     Prov-->>Core: assistant output
     Core-->>UI: OnTaskComplete(UserTurn)
 
+    opt SCRATCH_WRITE enabled
+      UI->>Core: Op::UserTurn(scratch write request)
+      Core->>Prov: sampling request(s)
+      Prov-->>Core: assistant confirms scratch written
+      Core-->>UI: OnTaskComplete(UserTurn)
+    end
+
     alt Variant A (agent authors packet)
       UI->>Core: Op::UserTurn(packet request)
       Core->>Prov: sampling request(s)
@@ -341,7 +386,7 @@ sequenceDiagram
     Prov-->>Core: compaction result
     Core-->>UI: Event ContextCompacted<br/>+ OnTaskComplete(Compact)
 
-    Note over UI,Core: Handoff: inject post-compaction user message<br/>(wrapper + packet)
+    Note over UI,Core: Handoff: inject post-compaction user message<br/>(wrapper + packet)<br/>(or prefix into next queued user message)
     UI->>Core: Op::UserTurn(handoff + packet)
   end
 ```

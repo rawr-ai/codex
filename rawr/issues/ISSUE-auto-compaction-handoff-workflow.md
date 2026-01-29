@@ -34,15 +34,19 @@ It focuses on **rawr auto-compaction**, but includes the closely related **built
 
 ```mermaid
 graph TD
-  A[UserTurn starts] --> B[core: run_turn]
-  B --> C{Feature::RawrAutoCompaction?}
-  C -->|no| D[core: built-in auto-compact only (token limit)]
-  C -->|yes| E[core: rawr mid-turn signals + rawr mid-turn compact eligible]
+  A[User turn starts] --> B[core run_turn]
+  B --> C{Rawr auto compaction enabled}
+  C --> C_yes[yes]
+  C_yes --> E[core rawr mid turn eligible]
+  C --> C_no[no]
+  C_no --> D[core built in auto compact only]
 
-  F[Turn completes in TUI] --> G[tui: maybe_rawr_auto_compact]
-  G --> H{Feature::RawrAutoCompaction?}
-  H -->|no| I[return (no watcher behavior)]
-  H -->|yes| J[tui watcher state machine eligible]
+  F[Turn completes in TUI] --> G[tui maybe_rawr_auto_compact]
+  G --> H{Rawr auto compaction enabled}
+  H --> H_yes[yes]
+  H_yes --> J[tui watcher state machine eligible]
+  H --> H_no[no]
+  H_no --> I[return]
 ```
 
 ## Invariant: There are two distinct rawr compaction workflows
@@ -84,24 +88,31 @@ These workflows are independent and can both fire over the lifetime of a thread.
 
 ```mermaid
 graph TD
-  subgraph Core["A) core mid-turn compaction"]
-    A1[run_turn sampling loop] --> A2[after sampling request: needs_follow_up?]
-    A2 -->|yes| A3[compute percent_remaining]
-    A3 --> A4[read signals + boundaries_required (config)]
-    A4 --> A5{rawr_should_compact_mid_turn?}
-    A5 -->|yes| A6[set CompactionTrigger::AutoWatcher]
+  subgraph Core[A core mid turn compaction]
+    A1[run_turn sampling loop] --> A2{needs follow up}
+    A2 --> A2_yes[yes]
+    A2_yes --> A3[compute percent remaining]
+    A3 --> A4[read signals and boundaries required]
+    A4 --> A5{should compact mid turn}
+    A5 --> A5_yes[yes]
+    A5_yes --> A6[set next compaction trigger AutoWatcher]
     A6 --> A7[run compaction task now]
     A7 --> A1
-    A5 -->|no| A1
+    A5 --> A5_no[no]
+    A5_no --> A1
+    A2 --> A2_no[no]
+    A2_no --> A1
   end
 
-  subgraph TUI["B) TUI watcher (turn-complete + preflight)"]
+  subgraph TUI[B TUI watcher]
     B1[on_task_complete] --> B2[maybe_rawr_auto_compact]
-    B2 --> B3{state?}
-    B3 -->|Idle| B4[check thresholds/boundaries]
-    B4 -->|compact| B5[send Op::Compact]
-    B5 --> B6[observe ContextCompacted + compaction completion]
-    B6 --> B7[inject packet (optional)]
+    B2 --> B3{state}
+    B3 --> B3_idle[Idle]
+    B3_idle --> B4[check thresholds and boundaries]
+    B4 --> B4_compact[compact]
+    B4_compact --> B5[send Op Compact]
+    B5 --> B6[observe ContextCompacted and compaction completion]
+    B6 --> B7[inject packet optional]
   end
 ```
 
@@ -122,14 +133,19 @@ graph TD
 
 ```mermaid
 graph TD
-  A[percent_remaining below threshold] --> B[tui: mode?]
-  B -->|tag| C[emit info message only]
-  B -->|suggest| D[emit suggestion only]
-  B -->|auto| E[tui may send Op::Compact]
+  A[percent remaining below threshold] --> B{tui mode}
+  B --> B_tag[tag]
+  B_tag --> C[emit info message only]
+  B --> B_suggest[suggest]
+  B_suggest --> D[emit suggestion only]
+  B --> B_auto[auto]
+  B_auto --> E[tui may send Op Compact]
 
-  F[core: needs_follow_up == true] --> G{Feature::RawrAutoCompaction?}
-  G -->|yes| H[core may compact mid-turn (no mode check)]
-  G -->|no| I[core built-in auto-compact only]
+  F[core needs follow up true] --> G{Rawr auto compaction enabled}
+  G --> G_yes[yes]
+  G_yes --> H[core may compact mid turn no mode check]
+  G --> G_no[no]
+  G_no --> I[core built in auto compact only]
 ```
 
 ## Invariant: Exactly how the TUI watcher decides “should we compact now?”
@@ -154,19 +170,27 @@ graph TD
 
 ```mermaid
 graph TD
-  A[maybe_rawr_auto_compact] --> B{preconditions ok?}
-  B -->|no| C[return]
-  B -->|yes| D[compute percent_remaining]
-  D --> E[compute trigger threshold: ready || percent || 75]
-  E --> F{percent_remaining < trigger?}
-  F -->|no| C
-  F -->|yes| G[compute has_any_required_boundary]
-  G --> H[compute is_emergency]
-  H --> I{mode == auto?}
-  I -->|no| J[tag/suggest: info only]
-  I -->|yes| K{is_emergency OR has_boundary?}
-  K -->|no| L[skip auto compact]
-  K -->|yes| M[proceed to compact (packet_author)]
+  A[maybe_rawr_auto_compact] --> B{preconditions ok}
+  B --> B_no[no]
+  B_no --> C[return]
+  B --> B_yes[yes]
+  B_yes --> D[compute percent remaining]
+  D --> E[compute trigger threshold ready or percent or 75]
+  E --> F{percent remaining below trigger}
+  F --> F_no[no]
+  F_no --> C
+  F --> F_yes[yes]
+  F_yes --> G[compute has any required boundary]
+  G --> H[compute is emergency]
+  H --> I{mode is auto}
+  I --> I_no[no]
+  I_no --> J[tag or suggest info only]
+  I --> I_yes[yes]
+  I_yes --> K{is emergency or has boundary}
+  K --> K_no[no]
+  K_no --> L[skip auto compact]
+  K --> K_yes[yes]
+  K_yes --> M[proceed to compact packet author]
 ```
 
 ## Invariant: `packet_author = "watcher"` (turn-complete auto) exact steps
@@ -196,20 +220,26 @@ graph TD
 
 ```mermaid
 graph TD
-  A[tui: mode=auto + watcher] --> B{queued user msgs?}
-  B -->|yes| C[state=Compacting(should_inject=false)]
-  C --> D[send Op::Compact]
-  B -->|no| E{turn_complete boundary required?}
-  E -->|yes| F[set preflight_pending; return]
-  E -->|no| G[build packet; state=Compacting(should_inject=true)]
+  A[tui mode auto watcher] --> B{queued user messages}
+  B --> B_yes[yes]
+  B_yes --> C[state Compacting should_inject false]
+  C --> D[send Op Compact]
+  B --> B_no[no]
+  B_no --> E{turn_complete boundary required}
+  E --> E_yes[yes]
+  E_yes --> F[set preflight_pending return]
+  E --> E_no[no]
+  E_no --> G[build packet state Compacting should_inject true]
   G --> D
-  D --> H[core: run compaction task]
-  H --> I[tui: ContextCompacted]
+  D --> H[core run compaction task]
+  H --> I[tui ContextCompacted]
   I --> J[mark saw_context_compacted]
-  H --> K[tui: on_task_complete(compaction)]
-  K --> L{should_inject_packet?}
-  L -->|yes| M[inject packet once (Op::UserTurn)]
-  L -->|no| N[state=Idle]
+  H --> K[tui on_task_complete compaction]
+  K --> L{should inject packet}
+  L --> L_yes[yes]
+  L_yes --> M[inject packet once send Op UserTurn]
+  L --> L_no[no]
+  L_no --> N[state Idle]
 ```
 
 ## Invariant: `packet_author = "agent"` (turn-complete auto) exact steps
@@ -228,16 +258,16 @@ graph TD
 
 ```mermaid
 graph TD
-  A[tui: mode=auto + packet_author=agent] --> B[state=AwaitingPacket]
-  B --> C[inject agent packet prompt (Op::UserTurn)]
+  A[tui mode auto packet_author agent] --> B[state AwaitingPacket]
+  B --> C[inject agent packet prompt send Op UserTurn]
   C --> D[agent replies with packet text]
-  D --> E[tui: on_task_complete -> maybe_rawr_auto_compact]
-  E --> F[consume AwaitingPacket; packet=last_agent_message]
-  F --> G[state=Compacting(should_inject=true)]
-  G --> H[send Op::Compact]
-  H --> I[core: run compaction task]
-  I --> J[tui: ContextCompacted + compaction completion]
-  J --> K[inject stored packet once (Op::UserTurn)]
+  D --> E[tui on_task_complete runs maybe_rawr_auto_compact]
+  E --> F[consume AwaitingPacket set packet]
+  F --> G[state Compacting should_inject true]
+  G --> H[send Op Compact]
+  H --> I[core run compaction task]
+  I --> J[tui ContextCompacted and compaction completion]
+  J --> K[inject stored packet once send Op UserTurn]
 ```
 
 ## Invariant: `turn_complete` boundary preflight (defer until next user message) exact steps
@@ -253,15 +283,18 @@ graph TD
 
 ```mermaid
 graph TD
-  A[tui: maybe_rawr_auto_compact] --> B{turn_complete in required boundaries?}
-  B -->|yes| C[preflight_pending = Some(percent_remaining)]
-  C --> D[return (no compaction yet)]
+  A[tui maybe_rawr_auto_compact] --> B{turn_complete required boundary}
+  B --> B_yes[yes]
+  B_yes --> C[preflight_pending set percent remaining]
+  C --> D[return no compaction yet]
   D --> E[user submits message]
-  E --> F{preflight_pending && not local cmd?}
-  F -->|yes| G[queue user msg; send Op::Compact]
-  G --> H[core: run compaction task]
-  H --> I[tui: after compaction, send queued msg]
-  F -->|no| J[normal submit path]
+  E --> F{preflight_pending and not local cmd}
+  F --> F_yes[yes]
+  F_yes --> G[queue user message send Op Compact]
+  G --> H[core run compaction task]
+  H --> I[tui after compaction send queued message]
+  F --> F_no[no]
+  F_no --> J[normal submit path]
 ```
 
 ## Invariant: What compaction actually does to the thread (history rewrite) — exact steps
@@ -292,17 +325,19 @@ This applies to: manual compact, built-in auto-compact, rawr mid-turn, and rawr 
 
 ```mermaid
 graph TD
-  A[Op::Compact] --> B[TaskKind::Compact]
-  B --> C{remote compaction enabled<br/>and provider supports?}
-  C -->|yes| D[remote: compact_conversation_history]
-  D --> E[replace history; recompute tokens]
-  E --> F[persist RolloutItem::Compacted(replacement_history)]
-  C -->|no| G[local: run_compact_task_inner]
-  G --> H[take compaction_trigger]
-  H --> I[stream compaction prompt; record output]
+  A[Op Compact] --> B[TaskKind Compact]
+  B --> C{remote compaction enabled and provider supports}
+  C --> C_yes[yes]
+  C_yes --> D[remote compact conversation history]
+  D --> E[replace history recompute tokens]
+  E --> F[persist Compacted replacement_history]
+  C --> C_no[no]
+  C_no --> G[local run_compact_task_inner]
+  G --> H[take compaction trigger]
+  H --> I[stream compaction prompt record output]
   I --> J[build summary_text]
   J --> K[rewrite history to compacted form]
-  K --> L[recompute tokens + persist RolloutItem::Compacted(message)]
+  K --> L[recompute tokens persist Compacted message]
 ```
 
 ## Variant / invariant: Can we modify “the compaction prompt we don’t control”?
@@ -321,9 +356,11 @@ Practical implication:
 
 ```mermaid
 graph TD
-  A[Need editable compaction prompt?] --> B{Remote compaction enabled?}
-  B -->|yes| C[No: provider controls prompt/behavior]
-  B -->|no| D[Yes: local compaction uses turn_context.compact_prompt]
+  A[Need editable compaction prompt] --> B{remote compaction enabled}
+  B --> B_yes[yes]
+  B_yes --> C[No provider controls behavior]
+  B --> B_no[no]
+  B_no --> D[Yes local uses turn_context compact_prompt]
 ```
 
 ## Prompt incentives and loop surfaces (why this can “want to loop”)

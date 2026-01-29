@@ -120,6 +120,34 @@ This is the user-visible shape of the golden path:
 4. `User`: post-compaction handoff (“here’s your packet back; continue” + packet)
 5. `Assistant`: continues work
 
+### UX-level workflow diagram (turn/interaction plane)
+
+This diagram is intentionally not code-centric. It shows the turn-based transcript and responsibility handoffs.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as User
+  participant W as Watcher (client)
+  participant A as In-session agent
+  participant C as Compactor (task)
+
+  Note over U,A: Ongoing multi-step plan (research → draft → harden)
+  W->>W: Detect boundary + assess context
+  alt should_compact_now = no
+    W-->>A: (no special message; continue normal turns)
+  else should_compact_now = yes
+    U->>A: Heads-up: pause, write continuation packet, then compaction, then resume
+    A->>U: Continuation packet (what/now/next + key constraints)
+    Note over W,C: Handoff: watcher triggers compaction AFTER packet exists
+    W->>C: Start compaction
+    C-->>W: Context compacted (history rewritten)
+    Note over U,A: Handoff: user re-seeds agent with packet post-compaction
+    U->>A: Handoff: “Here’s your packet back; continue” + packet
+    A-->>U: Continue next plan step
+  end
+```
+
 ---
 
 ## Contextual assessment (heuristics): “should we compact now?”
@@ -203,6 +231,72 @@ This section defines an implementable watcher state machine in terms of events, 
    - Trigger compaction task.
 6. `Compacting` → `PostCompactHandoffPending` on compaction completion.
 7. `PostCompactHandoffPending` → `Idle` after injecting post-compaction user handoff message.
+
+### Code-level workflow diagrams (implementation plane)
+
+These diagrams are intentionally code-centric and separate from the UX-level interaction diagram above.
+
+#### Target watcher state machine
+
+```mermaid
+stateDiagram-v2
+  [*] --> Idle
+
+  Idle --> Assessing: OnTurnComplete\n(preconditions ok)
+  Assessing --> Idle: should_compact_now = false
+  Assessing --> HeadsUpInjected: should_compact_now = true
+
+  HeadsUpInjected --> AwaitingPacket: Variant A\n(request packet from agent)
+  HeadsUpInjected --> AwaitingPacket: Variant B\n(generate packet internally)
+
+  AwaitingPacket --> Compacting: packet available
+  AwaitingPacket --> Compacting: OnTimeout\n(fallback packet)
+
+  Compacting --> PostCompactHandoffPending: compaction complete
+  PostCompactHandoffPending --> Idle: inject handoff user message\n(+ packet)
+```
+
+#### Target component/event handoffs (TUI watcher ↔ core ↔ provider)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant UI as TUI ChatWidget (watcher)
+  participant Core as Core op/task dispatcher
+  participant Prov as Provider (OpenAI/Codex)
+
+  Note over UI: Turn completes → maybe_rawr_auto_compact(...)
+  UI->>UI: Assess boundary + heuristics\n(+ cooldown, synthetic-turn guard)
+
+  alt should_compact_now = no
+    UI-->>UI: return (no-op)
+  else should_compact_now = yes
+    Note over UI,Core: Handoff: inject heads-up as synthetic user turn
+    UI->>Core: Op::UserTurn(heads-up)
+    Core->>Prov: sampling request(s)
+    Prov-->>Core: assistant output
+    Core-->>UI: OnTaskComplete(UserTurn)
+
+    alt Variant A (agent authors packet)
+      UI->>Core: Op::UserTurn(packet request)
+      Core->>Prov: sampling request(s)
+      Prov-->>Core: assistant packet output
+      Core-->>UI: OnTaskComplete(UserTurn)
+      UI->>UI: store packet for compaction sequence
+    else Variant B (watcher authors packet)
+      UI->>UI: build packet text\n(from structured state + last agent msg)
+    end
+
+    Note over UI,Core: Handoff: trigger compaction AFTER packet exists
+    UI->>Core: Op::Compact
+    Core->>Prov: compaction request (if remote)\n(or local model/prompt)
+    Prov-->>Core: compaction result
+    Core-->>UI: Event ContextCompacted\n+ OnTaskComplete(Compact)
+
+    Note over UI,Core: Handoff: inject post-compaction user message\n(wrapper + packet)
+    UI->>Core: Op::UserTurn(handoff + packet)
+  end
+```
 
 ### Loop prevention requirements (state-machine level)
 

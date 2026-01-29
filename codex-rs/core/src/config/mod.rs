@@ -1597,9 +1597,6 @@ impl Config {
             suppress_unstable_features_warning: cfg
                 .suppress_unstable_features_warning
                 .unwrap_or(false),
-            suppress_unstable_features_warning: cfg
-                .suppress_unstable_features_warning
-                .unwrap_or(false),
             rawr_auto_compaction: cfg.rawr_auto_compaction,
             active_profile: active_profile_name,
             active_project,

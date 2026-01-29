@@ -21,6 +21,14 @@ packet:
   max_tail_chars: 1200
 ---
 
+Okay — here’s what we’re going to do. I’m going to ask you to put together a continuation context packet for yourself: a small, precise handoff that lets you keep going exactly where you left off.
+
+After you provide that packet, I’m going to compact your session so you have more context window to work with for the next step. Then I’m going to hand this packet back to you right after compaction so you can immediately continue the same line of work (no drift, no restart).
+
+So: include whatever you think you’ll need in order to resume cleanly — keep the overarching goal in mind, and don’t forget the important things we’ve learned so far, things we’ve tried, invariants/decisions we’ve made, and any other details you’ll need to pick up the thread without re-discovering anything.
+
+There are guidelines below about what to include. You’re allowed (and encouraged) to upgrade/improve those guidelines based on your own self-reflection — include what you genuinely need to continue well. At the bottom, I’ll also include a short verbatim snippet of the very last thing you were thinking about or working on as a memory trigger.
+
 [rawr] Agent: before we compact this thread, you must **self-reflect** and write a **continuation context packet** for yourself.
 
 This is not a generic compact. This is your tight, intra-turn handoff: you are responsible for capturing the minimum, precise context you will need to resume smoothly after compaction and continue exactly where you left off (no drift, no restart).

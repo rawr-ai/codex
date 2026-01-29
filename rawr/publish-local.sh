@@ -89,10 +89,6 @@ set -euo pipefail
 # rawr defaults
 export CODEX_HOME="${CODEX_HOME:-$HOME/.codex-rawr}"
 
-# rawr watcher defaults: full auto + agent-authored continuation packet
-export RAWR_AUTO_COMPACTION_MODE="${RAWR_AUTO_COMPACTION_MODE:-auto}"
-export RAWR_AUTO_COMPACTION_PACKET_AUTHOR="${RAWR_AUTO_COMPACTION_PACKET_AUTHOR:-agent}"
-
 exec "$HOME/.local/bin/codex-rawr" "$@"
 EOF
 

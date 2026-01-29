@@ -155,6 +155,7 @@ use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnDiffEvent;
 use crate::protocol::WarningEvent;
+use crate::rawr_auto_compaction::RawrAutoCompactionSignals;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::RolloutRecorderParams;
 use crate::rollout::map_session_init_error;
@@ -450,6 +451,7 @@ pub(crate) struct Session {
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) services: SessionServices,
     next_internal_sub_id: AtomicU64,
+    rawr_auto_compaction_signals: Mutex<RawrAutoCompactionSignals>,
 }
 
 /// The context needed for a single turn of the thread.
@@ -875,6 +877,7 @@ impl Session {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            rawr_auto_compaction_signals: Mutex::new(RawrAutoCompactionSignals::default()),
         });
 
         // Dispatch the SessionConfiguredEvent first and then report any errors.
@@ -1788,6 +1791,94 @@ impl Session {
 
     pub(crate) fn features(&self) -> Features {
         self.features.clone()
+    }
+
+    pub(crate) async fn rawr_reset_auto_compaction_signals(&self, turn_id: String) {
+        if !self.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+        let mut guard = self.rawr_auto_compaction_signals.lock().await;
+        guard.reset_for_turn(turn_id);
+    }
+
+    pub(crate) async fn rawr_note_exec_boundary(
+        &self,
+        turn_id: &str,
+        command: &[String],
+        exit_code: i32,
+    ) {
+        if !self.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+        let mut guard = self.rawr_auto_compaction_signals.lock().await;
+        if !guard.is_active_turn(turn_id) {
+            return;
+        }
+        if exit_code == 0 {
+            if crate::rawr_auto_compaction::rawr_command_looks_like_git_commit(command) {
+                guard.saw_commit = true;
+            }
+            if crate::rawr_auto_compaction::rawr_command_looks_like_pr_checkpoint(command) {
+                guard.saw_pr_checkpoint = true;
+            }
+        }
+    }
+
+    pub(crate) async fn rawr_note_plan_update(
+        &self,
+        turn_id: &str,
+        update: &codex_protocol::plan_tool::UpdatePlanArgs,
+    ) {
+        if !self.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+        let mut guard = self.rawr_auto_compaction_signals.lock().await;
+        if !guard.is_active_turn(turn_id) {
+            return;
+        }
+        guard.saw_plan_update = true;
+        if crate::rawr_auto_compaction::rawr_plan_update_is_checkpoint(update) {
+            guard.saw_plan_checkpoint = true;
+        }
+    }
+
+    pub(crate) async fn rawr_note_semantic_boundary(
+        &self,
+        turn_id: &str,
+        last_agent_message: &str,
+    ) {
+        if !self.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+        let mut guard = self.rawr_auto_compaction_signals.lock().await;
+        if !guard.is_active_turn(turn_id) {
+            return;
+        }
+        if crate::rawr_auto_compaction::rawr_agent_message_looks_done(last_agent_message) {
+            guard.saw_agent_done = true;
+        }
+        if crate::rawr_auto_compaction::rawr_agent_message_looks_like_topic_shift(
+            last_agent_message,
+        ) {
+            guard.saw_topic_shift = true;
+        }
+        if crate::rawr_auto_compaction::rawr_agent_message_looks_like_concluding_thought(
+            last_agent_message,
+        ) {
+            guard.saw_concluding_thought = true;
+        }
+    }
+
+    pub(crate) async fn rawr_auto_compaction_signals(
+        &self,
+        turn_id: &str,
+    ) -> RawrAutoCompactionSignals {
+        let guard = self.rawr_auto_compaction_signals.lock().await;
+        if guard.is_active_turn(turn_id) {
+            guard.clone()
+        } else {
+            RawrAutoCompactionSignals::default()
+        }
     }
 
     pub(crate) async fn collaboration_mode(&self) -> CollaborationMode {
@@ -2843,7 +2934,16 @@ mod handlers {
     }
 
     pub async fn compact(sess: &Arc<Session>, sub_id: String) {
-        let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+        let mut turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+
+        if sess.enabled(crate::features::Feature::RawrAutoCompaction)
+            && matches!(
+                crate::compaction_audit::peek_next_compaction_trigger(sess.conversation_id),
+                Some(codex_protocol::protocol::CompactionTrigger::AutoWatcher { .. })
+            )
+        {
+            turn_context = super::rawr_compaction_turn_context(sess, &turn_context).await;
+        }
 
         sess.spawn_task(
             Arc::clone(&turn_context),
@@ -3158,15 +3258,13 @@ pub(crate) async fn run_turn(
     let model_info = turn_context.client.get_model_info();
     let total_usage_tokens = sess.get_total_token_usage().await;
     let rawr_auto_compaction_enabled = sess.enabled(Feature::RawrAutoCompaction);
-    let auto_compact_limit = if rawr_auto_compaction_enabled {
-        i64::MAX
-    } else {
-        model_info.auto_compact_token_limit().unwrap_or(i64::MAX)
-    };
+    let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
     let event = EventMsg::TurnStarted(TurnStartedEvent {
         model_context_window: turn_context.client.get_model_context_window(),
     });
     sess.send_event(&turn_context, event).await;
+    sess.rawr_reset_auto_compaction_signals(turn_context.sub_id.clone())
+        .await;
     if !rawr_auto_compaction_enabled && total_usage_tokens >= auto_compact_limit {
         run_auto_compact(&sess, &turn_context).await;
     }
@@ -3298,6 +3396,62 @@ pub(crate) async fn run_turn(
                 let total_usage_tokens = sess.get_total_token_usage().await;
                 let token_limit_reached = total_usage_tokens >= auto_compact_limit;
 
+                if rawr_auto_compaction_enabled {
+                    if let Some(last_message) = sampling_request_last_agent_message.as_deref() {
+                        sess.rawr_note_semantic_boundary(
+                            turn_context.sub_id.as_str(),
+                            last_message,
+                        )
+                        .await;
+                    }
+                    if needs_follow_up {
+                        let config = turn_context.client.config();
+                        let percent_remaining = turn_context
+                            .client
+                            .get_model_context_window()
+                            .map(|context_window| {
+                                let remaining = context_window.saturating_sub(total_usage_tokens);
+                                if context_window == 0 {
+                                    0
+                                } else {
+                                    remaining.saturating_mul(100) / context_window
+                                }
+                            })
+                            .unwrap_or(i64::MAX);
+                        let boundaries_required = config
+                            .rawr_auto_compaction
+                            .as_ref()
+                            .and_then(|rawr| rawr.trigger.as_ref())
+                            .and_then(|trigger| trigger.auto_requires_any_boundary.as_deref())
+                            .unwrap_or(&[]);
+                        let signals = sess
+                            .rawr_auto_compaction_signals(turn_context.sub_id.as_str())
+                            .await;
+                        if crate::rawr_auto_compaction::rawr_should_compact_mid_turn(
+                            config.as_ref(),
+                            percent_remaining,
+                            &signals,
+                            boundaries_required,
+                        ) {
+                            crate::compaction_audit::set_next_compaction_trigger(
+                                sess.conversation_id,
+                                codex_protocol::protocol::CompactionTrigger::AutoWatcher {
+                                    trigger_percent_remaining: percent_remaining,
+                                    saw_commit: signals.saw_commit,
+                                    saw_plan_checkpoint: signals.saw_plan_checkpoint,
+                                    saw_plan_update: signals.saw_plan_update,
+                                    saw_pr_checkpoint: signals.saw_pr_checkpoint,
+                                    packet_author: crate::rawr_auto_compaction::rawr_packet_author(
+                                        config.as_ref(),
+                                    ),
+                                },
+                            );
+                            run_rawr_auto_compact(&sess, &turn_context).await;
+                            continue;
+                        }
+                    }
+                }
+
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if token_limit_reached && needs_follow_up && !rawr_auto_compaction_enabled {
                     run_auto_compact(&sess, &turn_context).await;
@@ -3357,6 +3511,80 @@ async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) 
     } else {
         run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await;
     }
+}
+
+async fn rawr_compaction_turn_context(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+) -> Arc<TurnContext> {
+    let config = turn_context.client.config();
+    let rawr = config.rawr_auto_compaction.as_ref();
+    let compaction_model = rawr
+        .and_then(|rawr| rawr.compaction_model.as_deref())
+        .unwrap_or("gpt-5.2");
+    let compaction_effort = rawr
+        .and_then(|rawr| rawr.compaction_reasoning_effort)
+        .unwrap_or(codex_protocol::openai_models::ReasoningEffort::High);
+    let compaction_verbosity = rawr
+        .and_then(|rawr| rawr.compaction_verbosity)
+        .unwrap_or(codex_protocol::config_types::Verbosity::High);
+
+    // Override the model for the compaction request, but keep the rest of the turn context stable.
+    // This gives us a predictable, high-quality compaction even when the session model differs.
+    let model_info = sess
+        .services
+        .models_manager
+        .get_model_info(compaction_model, config.as_ref())
+        .await;
+
+    let mut per_turn_config = (*config).clone();
+    per_turn_config.model_verbosity = Some(compaction_verbosity);
+    let per_turn_config = Arc::new(per_turn_config);
+
+    let otel_manager = turn_context
+        .client
+        .get_otel_manager()
+        .with_model(compaction_model, model_info.slug.as_str());
+    let client = ModelClient::new(
+        Arc::clone(&per_turn_config),
+        turn_context.client.get_auth_manager(),
+        model_info.clone(),
+        otel_manager,
+        turn_context.client.get_provider(),
+        Some(compaction_effort),
+        turn_context.client.get_reasoning_summary(),
+        sess.conversation_id,
+        turn_context.client.get_session_source(),
+    );
+
+    Arc::new(TurnContext {
+        sub_id: turn_context.sub_id.clone(),
+        client,
+        cwd: turn_context.cwd.clone(),
+        developer_instructions: turn_context.developer_instructions.clone(),
+        compact_prompt: turn_context.compact_prompt.clone(),
+        user_instructions: turn_context.user_instructions.clone(),
+        personality: turn_context.personality,
+        approval_policy: turn_context.approval_policy,
+        sandbox_policy: turn_context.sandbox_policy.clone(),
+        windows_sandbox_level: turn_context.windows_sandbox_level,
+        shell_environment_policy: turn_context.shell_environment_policy.clone(),
+        tools_config: turn_context.tools_config.clone(),
+        ghost_snapshot: turn_context.ghost_snapshot.clone(),
+        final_output_json_schema: turn_context.final_output_json_schema.clone(),
+        codex_linux_sandbox_exe: turn_context.codex_linux_sandbox_exe.clone(),
+        tool_call_gate: Arc::clone(&turn_context.tool_call_gate),
+        truncation_policy: model_info.truncation_policy.into(),
+        dynamic_tools: turn_context.dynamic_tools.clone(),
+    })
+}
+
+async fn run_rawr_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
+    run_auto_compact(
+        sess,
+        &rawr_compaction_turn_context(sess, turn_context).await,
+    )
+    .await;
 }
 
 fn filter_connectors_for_input(
@@ -4775,6 +5003,7 @@ mod tests {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            rawr_auto_compaction_signals: Mutex::new(RawrAutoCompactionSignals::default()),
         };
 
         (session, turn_context)
@@ -4887,6 +5116,7 @@ mod tests {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            rawr_auto_compaction_signals: Mutex::new(RawrAutoCompactionSignals::default()),
         });
 
         (session, turn_context, rx_event)

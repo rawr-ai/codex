@@ -345,9 +345,14 @@ async fn manual_compact_uses_custom_prompt() {
         trigger_percent_remaining: 42,
         saw_commit: true,
         saw_plan_checkpoint: false,
+        saw_plan_update: false,
+        saw_pr_checkpoint: false,
         packet_author: CompactionPacketAuthor::Agent,
     };
-    compaction_audit::set_next_compaction_trigger(expected_trigger.clone());
+    compaction_audit::set_next_compaction_trigger(
+        test.session_configured.session_id,
+        expected_trigger.clone(),
+    );
     codex.submit(Op::Compact).await.expect("trigger compact");
     let warning_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
     let EventMsg::Warning(WarningEvent { message }) = warning_event else {

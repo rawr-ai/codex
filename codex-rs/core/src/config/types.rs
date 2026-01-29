@@ -666,6 +666,72 @@ impl Default for ShellEnvironmentPolicy {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionMode {
+    Tag,
+    Suggest,
+    Auto,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionPacketAuthor {
+    Watcher,
+    Agent,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionBoundary {
+    Commit,
+    PlanCheckpoint,
+    PlanUpdate,
+    PrCheckpoint,
+    AgentDone,
+    TopicShift,
+    ConcludingThought,
+    TurnComplete,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionTriggerToml {
+    /// Early (opportunistic) threshold: only compact on big-ish step boundaries.
+    pub early_percent_remaining_lt: Option<i64>,
+    /// Ready threshold (default behavior). When unset, falls back to `percent_remaining_lt`.
+    pub ready_percent_remaining_lt: Option<i64>,
+    /// Asap threshold: compact at the next natural pause boundary.
+    pub asap_percent_remaining_lt: Option<i64>,
+    /// Back-compat: older configs used a single threshold.
+    pub percent_remaining_lt: Option<i64>,
+    pub emergency_percent_remaining_lt: Option<i64>,
+    pub auto_requires_any_boundary: Option<Vec<RawrAutoCompactionBoundary>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionPacketToml {
+    pub max_tail_chars: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionToml {
+    pub mode: Option<RawrAutoCompactionMode>,
+    pub packet_author: Option<RawrAutoCompactionPacketAuthor>,
+    /// Optional model override used for compaction requests triggered by the watcher.
+    pub compaction_model: Option<String>,
+    /// Optional reasoning effort override used for watcher-triggered compactions.
+    pub compaction_reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+    /// Optional verbosity override used for watcher-triggered compactions.
+    pub compaction_verbosity: Option<codex_protocol::config_types::Verbosity>,
+    #[serde(default)]
+    pub trigger: Option<RawrAutoCompactionTriggerToml>,
+    #[serde(default)]
+    pub packet: Option<RawrAutoCompactionPacketToml>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

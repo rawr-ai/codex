@@ -567,7 +567,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::RawrAutoCompaction,
         key: "rawr_auto_compaction",
-        stage: Stage::Beta,
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
 ];

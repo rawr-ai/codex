@@ -71,7 +71,8 @@ async fn run_compact_task_inner(
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
 ) {
-    let compaction_trigger = crate::compaction_audit::take_next_compaction_trigger();
+    let compaction_trigger =
+        crate::compaction_audit::take_next_compaction_trigger(sess.conversation_id);
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;

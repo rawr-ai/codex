@@ -63,19 +63,36 @@ rawr_auto_compaction = true
 
 When enabled:
 - This fork owns compaction timing (Codex’s built-in auto-compaction is bypassed).
-- The watcher only runs at natural boundaries (turn completion) and will not compact mid-turn.
+- The watcher can compact **mid-turn** (between sampling requests) at natural boundaries, and can also compact at turn completion.
 
 Default behavior: suggest mode (prints a recommendation once context window drops below 75% remaining).
 
-Optional env vars:
-- `RAWR_AUTO_COMPACTION_MODE=tag|suggest|auto` (default: `suggest`)
-- `RAWR_AUTO_COMPACTION_PACKET_AUTHOR=watcher|agent` (default: `watcher`, only used in `auto` mode)
+Config settings (explicit, recommended):
+```toml
+[rawr_auto_compaction]
+mode = "auto" # tag | suggest | auto
+packet_author = "agent" # watcher | agent
+# Defaults to "GPT-5.2 (high)" for watcher-triggered compactions:
+# gpt-5.2 + ReasoningEffort::High.
+# compaction_model = "gpt-5.2"
+# compaction_reasoning_effort = "high"
+# compaction_verbosity = "high"
+
+[rawr_auto_compaction.trigger]
+early_percent_remaining_lt = 85
+ready_percent_remaining_lt = 75
+asap_percent_remaining_lt = 65
+# Back-compat: older configs used a single threshold.
+percent_remaining_lt = 75
+emergency_percent_remaining_lt = 15
+auto_requires_any_boundary = ["commit", "pr_checkpoint", "plan_checkpoint", "agent_done"]
+
+[rawr_auto_compaction.packet]
+max_tail_chars = 1200
+```
 
 ## Heuristics prompt (auditable/editable)
-Copy the template `codex/rawr/prompts/rawr-auto-compact.md` into:
-- `~/.codex-rawr/prompts/rawr-auto-compact.md`
-
-The YAML frontmatter controls thresholds and “auto requires boundary” gating; the Markdown body is used as the prompt when `RAWR_AUTO_COMPACTION_PACKET_AUTHOR=agent`.
+The prompt lives in-repo at `rawr/prompts/rawr-auto-compact.md` and is embedded into the binary at build time. The YAML frontmatter provides default thresholds/boundaries; the Markdown body is used as the prompt when `packet_author = "agent"`. Config overrides take precedence over frontmatter defaults.
 
 ## Using with Happy Coder
 Happy Coder’s CLI supports `happy codex` (Codex mode). If your `PATH` resolves `codex` to this fork (e.g. via the symlink above), `happy codex` will launch the fork.

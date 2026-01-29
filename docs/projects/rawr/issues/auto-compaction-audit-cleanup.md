@@ -15,3 +15,10 @@
 - **Choice:** Remove the legacy key and use `ready_percent_remaining_lt` exclusively, with defaults.
 - **Rationale:** No backward compatibility needed; simplifies config and eliminates ambiguous thresholds.
 - **Risk:** Any lingering configs that still use only `percent_remaining_lt` will no longer affect behavior.
+
+### Drop unused watcher-prompt artifact
+- **Context:** `rawr/prompts/rawr-auto-compact-watcher.md` is not referenced in code or docs after the watcher packet moved to code assembly.
+- **Options:** Keep it as future scaffolding; move it to docs; remove to reduce confusion.
+- **Choice:** Remove the unused prompt file.
+- **Rationale:** Eliminates dead artifacts and reduces the chance of confusing it with the active packet prompt.
+- **Risk:** If we later implement a watcher-authored packet prompt, we will need to recreate or restore the template.

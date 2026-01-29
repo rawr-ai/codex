@@ -596,9 +596,7 @@ struct RawrAutoCompactionPromptFrontmatter {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawrAutoCompactionTriggerRules {
-    early_percent_remaining_lt: Option<i64>,
     ready_percent_remaining_lt: Option<i64>,
-    asap_percent_remaining_lt: Option<i64>,
     emergency_percent_remaining_lt: i64,
     auto_requires_any_boundary: Vec<RawrAutoCompactionBoundary>,
 }
@@ -606,9 +604,7 @@ struct RawrAutoCompactionTriggerRules {
 impl Default for RawrAutoCompactionTriggerRules {
     fn default() -> Self {
         Self {
-            early_percent_remaining_lt: Some(85),
             ready_percent_remaining_lt: Some(75),
-            asap_percent_remaining_lt: Some(65),
             emergency_percent_remaining_lt: 15,
             auto_requires_any_boundary: vec![
                 RawrAutoCompactionBoundary::Commit,
@@ -2013,23 +2009,11 @@ impl ChatWidget {
                 settings.scratch_write_enabled = enabled;
             }
             if let Some(trigger) = config.trigger.as_ref() {
-                if let Some(early_percent_remaining_lt) = trigger.early_percent_remaining_lt {
-                    settings
-                        .prompt_frontmatter
-                        .trigger
-                        .early_percent_remaining_lt = Some(early_percent_remaining_lt);
-                }
                 if let Some(ready_percent_remaining_lt) = trigger.ready_percent_remaining_lt {
                     settings
                         .prompt_frontmatter
                         .trigger
                         .ready_percent_remaining_lt = Some(ready_percent_remaining_lt);
-                }
-                if let Some(asap_percent_remaining_lt) = trigger.asap_percent_remaining_lt {
-                    settings
-                        .prompt_frontmatter
-                        .trigger
-                        .asap_percent_remaining_lt = Some(asap_percent_remaining_lt);
                 }
                 if let Some(emergency_percent_remaining_lt) = trigger.emergency_percent_remaining_lt
                 {

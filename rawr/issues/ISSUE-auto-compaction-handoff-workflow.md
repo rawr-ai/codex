@@ -329,7 +329,6 @@ graph TD
 2. Requires token info; computes `percent_remaining`.
 3. Computes a single trigger threshold (current behavior):
    - `trigger_percent_remaining = ready_percent_remaining_lt OR 75`
-   - Note: `early_percent_remaining_lt` and `asap_percent_remaining_lt` exist in prompt YAML, but are **not used** in this TUI decision (as of current code).
 4. If `percent_remaining >= trigger_percent_remaining`, returns (no action).
 5. Computes “boundary present”:
    - Uses `auto_requires_any_boundary` from prompt YAML frontmatter, overridden by config if set.

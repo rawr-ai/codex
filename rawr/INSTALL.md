@@ -79,9 +79,7 @@ packet_author = "agent" # watcher | agent
 # compaction_verbosity = "high"
 
 [rawr_auto_compaction.trigger]
-early_percent_remaining_lt = 85
 ready_percent_remaining_lt = 75
-asap_percent_remaining_lt = 65
 emergency_percent_remaining_lt = 15
 auto_requires_any_boundary = ["commit", "pr_checkpoint", "plan_checkpoint", "agent_done"]
 

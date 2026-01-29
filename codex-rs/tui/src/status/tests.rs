@@ -69,14 +69,15 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
             // Normalize the displayed Codex version so snapshots stay stable across releases.
             let mut line = line;
             if let Some(start) = line.find("(v")
-                && let Some(end_rel) = line[start..].find(')') {
-                    let end = start + end_rel;
-                    let mut rebuilt = String::with_capacity(line.len());
-                    rebuilt.push_str(&line[..start]);
-                    rebuilt.push_str("(v0.0.0)");
-                    rebuilt.push_str(&line[end + 1..]);
-                    line = rebuilt;
-                }
+                && let Some(end_rel) = line[start..].find(')')
+            {
+                let end = start + end_rel;
+                let mut rebuilt = String::with_capacity(line.len());
+                rebuilt.push_str(&line[..start]);
+                rebuilt.push_str("(v0.0.0)");
+                rebuilt.push_str(&line[end + 1..]);
+                line = rebuilt;
+            }
 
             let line = if let (Some(dir_pos), Some(pipe_idx)) =
                 (line.find("Directory: "), line.rfind('│'))

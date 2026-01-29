@@ -1311,7 +1311,8 @@ impl ChatWidget {
                         let should_defer_to_next_user_turn = settings
                             .prompt_frontmatter
                             .trigger
-                            .auto_requires_any_boundary.contains(&RawrAutoCompactionBoundary::TurnComplete);
+                            .auto_requires_any_boundary
+                            .contains(&RawrAutoCompactionBoundary::TurnComplete);
                         if should_defer_to_next_user_turn
                             && self.rawr_preflight_compaction_pending.is_none()
                         {
@@ -1550,9 +1551,10 @@ impl ChatWidget {
                 }
             }
             if let Some(packet) = config.packet.as_ref()
-                && let Some(max_tail_chars) = packet.max_tail_chars {
-                    settings.prompt_frontmatter.packet.max_tail_chars = max_tail_chars;
-                }
+                && let Some(max_tail_chars) = packet.max_tail_chars
+            {
+                settings.prompt_frontmatter.packet.max_tail_chars = max_tail_chars;
+            }
         }
 
         settings

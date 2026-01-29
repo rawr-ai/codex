@@ -33,16 +33,16 @@ It focuses on **rawr auto-compaction**, but includes the closely related **built
 2. It early-returns if the feature flag is disabled.
 
 ```mermaid
-flowchart TD
+graph TD
   A[UserTurn starts] --> B[core: run_turn]
   B --> C{Feature::RawrAutoCompaction?}
-  C -- no --> D[core: built-in auto-compact only (token limit)]
-  C -- yes --> E[core: rawr mid-turn signals + rawr mid-turn compact eligible]
+  C -->|no| D[core: built-in auto-compact only (token limit)]
+  C -->|yes| E[core: rawr mid-turn signals + rawr mid-turn compact eligible]
 
   F[Turn completes in TUI] --> G[tui: maybe_rawr_auto_compact]
   G --> H{Feature::RawrAutoCompaction?}
-  H -- no --> I[return (no watcher behavior)]
-  H -- yes --> J[tui watcher state machine eligible]
+  H -->|no| I[return (no watcher behavior)]
+  H -->|yes| J[tui watcher state machine eligible]
 ```
 
 ## Invariant: There are two distinct rawr compaction workflows
@@ -83,16 +83,16 @@ These workflows are independent and can both fire over the lifetime of a thread.
 5. After compaction completes, the watcher injects a packet exactly once (depending on state + packet_author).
 
 ```mermaid
-flowchart TD
+graph TD
   subgraph Core["A) core mid-turn compaction"]
     A1[run_turn sampling loop] --> A2[after sampling request: needs_follow_up?]
     A2 -->|yes| A3[compute percent_remaining]
     A3 --> A4[read signals + boundaries_required (config)]
     A4 --> A5{rawr_should_compact_mid_turn?}
-    A5 -- yes --> A6[set CompactionTrigger::AutoWatcher]
+    A5 -->|yes| A6[set CompactionTrigger::AutoWatcher]
     A6 --> A7[run compaction task now]
     A7 --> A1
-    A5 -- no --> A1
+    A5 -->|no| A1
   end
 
   subgraph TUI["B) TUI watcher (turn-complete + preflight)"]
@@ -121,15 +121,15 @@ flowchart TD
 2. So even if the config is `mode = "suggest"`, the core mid-turn path can still compact (if the thresholds + boundary gating say so).
 
 ```mermaid
-flowchart TD
+graph TD
   A[percent_remaining below threshold] --> B[tui: mode?]
   B -->|tag| C[emit info message only]
   B -->|suggest| D[emit suggestion only]
   B -->|auto| E[tui may send Op::Compact]
 
   F[core: needs_follow_up == true] --> G{Feature::RawrAutoCompaction?}
-  G -- yes --> H[core may compact mid-turn (no mode check)]
-  G -- no --> I[core built-in auto-compact only]
+  G -->|yes| H[core may compact mid-turn (no mode check)]
+  G -->|no| I[core built-in auto-compact only]
 ```
 
 ## Invariant: Exactly how the TUI watcher decides “should we compact now?”
@@ -153,20 +153,20 @@ flowchart TD
    - Otherwise proceeds to compact (packet_author dependent).
 
 ```mermaid
-flowchart TD
+graph TD
   A[maybe_rawr_auto_compact] --> B{preconditions ok?}
-  B -- no --> C[return]
-  B -- yes --> D[compute percent_remaining]
+  B -->|no| C[return]
+  B -->|yes| D[compute percent_remaining]
   D --> E[compute trigger threshold: ready || percent || 75]
   E --> F{percent_remaining < trigger?}
-  F -- no --> C
-  F -- yes --> G[compute has_any_required_boundary]
+  F -->|no| C
+  F -->|yes| G[compute has_any_required_boundary]
   G --> H[compute is_emergency]
   H --> I{mode == auto?}
-  I -- no --> J[tag/suggest: info only]
-  I -- yes --> K{is_emergency OR has_boundary?}
-  K -- no --> L[skip auto compact]
-  K -- yes --> M[proceed to compact (packet_author)]
+  I -->|no| J[tag/suggest: info only]
+  I -->|yes| K{is_emergency OR has_boundary?}
+  K -->|no| L[skip auto compact]
+  K -->|yes| M[proceed to compact (packet_author)]
 ```
 
 ## Invariant: `packet_author = "watcher"` (turn-complete auto) exact steps
@@ -195,21 +195,21 @@ flowchart TD
      - `rawr_submit_injected_user_turn(packet)` → sends `Op::UserTurn`
 
 ```mermaid
-flowchart TD
+graph TD
   A[tui: mode=auto + watcher] --> B{queued user msgs?}
-  B -- yes --> C[state=Compacting(should_inject=false)]
+  B -->|yes| C[state=Compacting(should_inject=false)]
   C --> D[send Op::Compact]
-  B -- no --> E{turn_complete boundary required?}
-  E -- yes --> F[set preflight_pending; return]
-  E -- no --> G[build packet; state=Compacting(should_inject=true)]
+  B -->|no| E{turn_complete boundary required?}
+  E -->|yes| F[set preflight_pending; return]
+  E -->|no| G[build packet; state=Compacting(should_inject=true)]
   G --> D
   D --> H[core: run compaction task]
   H --> I[tui: ContextCompacted]
   I --> J[mark saw_context_compacted]
   H --> K[tui: on_task_complete(compaction)]
   K --> L{should_inject_packet?}
-  L -- yes --> M[inject packet once (Op::UserTurn)]
-  L -- no --> N[state=Idle]
+  L -->|yes| M[inject packet once (Op::UserTurn)]
+  L -->|no| N[state=Idle]
 ```
 
 ## Invariant: `packet_author = "agent"` (turn-complete auto) exact steps
@@ -227,7 +227,7 @@ flowchart TD
 6. After compaction completes, the watcher injects the stored packet once (same injection mechanics as the watcher-authored flow).
 
 ```mermaid
-flowchart TD
+graph TD
   A[tui: mode=auto + packet_author=agent] --> B[state=AwaitingPacket]
   B --> C[inject agent packet prompt (Op::UserTurn)]
   C --> D[agent replies with packet text]
@@ -252,16 +252,16 @@ flowchart TD
 4. After compaction completes, `maybe_send_next_queued_input()` submits the queued message as the next user turn.
 
 ```mermaid
-flowchart TD
+graph TD
   A[tui: maybe_rawr_auto_compact] --> B{turn_complete in required boundaries?}
-  B -- yes --> C[preflight_pending = Some(percent_remaining)]
+  B -->|yes| C[preflight_pending = Some(percent_remaining)]
   C --> D[return (no compaction yet)]
   D --> E[user submits message]
   E --> F{preflight_pending && not local cmd?}
-  F -- yes --> G[queue user msg; send Op::Compact]
+  F -->|yes| G[queue user msg; send Op::Compact]
   G --> H[core: run compaction task]
   H --> I[tui: after compaction, send queued msg]
-  F -- no --> J[normal submit path]
+  F -->|no| J[normal submit path]
 ```
 
 ## Invariant: What compaction actually does to the thread (history rewrite) — exact steps
@@ -291,13 +291,13 @@ This applies to: manual compact, built-in auto-compact, rawr mid-turn, and rawr 
 3. The session replaces history and recomputes tokens; the persisted `CompactedItem` stores `replacement_history` (and the `message` is empty).
 
 ```mermaid
-flowchart TD
+graph TD
   A[Op::Compact] --> B[TaskKind::Compact]
-  B --> C{remote compaction enabled\nand provider supports?}
-  C -- yes --> D[remote: compact_conversation_history]
+  B --> C{remote compaction enabled<br/>and provider supports?}
+  C -->|yes| D[remote: compact_conversation_history]
   D --> E[replace history; recompute tokens]
   E --> F[persist RolloutItem::Compacted(replacement_history)]
-  C -- no --> G[local: run_compact_task_inner]
+  C -->|no| G[local: run_compact_task_inner]
   G --> H[take compaction_trigger]
   H --> I[stream compaction prompt; record output]
   I --> J[build summary_text]
@@ -320,10 +320,10 @@ Practical implication:
 - If you need to directly control the compaction prompt content, you must use **local** compaction (`Feature::RemoteCompaction` disabled).
 
 ```mermaid
-flowchart TD
+graph TD
   A[Need editable compaction prompt?] --> B{Remote compaction enabled?}
-  B -- yes --> C[No: provider controls prompt/behavior]
-  B -- no --> D[Yes: local compaction uses turn_context.compact_prompt]
+  B -->|yes| C[No: provider controls prompt/behavior]
+  B -->|no| D[Yes: local compaction uses turn_context.compact_prompt]
 ```
 
 ## Prompt incentives and loop surfaces (why this can “want to loop”)
@@ -362,4 +362,3 @@ If after that turn the thread is still below the watcher threshold, the watcher 
 - Rawr packet prompt file: `rawr/prompts/rawr-auto-compact.md` (frontmatter + body)
 - Local compaction logic: `codex-rs/core/src/compact.rs`
 - Remote compaction logic: `codex-rs/core/src/compact_remote.rs`
-

@@ -21,15 +21,21 @@ packet:
   max_tail_chars: 1200
 ---
 
-[rawr] Before we compact this thread, produce a **continuation context packet** for yourself.
+[rawr] Agent: before we compact this thread, you must **self-reflect** and write a **continuation context packet** for yourself.
 
-This is not a generic compact. It is a tight, intra-turn handoff so you can resume smoothly after compaction and continue the same line of work without drift.
+This is not a generic compact. This is your tight, intra-turn handoff: you are responsible for capturing the minimum, precise context you will need to resume smoothly after compaction and continue exactly where you left off (no drift, no restart).
 
 Precedence (important):
 - This continuation context packet is the authoritative source of “what to do next” after compaction.
 - The generic compacted context is background only and must not override or supersede this packet.
 
-Write the packet as if it comes from the user addressing you. Keep it short and structured. Do not include secrets; redact tokens/keys.
+Accountability:
+- You own what gets carried forward. Be deliberate: reflect on your actual goal, state, decisions, and immediate next action.
+- If something is uncertain, name the assumption you are carrying forward rather than hand-waving it.
+
+Write the packet in my voice, as if I (the user) am speaking directly to you (the in-session agent). But the content must come from your self-reflection on this conversation and your work so far.
+
+Keep it short and structured. Do not include secrets; redact tokens/keys.
 
 Include exactly these sections:
 

@@ -333,23 +333,13 @@ async fn manual_compact_uses_custom_prompt() {
     let custom_prompt = "Use this compact prompt instead";
 
     let model_provider = non_openai_model_provider(&server);
-    let home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&home).await;
-    config.model_provider = model_provider;
-    config.compact_prompt = Some(custom_prompt.to_string());
-
-    let thread_manager = ThreadManager::with_models_provider(
-        CodexAuth::from_api_key("dummy"),
-        config.model_provider.clone(),
-    );
-    let NewThread {
-        thread: codex,
-        session_configured,
-        ..
-    } = thread_manager
-        .start_thread(config)
-        .await
-        .expect("create conversation");
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.compact_prompt = Some(custom_prompt.to_string());
+    });
+    let test = builder.build(&server).await.expect("create conversation");
+    let codex = test.codex.clone();
+    let rollout_path = test.session_configured.rollout_path.expect("rollout path");
 
     let expected_trigger = CompactionTrigger::AutoWatcher {
         trigger_percent_remaining: 42,
@@ -405,7 +395,6 @@ async fn manual_compact_uses_custom_prompt() {
     codex.submit(Op::Shutdown).await.unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
 
-    let rollout_path = session_configured.rollout_path.expect("rollout path");
     let rollout_text = std::fs::read_to_string(&rollout_path).unwrap_or_else(|e| {
         panic!(
             "failed to read rollout file {}: {e}",

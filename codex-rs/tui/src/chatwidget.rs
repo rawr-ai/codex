@@ -540,6 +540,7 @@ pub(crate) struct ChatWidget {
     rawr_auto_compaction_state: RawrAutoCompactionState,
     rawr_saw_commit_this_turn: bool,
     rawr_saw_plan_checkpoint_this_turn: bool,
+    rawr_saw_pr_checkpoint_this_turn: bool,
     rawr_preflight_compaction_pending: Option<i64>,
 }
 
@@ -570,6 +571,9 @@ struct RawrAutoCompactionPromptFrontmatter {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawrAutoCompactionTriggerRules {
+    early_percent_remaining_lt: Option<i64>,
+    ready_percent_remaining_lt: Option<i64>,
+    asap_percent_remaining_lt: Option<i64>,
     percent_remaining_lt: i64,
     emergency_percent_remaining_lt: i64,
     auto_requires_any_boundary: Vec<RawrAutoCompactionBoundary>,
@@ -578,10 +582,14 @@ struct RawrAutoCompactionTriggerRules {
 impl Default for RawrAutoCompactionTriggerRules {
     fn default() -> Self {
         Self {
+            early_percent_remaining_lt: Some(85),
+            ready_percent_remaining_lt: Some(75),
+            asap_percent_remaining_lt: Some(65),
             percent_remaining_lt: 75,
             emergency_percent_remaining_lt: 15,
             auto_requires_any_boundary: vec![
                 RawrAutoCompactionBoundary::Commit,
+                RawrAutoCompactionBoundary::PrCheckpoint,
                 RawrAutoCompactionBoundary::PlanCheckpoint,
                 RawrAutoCompactionBoundary::AgentDone,
             ],
@@ -665,6 +673,33 @@ fn rawr_command_looks_like_git_commit(command: &[String]) -> bool {
         .any(|pair| basename(pair[0].as_str()) == "git" && pair[1].eq_ignore_ascii_case("commit"))
 }
 
+fn rawr_command_looks_like_pr_checkpoint(command: &[String]) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+    let joined = command.join(" ").to_ascii_lowercase();
+
+    if joined.contains("git push") {
+        return true;
+    }
+    if joined.contains("gt submit") || joined.contains("gt ss") {
+        return true;
+    }
+    if joined.contains("gt create") || joined.contains("gt review") || joined.contains("gt land") {
+        return true;
+    }
+    if joined.contains("gh pr create")
+        || joined.contains("gh pr close")
+        || joined.contains("gh pr merge")
+        || joined.contains("gh pr reopen")
+        || joined.contains("gh pr review")
+    {
+        return true;
+    }
+
+    false
+}
+
 fn rawr_agent_message_looks_done(message: &str) -> bool {
     let lower = message.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -679,6 +714,44 @@ fn rawr_agent_message_looks_done(message: &str) -> bool {
     ["done", "completed", "finished", "shipped", "pushed"]
         .into_iter()
         .any(|needle| lower.contains(needle))
+}
+
+fn rawr_agent_message_looks_like_topic_shift(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    [
+        "moving on",
+        "switching to",
+        "next,",
+        "next:",
+        "next up",
+        "now, let's",
+        "now let's",
+        "we'll now",
+    ]
+    .into_iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn rawr_agent_message_looks_like_concluding_thought(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    [
+        "in summary",
+        "to summarize",
+        "to wrap up",
+        "wrapping up",
+        "conclusion",
+        "concluding",
+        "final thoughts",
+        "next steps",
+    ]
+    .into_iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn split_yaml_frontmatter(contents: &str) -> (Option<&str>, &str) {
@@ -1087,6 +1160,7 @@ impl ChatWidget {
         self.saw_plan_update_this_turn = false;
         self.rawr_saw_commit_this_turn = false;
         self.rawr_saw_plan_checkpoint_this_turn = false;
+        self.rawr_saw_pr_checkpoint_this_turn = false;
         if let RawrAutoCompactionState::Compacting {
             saw_context_compacted: false,
             saw_turn_complete: true,
@@ -1235,7 +1309,14 @@ impl ChatWidget {
             return;
         };
 
-        let trigger_percent_remaining = settings.prompt_frontmatter.trigger.percent_remaining_lt;
+        let trigger_percent_remaining = settings
+            .prompt_frontmatter
+            .trigger
+            .ready_percent_remaining_lt
+            .or(Some(
+                settings.prompt_frontmatter.trigger.percent_remaining_lt,
+            ))
+            .unwrap_or(75);
         if percent_remaining >= trigger_percent_remaining {
             return;
         }
@@ -1253,10 +1334,19 @@ impl ChatWidget {
                 .iter()
                 .any(|boundary| match boundary {
                     RawrAutoCompactionBoundary::Commit => self.rawr_saw_commit_this_turn,
+                    RawrAutoCompactionBoundary::PrCheckpoint => {
+                        self.rawr_saw_pr_checkpoint_this_turn
+                    }
                     RawrAutoCompactionBoundary::PlanCheckpoint => {
                         self.rawr_saw_plan_checkpoint_this_turn
                     }
+                    RawrAutoCompactionBoundary::PlanUpdate => self.saw_plan_update_this_turn,
                     RawrAutoCompactionBoundary::AgentDone => agent_done,
+                    RawrAutoCompactionBoundary::TopicShift => {
+                        last_agent_message.is_some_and(rawr_agent_message_looks_like_topic_shift)
+                    }
+                    RawrAutoCompactionBoundary::ConcludingThought => last_agent_message
+                        .is_some_and(rawr_agent_message_looks_like_concluding_thought),
                     RawrAutoCompactionBoundary::TurnComplete => true,
                 });
 
@@ -1363,14 +1453,19 @@ impl ChatWidget {
                     codex_core::protocol::CompactionPacketAuthor::Agent
                 }
             };
-            codex_core::compaction_audit::set_next_compaction_trigger(
-                codex_core::protocol::CompactionTrigger::AutoWatcher {
-                    trigger_percent_remaining: *trigger_percent_remaining,
-                    saw_commit: self.rawr_saw_commit_this_turn,
-                    saw_plan_checkpoint: self.rawr_saw_plan_checkpoint_this_turn,
-                    packet_author,
-                },
-            );
+            if let Some(thread_id) = self.thread_id {
+                codex_core::compaction_audit::set_next_compaction_trigger(
+                    thread_id,
+                    codex_core::protocol::CompactionTrigger::AutoWatcher {
+                        trigger_percent_remaining: *trigger_percent_remaining,
+                        saw_commit: self.rawr_saw_commit_this_turn,
+                        saw_plan_checkpoint: self.rawr_saw_plan_checkpoint_this_turn,
+                        saw_plan_update: self.saw_plan_update_this_turn,
+                        saw_pr_checkpoint: self.rawr_saw_pr_checkpoint_this_turn,
+                        packet_author,
+                    },
+                );
+            }
         }
         self.clear_token_usage();
         self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
@@ -1533,6 +1628,24 @@ impl ChatWidget {
                 settings.packet_author = packet_author;
             }
             if let Some(trigger) = config.trigger.as_ref() {
+                if let Some(early_percent_remaining_lt) = trigger.early_percent_remaining_lt {
+                    settings
+                        .prompt_frontmatter
+                        .trigger
+                        .early_percent_remaining_lt = Some(early_percent_remaining_lt);
+                }
+                if let Some(ready_percent_remaining_lt) = trigger.ready_percent_remaining_lt {
+                    settings
+                        .prompt_frontmatter
+                        .trigger
+                        .ready_percent_remaining_lt = Some(ready_percent_remaining_lt);
+                }
+                if let Some(asap_percent_remaining_lt) = trigger.asap_percent_remaining_lt {
+                    settings
+                        .prompt_frontmatter
+                        .trigger
+                        .asap_percent_remaining_lt = Some(asap_percent_remaining_lt);
+                }
                 if let Some(percent_remaining_lt) = trigger.percent_remaining_lt {
                     settings.prompt_frontmatter.trigger.percent_remaining_lt = percent_remaining_lt;
                 }
@@ -2378,6 +2491,9 @@ impl ChatWidget {
         if ev.exit_code == 0 && rawr_command_looks_like_git_commit(&command) {
             self.rawr_saw_commit_this_turn = true;
         }
+        if ev.exit_code == 0 && rawr_command_looks_like_pr_checkpoint(&command) {
+            self.rawr_saw_pr_checkpoint_this_turn = true;
+        }
 
         let needs_new = self
             .active_cell
@@ -2725,6 +2841,7 @@ impl ChatWidget {
             rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
             rawr_saw_commit_this_turn: false,
             rawr_saw_plan_checkpoint_this_turn: false,
+            rawr_saw_pr_checkpoint_this_turn: false,
             rawr_preflight_compaction_pending: None,
         };
 
@@ -2868,6 +2985,7 @@ impl ChatWidget {
             rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
             rawr_saw_commit_this_turn: false,
             rawr_saw_plan_checkpoint_this_turn: false,
+            rawr_saw_pr_checkpoint_this_turn: false,
             rawr_preflight_compaction_pending: None,
         };
 
@@ -3000,6 +3118,7 @@ impl ChatWidget {
             rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
             rawr_saw_commit_this_turn: false,
             rawr_saw_plan_checkpoint_this_turn: false,
+            rawr_saw_pr_checkpoint_this_turn: false,
             rawr_preflight_compaction_pending: None,
         };
 

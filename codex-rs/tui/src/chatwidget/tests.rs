@@ -847,6 +847,7 @@ async fn make_chatwidget_manual(
         rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
         rawr_saw_commit_this_turn: false,
         rawr_saw_plan_checkpoint_this_turn: false,
+        rawr_saw_pr_checkpoint_this_turn: false,
         rawr_preflight_compaction_pending: None,
     };
     widget.set_model(&resolved_model);

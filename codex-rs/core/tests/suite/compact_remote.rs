@@ -389,9 +389,14 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
         trigger_percent_remaining: 7,
         saw_commit: false,
         saw_plan_checkpoint: true,
+        saw_plan_update: false,
+        saw_pr_checkpoint: false,
         packet_author: CompactionPacketAuthor::Watcher,
     };
-    compaction_audit::set_next_compaction_trigger(expected_trigger.clone());
+    compaction_audit::set_next_compaction_trigger(
+        harness.test().session_configured.session_id,
+        expected_trigger.clone(),
+    );
     codex.submit(Op::Compact).await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 

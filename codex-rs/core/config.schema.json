@@ -808,7 +808,11 @@
       "enum": [
         "commit",
         "plan_checkpoint",
+        "plan_update",
+        "pr_checkpoint",
         "agent_done",
+        "topic_shift",
+        "concluding_thought",
         "turn_complete"
       ],
       "type": "string"
@@ -842,6 +846,26 @@
     "RawrAutoCompactionToml": {
       "additionalProperties": false,
       "properties": {
+        "compaction_model": {
+          "description": "Optional model override used for compaction requests triggered by the watcher.",
+          "type": "string"
+        },
+        "compaction_reasoning_effort": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            }
+          ],
+          "description": "Optional reasoning effort override used for watcher-triggered compactions."
+        },
+        "compaction_verbosity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Verbosity"
+            }
+          ],
+          "description": "Optional verbosity override used for watcher-triggered compactions."
+        },
         "mode": {
           "$ref": "#/definitions/RawrAutoCompactionMode"
         },
@@ -870,17 +894,33 @@
     "RawrAutoCompactionTriggerToml": {
       "additionalProperties": false,
       "properties": {
+        "asap_percent_remaining_lt": {
+          "description": "Asap threshold: compact at the next natural pause boundary.",
+          "format": "int64",
+          "type": "integer"
+        },
         "auto_requires_any_boundary": {
           "items": {
             "$ref": "#/definitions/RawrAutoCompactionBoundary"
           },
           "type": "array"
         },
+        "early_percent_remaining_lt": {
+          "description": "Early (opportunistic) threshold: only compact on big-ish step boundaries.",
+          "format": "int64",
+          "type": "integer"
+        },
         "emergency_percent_remaining_lt": {
           "format": "int64",
           "type": "integer"
         },
         "percent_remaining_lt": {
+          "description": "Back-compat: older configs used a single threshold.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "ready_percent_remaining_lt": {
+          "description": "Ready threshold (default behavior). When unset, falls back to `percent_remaining_lt`.",
           "format": "int64",
           "type": "integer"
         }

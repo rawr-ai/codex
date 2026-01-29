@@ -7,9 +7,10 @@ Current implementation status (as of `rawr/main`):
 - Feature flag: `[features] rawr_auto_compaction = true`
 - Fork isolation: defaults `CODEX_HOME=~/.codex-rawr` when unset
 - Built-in auto-compaction bypassed when rawr watcher enabled
-- Watcher triggers only at turn completion (never mid-turn)
+- Watcher can trigger compaction at turn completion and **mid-turn** (between sampling requests) once boundary heuristics fire.
 - Auto gating now requires “natural boundary” signals unless emergency threshold triggers:
   - `commit` (successful `git commit` observed)
+  - `pr_checkpoint` (PR lifecycle checkpoint observed: publish/review/open/close heuristics)
   - `plan_checkpoint` (plan updated with at least one `completed` step)
   - `agent_done` (best-effort heuristic on last agent message)
 - Heuristics prompt is embedded from `rawr/prompts/rawr-auto-compact.md` (YAML frontmatter defaults + Markdown body)
@@ -29,7 +30,6 @@ We need higher correctness and robustness around “when to compact” and a bet
 - Keep fork delta small, feature-flagged, and rebase-friendly.
 
 ## Non-goals (v0)
-- Compaction mid-turn (we’ll do this later with explicit mid-process context packaging and re-attach).
 - Full semantic “task initiated” classifier across session history (separate workstream).
 - External terminal automation / separate TUI wrapper.
 
@@ -73,8 +73,8 @@ Additionally, implement the “ask agent for packet” flow using the editable p
 
 ## Acceptance criteria
 - In `auto` mode, watcher compacts only when:
-  - `percent_remaining < percent_remaining_lt` AND
-  - (any boundary satisfied OR `percent_remaining < emergency_percent_remaining_lt`)
+  - Remaining context falls below one of `early` / `ready` / `asap` thresholds, and
+  - A tier-appropriate boundary is observed (unless the emergency threshold triggers).
 - In `auto` mode + `packet_author=agent`, injected agent prompt matches the prompt file body.
 - Post-compaction injection happens exactly once per compaction and never mid-turn.
 - Unit tests cover:

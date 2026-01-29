@@ -1651,6 +1651,12 @@ pub enum CompactionTrigger {
         saw_commit: bool,
         /// Whether the watcher observed a plan checkpoint boundary this turn.
         saw_plan_checkpoint: bool,
+        /// Whether the watcher observed any plan update this turn.
+        #[serde(default)]
+        saw_plan_update: bool,
+        /// Whether the watcher observed a PR lifecycle checkpoint this turn.
+        #[serde(default)]
+        saw_pr_checkpoint: bool,
         /// Who authored the post-compact continuation packet (when applicable).
         packet_author: CompactionPacketAuthor,
     },

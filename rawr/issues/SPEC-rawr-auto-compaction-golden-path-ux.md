@@ -98,7 +98,49 @@ When the watcher decides “yes, compact now”, the transcript must follow this
 
    There are two variants for who generates the text:
    - **Variant A (preferred): in-session agent writes it** in response to the heads-up prompt.
-   - **Variant B (fallback): watcher generates it** but it must still be presented *as if* the in-session agent authored it (see “Open design questions” if assistant-role injection is not available).
+   - **Variant B (fallback): watcher authors the packet** using a structured trail + full-session reading/search, then the system appends a recent-activity tail (see below). The result must still be presented *as if* the in-session agent authored it (see “Open design questions” if assistant-role injection is not available).
+
+#### Variant B design: watcher-authored packet (scope, inputs, assembly)
+
+Variant B is not “summarize the last message”. Its contract is:
+
+1. **Guaranteed baseline (structured state trail; required)**
+   - The watcher must be given (or must construct) a structured trail representing the entire relevant conversation:
+     - The full **chain of user requests** in order (what the user asked to do, and how it evolved).
+     - The corresponding chain of **agent plans and high-level actions** taken in response (what the agent planned to do and what it actually did).
+   - The packet must explicitly answer:
+     - “What did the user last ask to do?”
+     - “What did the user ask to do previously?”
+     using the above chains, not only the last turn.
+
+2. **Contextual reading/search over the full session (optional but encouraged)**
+   - In addition to the structured baseline, the watcher agent can:
+     - read through the full session transcript,
+     - search over the session as needed,
+     - include or exclude tool calls,
+     - include or exclude user/agent messages,
+     depending on what it deems important.
+   - This is how the packet should surface:
+     - invariants,
+     - decisions,
+     - traps/pitfalls,
+     - other “things to be aware of”
+     that are not obvious from just the last turn or from the structured trail alone.
+
+3. **Packet assembly output (required structure)**
+   - The watcher-authored packet must be structured to include at minimum:
+     - **User request chain** (ordered list, with the “current ask” highlighted),
+     - **Agent plan/action chain** (ordered list aligned to the user chain),
+     - **Where we are now** (current state and constraints),
+     - **What’s next** (next concrete steps),
+     - **Decisions + invariants + traps** (bullet list with short rationale).
+
+4. **Automated recent internal activity tail (appended after watcher assembly)**
+   - After the watcher assembles the packet body, the system appends an automated tail section:
+     - a verbatim snippet of the last N “internal activity” items from the in-session agent,
+     - where N is defined as an internal-message limit and/or tool-call limit (not a character limit).
+   - This tail exists to “jog memory” on the very last actions taken right before compaction.
+   - See “Open design questions” for feasibility details (e.g., what constitutes “internal activity” and what can be recorded verbatim).
 
 4. **Compaction runs**:
    - After the continuation packet exists in the conversation, the watcher triggers compaction.
@@ -207,6 +249,7 @@ This section defines an implementable watcher state machine in terms of events, 
 - `Assessing { trigger_reason, trigger_percent_remaining }`
 - `HeadsUpInjected { trigger_reason, trigger_percent_remaining }`
 - `AwaitingPacket { trigger_reason, trigger_percent_remaining, packet_deadline }`
+- `AssemblingPacket { trigger_reason, trigger_percent_remaining }` (Variant B)
 - `Compacting { trigger_reason, packet, saw_context_compacted, saw_turn_complete }`
 - `PostCompactHandoffPending { packet }`
 
@@ -226,7 +269,8 @@ This section defines an implementable watcher state machine in terms of events, 
    - Inject heads-up user message (synthetic turn).
 4. `HeadsUpInjected` → `AwaitingPacket`:
    - Trigger next assistant turn to produce packet (Variant A),
-   - or generate packet internally (Variant B) and present it as assistant-authored (open question if not supported).
+5. `HeadsUpInjected` → `AssemblingPacket`:
+   - Variant B: watcher assembles packet from (a) structured trail baseline and (b) optional session reading/search, then system appends recent-activity tail; result is presented as assistant-authored (open question if not supported).
 5. `AwaitingPacket` → `Compacting` when packet is available:
    - Trigger compaction task.
 6. `Compacting` → `PostCompactHandoffPending` on compaction completion.
@@ -247,10 +291,11 @@ stateDiagram-v2
   Assessing --> HeadsUpInjected: should_compact_now = true
 
   HeadsUpInjected --> AwaitingPacket: Variant A<br/>(request packet from agent)
-  HeadsUpInjected --> AwaitingPacket: Variant B<br/>(generate packet internally)
+  HeadsUpInjected --> AssemblingPacket: Variant B<br/>(watcher assembles packet)
 
   AwaitingPacket --> Compacting: packet available
   AwaitingPacket --> Compacting: OnTimeout<br/>(fallback packet)
+  AssemblingPacket --> Compacting: packet assembled<br/>(append activity tail)
 
   Compacting --> PostCompactHandoffPending: compaction complete
   PostCompactHandoffPending --> Idle: inject handoff user message<br/>(+ packet)
@@ -284,7 +329,10 @@ sequenceDiagram
       Core-->>UI: OnTaskComplete(UserTurn)
       UI->>UI: store packet for compaction sequence
     else Variant B (watcher authors packet)
-      UI->>UI: build packet text<br/>(from structured state + last agent msg)
+      UI->>UI: construct structured trail baseline<br/>(user request chain + agent plan/action chain)
+      UI->>UI: scan/search full session as needed<br/>(include/exclude tools/messages)
+      UI->>UI: assemble packet body<br/>(now/next + decisions/invariants/traps)
+      UI->>UI: append recent activity tail<br/>(last N internal/tool events verbatim)
     end
 
     Note over UI,Core: Handoff: trigger compaction AFTER packet exists
@@ -392,6 +440,13 @@ This section is the actionable “what needs to change” delta.
   - **B1 (preferred UX):** watcher can inject an assistant-role message (the packet) into the transcript/history.
   - **B2 (honest fallback):** watcher injects a user-role message labeled “system-generated continuation packet (watcher)” and the post-compaction handoff is still user-authored.
   - **B3 (remove):** drop watcher-authored packets; always request packet from in-session agent, and only compact when it is produced (emergency still possible).
+
+**Variant B packet assembly requirements (new)**:
+
+- Watcher-authored packets must be based on:
+  - a structured “trail baseline” (full chain of user requests + chain of agent plans/actions),
+  - plus optional full-session reading/search,
+  - plus an automatically appended recent-activity tail (last N internal/tool events).
 
 ### 3) Post-compaction handoff must be explicit and standardized (required)
 
@@ -529,6 +584,14 @@ If that ordering is not feasible, we must explicitly define the alternate orderi
      - start the heads-up/packet sequence at turn completion (then compact immediately), or
      - start the sequence at next user submission (but that blocks the user’s message until the sequence completes).
    - If we keep preflight, the UX needs to be explicitly specified and guarded against loops.
+
+7. **What exactly is the “recent internal activity tail”, and can it be recorded verbatim?**
+   - If “thinking tokens” are not available, do we define “internal activity” as:
+     - the last N tool calls and their outputs,
+     - the last N plan updates/checkpoints,
+     - the last N “action summary” records we explicitly log,
+     - or some combination?
+   - Where will this data be stored so Variant B can reliably access it even under tight token budgets?
 
 ---
 

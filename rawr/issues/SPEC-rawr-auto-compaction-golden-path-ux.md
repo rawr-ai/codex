@@ -242,18 +242,18 @@ These diagrams are intentionally code-centric and separate from the UX-level int
 stateDiagram-v2
   [*] --> Idle
 
-  Idle --> Assessing: OnTurnComplete\n(preconditions ok)
+  Idle --> Assessing: OnTurnComplete<br/>(preconditions ok)
   Assessing --> Idle: should_compact_now = false
   Assessing --> HeadsUpInjected: should_compact_now = true
 
-  HeadsUpInjected --> AwaitingPacket: Variant A\n(request packet from agent)
-  HeadsUpInjected --> AwaitingPacket: Variant B\n(generate packet internally)
+  HeadsUpInjected --> AwaitingPacket: Variant A<br/>(request packet from agent)
+  HeadsUpInjected --> AwaitingPacket: Variant B<br/>(generate packet internally)
 
   AwaitingPacket --> Compacting: packet available
-  AwaitingPacket --> Compacting: OnTimeout\n(fallback packet)
+  AwaitingPacket --> Compacting: OnTimeout<br/>(fallback packet)
 
   Compacting --> PostCompactHandoffPending: compaction complete
-  PostCompactHandoffPending --> Idle: inject handoff user message\n(+ packet)
+  PostCompactHandoffPending --> Idle: inject handoff user message<br/>(+ packet)
 ```
 
 #### Target component/event handoffs (TUI watcher ↔ core ↔ provider)
@@ -266,7 +266,7 @@ sequenceDiagram
   participant Prov as Provider (OpenAI/Codex)
 
   Note over UI: Turn completes → maybe_rawr_auto_compact(...)
-  UI->>UI: Assess boundary + heuristics\n(+ cooldown, synthetic-turn guard)
+  UI->>UI: Assess boundary + heuristics<br/>(+ cooldown, synthetic-turn guard)
 
   alt should_compact_now = no
     UI-->>UI: return (no-op)
@@ -284,16 +284,16 @@ sequenceDiagram
       Core-->>UI: OnTaskComplete(UserTurn)
       UI->>UI: store packet for compaction sequence
     else Variant B (watcher authors packet)
-      UI->>UI: build packet text\n(from structured state + last agent msg)
+      UI->>UI: build packet text<br/>(from structured state + last agent msg)
     end
 
     Note over UI,Core: Handoff: trigger compaction AFTER packet exists
     UI->>Core: Op::Compact
-    Core->>Prov: compaction request (if remote)\n(or local model/prompt)
+    Core->>Prov: compaction request (if remote)<br/>(or local model/prompt)
     Prov-->>Core: compaction result
-    Core-->>UI: Event ContextCompacted\n+ OnTaskComplete(Compact)
+    Core-->>UI: Event ContextCompacted<br/>+ OnTaskComplete(Compact)
 
-    Note over UI,Core: Handoff: inject post-compaction user message\n(wrapper + packet)
+    Note over UI,Core: Handoff: inject post-compaction user message<br/>(wrapper + packet)
     UI->>Core: Op::UserTurn(handoff + packet)
   end
 ```

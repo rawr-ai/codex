@@ -34,19 +34,77 @@ It focuses on **rawr auto-compaction**, but includes the closely related **built
 
 ```mermaid
 graph TD
-  A[User turn starts] --> B[core run_turn]
-  B --> C{Rawr auto compaction enabled}
-  C --> C_yes[yes]
-  C_yes --> E[core rawr mid turn eligible]
-  C --> C_no[no]
-  C_no --> D[core built in auto compact only]
+  subgraph ART[Non code triggers]
+    A[User starts a turn]
+    F[UI reports turn complete]
+  end
 
-  F[Turn completes in TUI] --> G[tui maybe_rawr_auto_compact]
-  G --> H{Rawr auto compaction enabled}
+  subgraph CLI[Codex CLI process]
+    B[core run_turn sampling loop]
+    C{Rawr auto compaction feature on}
+    D[CLI built in auto compact only]
+    E[Rawr mid turn compaction logic active]
+
+    G[rawr watcher entry maybe_rawr_auto_compact]
+    H{Rawr auto compaction feature on}
+    I[return do nothing]
+    J[Rawr watcher state machine active]
+  end
+
+  A --> B
+  B --> C
+  C --> C_yes[yes]
+  C_yes --> E
+  C --> C_no[no]
+  C_no --> D
+
+  F --> G
+  G --> H
   H --> H_yes[yes]
-  H_yes --> J[tui watcher state machine eligible]
+  H_yes --> J
   H --> H_no[no]
-  H_no --> I[return]
+  H_no --> I
+
+  R1[Potential failure mismatched feature gating]
+  C -.-> R1
+  H -.-> R1
+
+  subgraph Legend[Legend]
+    L1[CLI native]
+    L2[Rawr custom code]
+    L3[Glue or orchestration]
+    L4[OpenAI backend]
+    L5[Non code artifact]
+    L6[Handoff or risk]
+  end
+
+  classDef native fill:#E3F2FD,stroke:#1E88E5,color:#0D47A1;
+  classDef backend fill:#F3E5F5,stroke:#8E24AA,color:#4A148C;
+  classDef custom fill:#E8F5E9,stroke:#43A047,color:#1B5E20;
+  classDef customFn fill:#C8E6C9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+  classDef glue fill:#FFF3E0,stroke:#FB8C00,color:#E65100;
+  classDef artifact fill:#FAFAFA,stroke:#757575,stroke-dasharray:4 3,color:#424242;
+  classDef handoff fill:#FFEBEE,stroke:#E53935,stroke-width:2px,color:#B71C1C;
+  classDef risk fill:#FFCDD2,stroke:#C62828,stroke-width:2px,stroke-dasharray:2 2,color:#B71C1C;
+
+  class A,F artifact;
+  class B,D native;
+  class C,H,C_yes,C_no,H_yes,H_no glue;
+  class E,J custom;
+  class G customFn;
+  class I glue;
+  class R1 risk;
+
+  class L1 native;
+  class L2 custom;
+  class L3 glue;
+  class L4 backend;
+  class L5 artifact;
+  class L6 handoff;
+
+  style CLI fill:#ffffff,stroke:#1E88E5,stroke-width:2px;
+  style ART fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
+  style Legend fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
 ```
 
 ## Invariant: There are two distinct rawr compaction workflows
@@ -88,32 +146,93 @@ These workflows are independent and can both fire over the lifetime of a thread.
 
 ```mermaid
 graph TD
-  subgraph Core[A core mid turn compaction]
-    A1[run_turn sampling loop] --> A2{needs follow up}
-    A2 --> A2_yes[yes]
-    A2_yes --> A3[compute percent remaining]
-    A3 --> A4[read signals and boundaries required]
-    A4 --> A5{should compact mid turn}
-    A5 --> A5_yes[yes]
-    A5_yes --> A6[set next compaction trigger AutoWatcher]
-    A6 --> A7[run compaction task now]
-    A7 --> A1
-    A5 --> A5_no[no]
-    A5_no --> A1
-    A2 --> A2_no[no]
-    A2_no --> A1
+  subgraph CLI[Codex CLI process]
+    subgraph Core[core mid turn compaction]
+      A1[core run_turn sampling loop]
+      A2{needs follow up}
+      A3[compute percent remaining]
+      A4[read signals and boundaries required]
+      A5{should compact mid turn}
+      A6[set next compaction trigger AutoWatcher]
+      A7[run compaction task now]
+    end
+
+    subgraph TUI[TUI watcher]
+      B1[TUI on_task_complete]
+      B2[Rawr watcher maybe_rawr_auto_compact]
+      B3{watcher state}
+      B4[check thresholds and boundaries]
+      B5[handoff send Op Compact]
+      B6[observe ContextCompacted and compaction completion]
+      B7[inject packet optional]
+    end
   end
 
-  subgraph TUI[B TUI watcher]
-    B1[on_task_complete] --> B2[maybe_rawr_auto_compact]
-    B2 --> B3{state}
-    B3 --> B3_idle[Idle]
-    B3_idle --> B4[check thresholds and boundaries]
-    B4 --> B4_compact[compact]
-    B4_compact --> B5[send Op Compact]
-    B5 --> B6[observe ContextCompacted and compaction completion]
-    B6 --> B7[inject packet optional]
+  subgraph BACKEND[OpenAI backend]
+    O1[model responds to sampling request]
   end
+
+  subgraph ART[Non code artifacts]
+    CFG1[rawr_auto_compaction config]
+  end
+
+  A1 --> H1[handoff sampling request] --> O1
+  O1 --> H2[handoff sampling result] --> A2
+  A2 --> A2_yes[yes] --> A3
+  A2 --> A2_no[no] --> A1
+  A3 --> A4
+  CFG1 -.-> A4
+  A4 --> A5
+  A5 --> A5_yes[yes] --> A6 --> A7 --> A1
+  A5 --> A5_no[no] --> A1
+
+  B1 --> B2 --> B3
+  B3 --> B3_idle[Idle] --> B4 --> B5 --> A7
+  A7 --> H3[handoff ContextCompacted event] --> B6 --> B7
+
+  R2[Risk compaction then continue same turn can repeat]
+  A7 -.-> R2
+
+  subgraph Legend[Legend]
+    L1[CLI native]
+    L2[Rawr custom function]
+    L3[Glue or orchestration]
+    L4[OpenAI backend]
+    L5[Non code artifact]
+    L6[Handoff]
+    L7[Risk point]
+  end
+
+  classDef native fill:#E3F2FD,stroke:#1E88E5,color:#0D47A1;
+  classDef backend fill:#F3E5F5,stroke:#8E24AA,color:#4A148C;
+  classDef custom fill:#E8F5E9,stroke:#43A047,color:#1B5E20;
+  classDef customFn fill:#C8E6C9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+  classDef glue fill:#FFF3E0,stroke:#FB8C00,color:#E65100;
+  classDef artifact fill:#FAFAFA,stroke:#757575,stroke-dasharray:4 3,color:#424242;
+  classDef handoff fill:#FFEBEE,stroke:#E53935,stroke-width:2px,color:#B71C1C;
+  classDef risk fill:#FFCDD2,stroke:#C62828,stroke-width:2px,stroke-dasharray:2 2,color:#B71C1C;
+
+  class A1,A2,A7,B1,B6 native;
+  class B2 customFn;
+  class A5,B3 custom;
+  class A3,A4,B4 glue;
+  class CFG1 artifact;
+  class O1 backend;
+  class H1,H2,H3,B5,A5_yes,A5_no,A2_yes,A2_no,B3_idle handoff;
+  class R2 risk;
+
+  class L1 native;
+  class L2 customFn;
+  class L3 glue;
+  class L4 backend;
+  class L5 artifact;
+  class L6 handoff;
+  class L7 risk;
+
+  style CLI fill:#ffffff,stroke:#1E88E5,stroke-width:2px;
+  style BACKEND fill:#ffffff,stroke:#8E24AA,stroke-width:2px;
+  style ART fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
+  style Legend fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
 ```
 
 ## Invariant: Mode affects only the TUI watcher (core mid-turn ignores mode)
@@ -133,19 +252,72 @@ graph TD
 
 ```mermaid
 graph TD
-  A[percent remaining below threshold] --> B{tui mode}
-  B --> B_tag[tag]
-  B_tag --> C[emit info message only]
-  B --> B_suggest[suggest]
-  B_suggest --> D[emit suggestion only]
-  B --> B_auto[auto]
-  B_auto --> E[tui may send Op Compact]
+  subgraph ART[Non code artifacts]
+    CFG2[rawr_auto_compaction mode]
+  end
 
-  F[core needs follow up true] --> G{Rawr auto compaction enabled}
-  G --> G_yes[yes]
-  G_yes --> H[core may compact mid turn no mode check]
-  G --> G_no[no]
-  G_no --> I[core built in auto compact only]
+  subgraph CLI[Codex CLI process]
+    A[percent remaining below threshold]
+
+    B{TUI watcher mode}
+    C[emit info message only]
+    D[emit suggestion only]
+    E[handoff send Op Compact]
+
+    F[core needs follow up true]
+    G{Rawr auto compaction enabled}
+    H[core may compact mid turn ignores mode]
+    I[core built in auto compact only]
+  end
+
+  CFG2 -.-> B
+  A --> B
+  B --> B_tag[tag] --> C
+  B --> B_suggest[suggest] --> D
+  B --> B_auto[auto] --> E
+
+  F --> G
+  G --> G_yes[yes] --> H
+  G --> G_no[no] --> I
+
+  R3[Potential confusion mode affects TUI only]
+  B -.-> R3
+  G -.-> R3
+
+  subgraph Legend[Legend]
+    L1[CLI native]
+    L2[Rawr custom code]
+    L3[Glue or orchestration]
+    L4[Non code artifact]
+    L5[Handoff]
+    L6[Risk point]
+  end
+
+  classDef native fill:#E3F2FD,stroke:#1E88E5,color:#0D47A1;
+  classDef custom fill:#E8F5E9,stroke:#43A047,color:#1B5E20;
+  classDef customFn fill:#C8E6C9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+  classDef glue fill:#FFF3E0,stroke:#FB8C00,color:#E65100;
+  classDef artifact fill:#FAFAFA,stroke:#757575,stroke-dasharray:4 3,color:#424242;
+  classDef handoff fill:#FFEBEE,stroke:#E53935,stroke-width:2px,color:#B71C1C;
+  classDef risk fill:#FFCDD2,stroke:#C62828,stroke-width:2px,stroke-dasharray:2 2,color:#B71C1C;
+
+  class A,F,H,I native;
+  class B,G custom;
+  class C,D glue;
+  class E,B_tag,B_suggest,B_auto,G_yes,G_no handoff;
+  class CFG2 artifact;
+  class R3 risk;
+
+  class L1 native;
+  class L2 custom;
+  class L3 glue;
+  class L4 artifact;
+  class L5 handoff;
+  class L6 risk;
+
+  style CLI fill:#ffffff,stroke:#1E88E5,stroke-width:2px;
+  style ART fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
+  style Legend fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
 ```
 
 ## Invariant: Exactly how the TUI watcher decides “should we compact now?”
@@ -170,27 +342,85 @@ graph TD
 
 ```mermaid
 graph TD
-  A[maybe_rawr_auto_compact] --> B{preconditions ok}
-  B --> B_no[no]
-  B_no --> C[return]
-  B --> B_yes[yes]
-  B_yes --> D[compute percent remaining]
-  D --> E[compute trigger threshold ready or percent or 75]
-  E --> F{percent remaining below trigger}
-  F --> F_no[no]
-  F_no --> C
-  F --> F_yes[yes]
-  F_yes --> G[compute has any required boundary]
-  G --> H[compute is emergency]
-  H --> I{mode is auto}
-  I --> I_no[no]
-  I_no --> J[tag or suggest info only]
-  I --> I_yes[yes]
-  I_yes --> K{is emergency or has boundary}
-  K --> K_no[no]
-  K_no --> L[skip auto compact]
-  K --> K_yes[yes]
-  K_yes --> M[proceed to compact packet author]
+  subgraph ART[Non code artifacts]
+    CFG3[thresholds and required boundaries]
+    TOK1[token usage snapshot]
+    MODE1[watcher mode]
+  end
+
+  subgraph CLI[Codex CLI process]
+    A[Rawr watcher maybe_rawr_auto_compact]
+    B{preconditions ok}
+    C[return]
+    D[compute percent remaining]
+    E[compute trigger threshold]
+    F{percent remaining below trigger}
+    G[compute has any required boundary]
+    H[compute is emergency]
+    I{mode is auto}
+    J[tag or suggest info only]
+    L[skip auto compact]
+    M[proceed to compact choose packet author]
+    K{is emergency or has boundary}
+  end
+
+  CFG3 -.-> E
+  CFG3 -.-> G
+  TOK1 -.-> D
+  MODE1 -.-> I
+
+  A --> B
+  B --> B_no[no] --> C
+  B --> B_yes[yes] --> D --> E --> F
+  F --> F_no[no] --> C
+  F --> F_yes[yes] --> G --> H --> I
+  I --> I_no[no] --> J
+  I --> I_yes[yes] --> K
+  K --> K_no[no] --> L
+  K --> K_yes[yes] --> M
+
+  R4[Potential failure token usage missing or stale]
+  TOK1 -.-> R4
+  D -.-> R4
+
+  R5[Potential confusion thresholds come from config and prompt frontmatter]
+  CFG3 -.-> R5
+
+  subgraph Legend[Legend]
+    L1[CLI native]
+    L2[Rawr custom function]
+    L3[Glue or orchestration]
+    L4[Non code artifact]
+    L5[Handoff]
+    L6[Risk point]
+  end
+
+  classDef native fill:#E3F2FD,stroke:#1E88E5,color:#0D47A1;
+  classDef custom fill:#E8F5E9,stroke:#43A047,color:#1B5E20;
+  classDef customFn fill:#C8E6C9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+  classDef glue fill:#FFF3E0,stroke:#FB8C00,color:#E65100;
+  classDef artifact fill:#FAFAFA,stroke:#757575,stroke-dasharray:4 3,color:#424242;
+  classDef handoff fill:#FFEBEE,stroke:#E53935,stroke-width:2px,color:#B71C1C;
+  classDef risk fill:#FFCDD2,stroke:#C62828,stroke-width:2px,stroke-dasharray:2 2,color:#B71C1C;
+
+  class A customFn;
+  class B,F,I,K custom;
+  class D,E,G,H glue;
+  class C,J,L,M native;
+  class B_yes,B_no,F_yes,F_no,I_yes,I_no,K_yes,K_no handoff;
+  class CFG3,TOK1,MODE1 artifact;
+  class R4,R5 risk;
+
+  class L1 native;
+  class L2 customFn;
+  class L3 glue;
+  class L4 artifact;
+  class L5 handoff;
+  class L6 risk;
+
+  style CLI fill:#ffffff,stroke:#1E88E5,stroke-width:2px;
+  style ART fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
+  style Legend fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
 ```
 
 ## Invariant: `packet_author = "watcher"` (turn-complete auto) exact steps
@@ -220,26 +450,85 @@ graph TD
 
 ```mermaid
 graph TD
-  A[tui mode auto watcher] --> B{queued user messages}
-  B --> B_yes[yes]
-  B_yes --> C[state Compacting should_inject false]
-  C --> D[send Op Compact]
-  B --> B_no[no]
-  B_no --> E{turn_complete boundary required}
-  E --> E_yes[yes]
-  E_yes --> F[set preflight_pending return]
-  E --> E_no[no]
-  E_no --> G[build packet state Compacting should_inject true]
-  G --> D
-  D --> H[core run compaction task]
-  H --> I[tui ContextCompacted]
-  I --> J[mark saw_context_compacted]
-  H --> K[tui on_task_complete compaction]
-  K --> L{should inject packet}
-  L --> L_yes[yes]
-  L_yes --> M[inject packet once send Op UserTurn]
-  L --> L_no[no]
-  L_no --> N[state Idle]
+  subgraph ART[Non code artifacts]
+    Q1[queued user messages]
+    CFG4[required boundary list]
+    PKT1[watcher built continuation packet]
+  end
+
+  subgraph CLI[Codex CLI process]
+    T1[Rawr watcher evaluate auto compact]
+    B{queued user messages}
+    S1[set state Compacting no inject]
+    E{turn_complete boundary required}
+    P1[set preflight_pending and return]
+    G[build packet and set state Compacting inject]
+    H1[handoff send Op Compact]
+
+    C1[core runs compaction task]
+    H2[handoff ContextCompacted event]
+    J[mark saw_context_compacted in watcher state]
+    K[TUI on_task_complete for compaction]
+    L{should inject packet}
+    H3[handoff inject synthetic user turn]
+    N[set state Idle]
+  end
+
+  Q1 -.-> B
+  CFG4 -.-> E
+  PKT1 -.-> G
+
+  T1 --> B
+  B --> B_yes[yes] --> S1 --> H1
+  B --> B_no[no] --> E
+  E --> E_yes[yes] --> P1 --> N
+  E --> E_no[no] --> G --> H1
+
+  H1 --> C1 --> H2 --> J
+  C1 --> K --> L
+  L --> L_yes[yes] --> H3 --> N
+  L --> L_no[no] --> N
+
+  R6[Potential failure watcher state and events out of sync]
+  H2 -.-> R6
+  K -.-> R6
+  H3 -.-> R6
+
+  subgraph Legend[Legend]
+    L1[CLI native]
+    L2[Rawr custom function]
+    L3[Glue or orchestration]
+    L4[Non code artifact]
+    L5[Handoff]
+    L6[Risk point]
+  end
+
+  classDef native fill:#E3F2FD,stroke:#1E88E5,color:#0D47A1;
+  classDef custom fill:#E8F5E9,stroke:#43A047,color:#1B5E20;
+  classDef customFn fill:#C8E6C9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+  classDef glue fill:#FFF3E0,stroke:#FB8C00,color:#E65100;
+  classDef artifact fill:#FAFAFA,stroke:#757575,stroke-dasharray:4 3,color:#424242;
+  classDef handoff fill:#FFEBEE,stroke:#E53935,stroke-width:2px,color:#B71C1C;
+  classDef risk fill:#FFCDD2,stroke:#C62828,stroke-width:2px,stroke-dasharray:2 2,color:#B71C1C;
+
+  class Q1,CFG4,PKT1 artifact;
+  class T1 customFn;
+  class B,E,L custom;
+  class S1,G,P1,J glue;
+  class C1,K,N native;
+  class H1,H2,H3,B_yes,B_no,E_yes,E_no,L_yes,L_no handoff;
+  class R6 risk;
+
+  class L1 native;
+  class L2 customFn;
+  class L3 glue;
+  class L4 artifact;
+  class L5 handoff;
+  class L6 risk;
+
+  style CLI fill:#ffffff,stroke:#1E88E5,stroke-width:2px;
+  style ART fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
+  style Legend fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
 ```
 
 ## Invariant: `packet_author = "agent"` (turn-complete auto) exact steps
@@ -258,16 +547,80 @@ graph TD
 
 ```mermaid
 graph TD
-  A[tui mode auto packet_author agent] --> B[state AwaitingPacket]
-  B --> C[inject agent packet prompt send Op UserTurn]
-  C --> D[agent replies with packet text]
-  D --> E[tui on_task_complete runs maybe_rawr_auto_compact]
-  E --> F[consume AwaitingPacket set packet]
-  F --> G[state Compacting should_inject true]
-  G --> H[send Op Compact]
-  H --> I[core run compaction task]
-  I --> J[tui ContextCompacted and compaction completion]
-  J --> K[inject stored packet once send Op UserTurn]
+  subgraph ART[Non code artifacts]
+    PROMPT1[rawr agent packet prompt]
+  end
+
+  subgraph BACKEND[OpenAI backend]
+    O1[model returns packet text]
+  end
+
+  subgraph CLI[Codex CLI process]
+    A[Rawr watcher mode auto packet_author agent]
+    B[set state AwaitingPacket]
+    H1[handoff inject prompt as synthetic user turn]
+    H2[handoff sampling request to OpenAI]
+    H3[handoff agent output back to CLI]
+    E[TUI on_task_complete runs maybe_rawr_auto_compact]
+    F[consume AwaitingPacket store packet]
+    G[set state Compacting should inject]
+    H4[handoff send Op Compact]
+    I[core runs compaction task]
+    J[watcher observes ContextCompacted and completion]
+    H5[handoff inject stored packet as user turn]
+  end
+
+  PROMPT1 -.-> H1
+  A --> B --> H1 --> H2 --> O1 --> H3 --> E --> F --> G --> H4 --> I --> J --> H5
+
+  R7[Potential failure packet content can be malformed or too long]
+  O1 -.-> R7
+  H5 -.-> R7
+
+  R8[Potential loop packet turn can trigger watcher again]
+  H5 -.-> R8
+  A -.-> R8
+
+  subgraph Legend[Legend]
+    L1[CLI native]
+    L2[Rawr custom function]
+    L3[Glue or orchestration]
+    L4[OpenAI backend]
+    L5[Non code artifact]
+    L6[Handoff]
+    L7[Risk point]
+  end
+
+  classDef native fill:#E3F2FD,stroke:#1E88E5,color:#0D47A1;
+  classDef backend fill:#F3E5F5,stroke:#8E24AA,color:#4A148C;
+  classDef custom fill:#E8F5E9,stroke:#43A047,color:#1B5E20;
+  classDef customFn fill:#C8E6C9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+  classDef glue fill:#FFF3E0,stroke:#FB8C00,color:#E65100;
+  classDef artifact fill:#FAFAFA,stroke:#757575,stroke-dasharray:4 3,color:#424242;
+  classDef handoff fill:#FFEBEE,stroke:#E53935,stroke-width:2px,color:#B71C1C;
+  classDef risk fill:#FFCDD2,stroke:#C62828,stroke-width:2px,stroke-dasharray:2 2,color:#B71C1C;
+
+  class PROMPT1 artifact;
+  class O1 backend;
+  class A customFn;
+  class B,F,G glue;
+  class I,J native;
+  class E custom;
+  class H1,H2,H3,H4,H5 handoff;
+  class R7,R8 risk;
+
+  class L1 native;
+  class L2 customFn;
+  class L3 glue;
+  class L4 backend;
+  class L5 artifact;
+  class L6 handoff;
+  class L7 risk;
+
+  style CLI fill:#ffffff,stroke:#1E88E5,stroke-width:2px;
+  style BACKEND fill:#ffffff,stroke:#8E24AA,stroke-width:2px;
+  style ART fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
+  style Legend fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
 ```
 
 ## Invariant: `turn_complete` boundary preflight (defer until next user message) exact steps
@@ -283,18 +636,72 @@ graph TD
 
 ```mermaid
 graph TD
-  A[tui maybe_rawr_auto_compact] --> B{turn_complete required boundary}
-  B --> B_yes[yes]
-  B_yes --> C[preflight_pending set percent remaining]
-  C --> D[return no compaction yet]
-  D --> E[user submits message]
-  E --> F{preflight_pending and not local cmd}
-  F --> F_yes[yes]
-  F_yes --> G[queue user message send Op Compact]
-  G --> H[core run compaction task]
-  H --> I[tui after compaction send queued message]
-  F --> F_no[no]
-  F_no --> J[normal submit path]
+  subgraph ART[Non code artifacts]
+    CFG5[required boundary list includes turn_complete]
+    UM1[user message]
+  end
+
+  subgraph CLI[Codex CLI process]
+    A[TUI watcher maybe_rawr_auto_compact]
+    B{turn_complete required boundary}
+    C[set preflight_pending store percent remaining]
+    D[return no compaction yet]
+    E[user submits message]
+    F{preflight_pending and not local cmd}
+    Q1[queue user message]
+    H1[handoff send Op Compact before user turn]
+    H[core runs compaction task]
+    H2[handoff after compaction submit queued message]
+    J[normal submit path]
+  end
+
+  CFG5 -.-> B
+  UM1 -.-> E
+
+  A --> B
+  B --> B_yes[yes] --> C --> D --> E --> F
+  F --> F_yes[yes] --> Q1 --> H1 --> H --> H2 --> J
+  F --> F_no[no] --> J
+
+  R9[Potential failure user expects message to run but it is queued]
+  Q1 -.-> R9
+  H1 -.-> R9
+
+  subgraph Legend[Legend]
+    L1[CLI native]
+    L2[Rawr custom function]
+    L3[Glue or orchestration]
+    L4[Non code artifact]
+    L5[Handoff]
+    L6[Risk point]
+  end
+
+  classDef native fill:#E3F2FD,stroke:#1E88E5,color:#0D47A1;
+  classDef custom fill:#E8F5E9,stroke:#43A047,color:#1B5E20;
+  classDef customFn fill:#C8E6C9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+  classDef glue fill:#FFF3E0,stroke:#FB8C00,color:#E65100;
+  classDef artifact fill:#FAFAFA,stroke:#757575,stroke-dasharray:4 3,color:#424242;
+  classDef handoff fill:#FFEBEE,stroke:#E53935,stroke-width:2px,color:#B71C1C;
+  classDef risk fill:#FFCDD2,stroke:#C62828,stroke-width:2px,stroke-dasharray:2 2,color:#B71C1C;
+
+  class CFG5,UM1 artifact;
+  class A customFn;
+  class B,F custom;
+  class C,D,Q1 glue;
+  class E,J,H native;
+  class H1,H2,B_yes,F_yes,F_no handoff;
+  class R9 risk;
+
+  class L1 native;
+  class L2 customFn;
+  class L3 glue;
+  class L4 artifact;
+  class L5 handoff;
+  class L6 risk;
+
+  style CLI fill:#ffffff,stroke:#1E88E5,stroke-width:2px;
+  style ART fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
+  style Legend fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
 ```
 
 ## Invariant: What compaction actually does to the thread (history rewrite) — exact steps
@@ -325,19 +732,80 @@ This applies to: manual compact, built-in auto-compact, rawr mid-turn, and rawr 
 
 ```mermaid
 graph TD
-  A[Op Compact] --> B[TaskKind Compact]
-  B --> C{remote compaction enabled and provider supports}
-  C --> C_yes[yes]
-  C_yes --> D[remote compact conversation history]
-  D --> E[replace history recompute tokens]
-  E --> F[persist Compacted replacement_history]
-  C --> C_no[no]
-  C_no --> G[local run_compact_task_inner]
-  G --> H[take compaction trigger]
-  H --> I[stream compaction prompt record output]
-  I --> J[build summary_text]
-  J --> K[rewrite history to compacted form]
-  K --> L[recompute tokens persist Compacted message]
+  subgraph ART[Non code artifacts]
+    CFG6[feature RemoteCompaction and provider selection]
+    PROMPT2[compaction prompt text local only]
+  end
+
+  subgraph CLI[Codex CLI process]
+    A[Op Compact event]
+    B[TaskKind Compact]
+    C{remote compaction enabled and provider supports}
+
+    R1[remote compaction RPC]
+    L1[local compaction task inner]
+
+    H1[take compaction trigger]
+    H2[rewrite history and recompute tokens]
+    P1[persist Compacted item]
+  end
+
+  subgraph BACKEND[OpenAI backend]
+    O1[remote compact conversation history]
+    O2[local compaction model summary]
+  end
+
+  CFG6 -.-> C
+  PROMPT2 -.-> L1
+
+  A --> B --> C
+  C --> C_yes[yes] --> H3[handoff remote compact] --> O1 --> H4[handoff replacement history] --> H2 --> P1
+  C --> C_no[no] --> L1 --> H1 --> H5[handoff send prompt to model] --> O2 --> H6[handoff model summary] --> H2 --> P1
+
+  R10[Potential failure backend returns invalid replacement history]
+  O1 -.-> R10
+  H4 -.-> R10
+
+  subgraph Legend[Legend]
+    Lg1[CLI native]
+    Lg2[Rawr custom code]
+    Lg3[Glue or orchestration]
+    Lg4[OpenAI backend]
+    Lg5[Non code artifact]
+    Lg6[Handoff]
+    Lg7[Risk point]
+  end
+
+  classDef native fill:#E3F2FD,stroke:#1E88E5,color:#0D47A1;
+  classDef backend fill:#F3E5F5,stroke:#8E24AA,color:#4A148C;
+  classDef custom fill:#E8F5E9,stroke:#43A047,color:#1B5E20;
+  classDef customFn fill:#C8E6C9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+  classDef glue fill:#FFF3E0,stroke:#FB8C00,color:#E65100;
+  classDef artifact fill:#FAFAFA,stroke:#757575,stroke-dasharray:4 3,color:#424242;
+  classDef handoff fill:#FFEBEE,stroke:#E53935,stroke-width:2px,color:#B71C1C;
+  classDef risk fill:#FFCDD2,stroke:#C62828,stroke-width:2px,stroke-dasharray:2 2,color:#B71C1C;
+
+  class CFG6,PROMPT2 artifact;
+  class A,B native;
+  class C custom;
+  class L1,H1,H2,R1 glue;
+  class O1,O2 backend;
+  class C_yes,C_no,H3,H4,H5,H6 handoff;
+  class P1 native;
+  class R10 risk;
+
+  class Lg1 native;
+  class Lg2 custom;
+  class Lg3 glue;
+  class Lg4 backend;
+  class Lg5 artifact;
+  class Lg6 handoff;
+  class Lg7 risk;
+
+  style CLI fill:#ffffff,stroke:#1E88E5,stroke-width:2px;
+  style BACKEND fill:#ffffff,stroke:#8E24AA,stroke-width:2px;
+  style ART fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
+  style Legend fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
 ```
 
 ## Variant / invariant: Can we modify “the compaction prompt we don’t control”?
@@ -356,11 +824,55 @@ Practical implication:
 
 ```mermaid
 graph TD
-  A[Need editable compaction prompt] --> B{remote compaction enabled}
-  B --> B_yes[yes]
-  B_yes --> C[No provider controls behavior]
-  B --> B_no[no]
-  B_no --> D[Yes local uses turn_context compact_prompt]
+  subgraph ART[Non code artifacts]
+    CFG7[Feature RemoteCompaction toggle]
+    PROMPT3[editable prompt string local only]
+  end
+
+  subgraph CLI[Codex CLI process]
+    A[Need editable compaction prompt]
+    B{remote compaction enabled}
+    C[No provider controls behavior]
+    D[Yes local uses turn_context compact_prompt]
+  end
+
+  CFG7 -.-> B
+  PROMPT3 -.-> D
+
+  A --> B
+  B --> B_yes[yes] --> C
+  B --> B_no[no] --> D
+
+  R11[Failure mode remote compaction hides prompt control]
+  B -.-> R11
+
+  subgraph Legend[Legend]
+    L1[CLI native]
+    L2[Non code artifact]
+    L3[Handoff]
+    L4[Risk point]
+  end
+
+  classDef native fill:#E3F2FD,stroke:#1E88E5,color:#0D47A1;
+  classDef artifact fill:#FAFAFA,stroke:#757575,stroke-dasharray:4 3,color:#424242;
+  classDef handoff fill:#FFEBEE,stroke:#E53935,stroke-width:2px,color:#B71C1C;
+  classDef risk fill:#FFCDD2,stroke:#C62828,stroke-width:2px,stroke-dasharray:2 2,color:#B71C1C;
+  classDef glue fill:#FFF3E0,stroke:#FB8C00,color:#E65100;
+
+  class A,C,D native;
+  class B glue;
+  class B_yes,B_no handoff;
+  class CFG7,PROMPT3 artifact;
+  class R11 risk;
+
+  class L1 native;
+  class L2 artifact;
+  class L3 handoff;
+  class L4 risk;
+
+  style CLI fill:#ffffff,stroke:#1E88E5,stroke-width:2px;
+  style ART fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
+  style Legend fill:#ffffff,stroke:#757575,stroke-width:1px,stroke-dasharray:4 3;
 ```
 
 ## Prompt incentives and loop surfaces (why this can “want to loop”)

@@ -666,6 +666,55 @@ impl Default for ShellEnvironmentPolicy {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionMode {
+    Tag,
+    Suggest,
+    Auto,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionPacketAuthor {
+    Watcher,
+    Agent,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionBoundary {
+    Commit,
+    PlanCheckpoint,
+    AgentDone,
+    TurnComplete,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionTriggerToml {
+    pub percent_remaining_lt: Option<i64>,
+    pub emergency_percent_remaining_lt: Option<i64>,
+    pub auto_requires_any_boundary: Option<Vec<RawrAutoCompactionBoundary>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionPacketToml {
+    pub max_tail_chars: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionToml {
+    pub mode: Option<RawrAutoCompactionMode>,
+    pub packet_author: Option<RawrAutoCompactionPacketAuthor>,
+    #[serde(default)]
+    pub trigger: Option<RawrAutoCompactionTriggerToml>,
+    #[serde(default)]
+    pub packet: Option<RawrAutoCompactionPacketToml>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

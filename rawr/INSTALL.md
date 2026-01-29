@@ -67,15 +67,23 @@ When enabled:
 
 Default behavior: suggest mode (prints a recommendation once context window drops below 75% remaining).
 
-Optional env vars:
-- `RAWR_AUTO_COMPACTION_MODE=tag|suggest|auto` (default: `suggest`)
-- `RAWR_AUTO_COMPACTION_PACKET_AUTHOR=watcher|agent` (default: `watcher`, only used in `auto` mode)
+Config settings (explicit, recommended):
+```toml
+[rawr_auto_compaction]
+mode = "auto" # tag | suggest | auto
+packet_author = "agent" # watcher | agent
+
+[rawr_auto_compaction.trigger]
+percent_remaining_lt = 75
+emergency_percent_remaining_lt = 15
+auto_requires_any_boundary = ["commit", "plan_checkpoint", "agent_done"]
+
+[rawr_auto_compaction.packet]
+max_tail_chars = 1200
+```
 
 ## Heuristics prompt (auditable/editable)
-Copy the template `codex/rawr/prompts/rawr-auto-compact.md` into:
-- `~/.codex-rawr/prompts/rawr-auto-compact.md`
-
-The YAML frontmatter controls thresholds and “auto requires boundary” gating; the Markdown body is used as the prompt when `RAWR_AUTO_COMPACTION_PACKET_AUTHOR=agent`.
+The prompt lives in-repo at `rawr/prompts/rawr-auto-compact.md` and is embedded into the binary at build time. The YAML frontmatter provides default thresholds/boundaries; the Markdown body is used as the prompt when `packet_author = "agent"`. Config overrides take precedence over frontmatter defaults.
 
 ## Using with Happy Coder
 Happy Coder’s CLI supports `happy codex` (Codex mode). If your `PATH` resolves `codex` to this fork (e.g. via the symlink above), `happy codex` will launch the fork.

@@ -12,7 +12,7 @@ Current implementation status (as of `rawr/main`):
   - `commit` (successful `git commit` observed)
   - `plan_checkpoint` (plan updated with at least one `completed` step)
   - `agent_done` (best-effort heuristic on last agent message)
-- Heuristics prompt is editable via `~/.codex-rawr/prompts/rawr-auto-compact.md` (YAML frontmatter + Markdown body)
+- Heuristics prompt is embedded from `rawr/prompts/rawr-auto-compact.md` (YAML frontmatter defaults + Markdown body)
 
 References:
 - Watcher + settings loader: `codex-rs/tui/src/chatwidget.rs`
@@ -57,17 +57,18 @@ Enhance the watcher-built packet to include the multi-level context we want:
 - Final directive: “continue now”
 
 Additionally, implement the “ask agent for packet” flow using the editable prompt body:
-- When `RAWR_AUTO_COMPACTION_PACKET_AUTHOR=agent`:
+- When `rawr_auto_compaction.packet_author = "agent"`:
   1) Inject the prompt (from prompt file body)
   2) Wait for the agent’s packet response
   3) Trigger compaction
   4) Inject that packet as the first post-compact user message
 
-### C) Make YAML knobs the single source of truth
-- Move remaining hard-coded trigger values into YAML:
+### C) Make YAML knobs the single source of truth (with config overrides)
+- Keep default trigger values in YAML:
   - `percent_remaining_lt`
   - `emergency_percent_remaining_lt`
   - `auto_requires_any_boundary`
+- Allow config overrides for explicit, per-user control.
 - Add a “reload-on-change” story later; for now, load at turn completion (cheap + safe).
 
 ## Acceptance criteria

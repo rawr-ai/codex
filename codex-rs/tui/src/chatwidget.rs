@@ -35,6 +35,9 @@ use codex_chatgpt::connectors;
 use codex_core::config::Config;
 use codex_core::config::ConstraintResult;
 use codex_core::config::types::Notifications;
+use codex_core::config::types::RawrAutoCompactionBoundary;
+use codex_core::config::types::RawrAutoCompactionMode;
+use codex_core::config::types::RawrAutoCompactionPacketAuthor;
 use codex_core::features::FEATURES;
 use codex_core::features::Feature;
 use codex_core::git_info::current_branch_name;
@@ -447,6 +450,7 @@ pub(crate) struct ChatWidget {
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
     token_info: Option<TokenUsageInfo>,
+    status_token_info: Option<TokenUsageInfo>,
     rate_limit_snapshot: Option<RateLimitSnapshotDisplay>,
     plan_type: Option<PlanType>,
     rate_limit_warnings: RateLimitWarningState,
@@ -554,28 +558,6 @@ enum RawrAutoCompactionState {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RawrAutoCompactionMode {
-    Tag,
-    Suggest,
-    Auto,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RawrAutoCompactionPacketAuthor {
-    Watcher,
-    Agent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RawrAutoCompactionBoundary {
-    Commit,
-    PlanCheckpoint,
-    AgentDone,
-    TurnComplete,
-}
-
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 #[derive(Default)]
@@ -643,6 +625,11 @@ impl RawrAutoCompactionSettings {
         }
     }
 }
+
+const RAWR_AUTO_COMPACT_PROMPT_TEMPLATE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../rawr/prompts/rawr-auto-compact.md"
+));
 
 fn default_rawr_agent_packet_prompt() -> String {
     [
@@ -1156,28 +1143,19 @@ impl ChatWidget {
     }
 
     fn rawr_auto_compaction_mode(&self) -> RawrAutoCompactionMode {
-        match std::env::var("RAWR_AUTO_COMPACTION_MODE")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "auto" => RawrAutoCompactionMode::Auto,
-            "tag" => RawrAutoCompactionMode::Tag,
-            _ => RawrAutoCompactionMode::Suggest,
-        }
+        self.config
+            .rawr_auto_compaction
+            .as_ref()
+            .and_then(|config| config.mode)
+            .unwrap_or(RawrAutoCompactionMode::Suggest)
     }
 
     fn rawr_auto_compaction_packet_author(&self) -> RawrAutoCompactionPacketAuthor {
-        match std::env::var("RAWR_AUTO_COMPACTION_PACKET_AUTHOR")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "agent" => RawrAutoCompactionPacketAuthor::Agent,
-            _ => RawrAutoCompactionPacketAuthor::Watcher,
-        }
+        self.config
+            .rawr_auto_compaction
+            .as_ref()
+            .and_then(|config| config.packet_author)
+            .unwrap_or(RawrAutoCompactionPacketAuthor::Watcher)
     }
 
     fn maybe_rawr_auto_compact(&mut self, last_agent_message: Option<&str>) {
@@ -1300,7 +1278,7 @@ impl ChatWidget {
             RawrAutoCompactionMode::Suggest => {
                 self.add_info_message(
                     format!(
-                        "[rawr] auto-compaction watcher: recommend compact now (suggest). Context window: {percent_remaining}% left. Run `/compact` to proceed, or set `RAWR_AUTO_COMPACTION_MODE=auto` for automatic compaction."
+                        "[rawr] auto-compaction watcher: recommend compact now (suggest). Context window: {percent_remaining}% left. Run `/compact` to proceed, or set `rawr_auto_compaction.mode = \"auto\"` in config.toml for automatic compaction."
                     ),
                     None,
                 );
@@ -1333,9 +1311,7 @@ impl ChatWidget {
                         let should_defer_to_next_user_turn = settings
                             .prompt_frontmatter
                             .trigger
-                            .auto_requires_any_boundary
-                            .iter()
-                            .any(|boundary| *boundary == RawrAutoCompactionBoundary::TurnComplete);
+                            .auto_requires_any_boundary.contains(&RawrAutoCompactionBoundary::TurnComplete);
                         if should_defer_to_next_user_turn
                             && self.rawr_preflight_compaction_pending.is_none()
                         {
@@ -1529,16 +1505,7 @@ impl ChatWidget {
         let packet_author = self.rawr_auto_compaction_packet_author();
         let mut settings = RawrAutoCompactionSettings::default_with_mode(mode, packet_author);
 
-        let prompt_path = self
-            .config
-            .codex_home
-            .join("prompts")
-            .join("rawr-auto-compact.md");
-        let Ok(contents) = std::fs::read_to_string(&prompt_path) else {
-            return settings;
-        };
-
-        let (frontmatter_str, body) = split_yaml_frontmatter(&contents);
+        let (frontmatter_str, body) = split_yaml_frontmatter(RAWR_AUTO_COMPACT_PROMPT_TEMPLATE);
         if let Some(frontmatter_str) = frontmatter_str {
             match serde_yaml::from_str::<RawrAutoCompactionPromptFrontmatter>(frontmatter_str) {
                 Ok(frontmatter) => {
@@ -1546,8 +1513,7 @@ impl ChatWidget {
                 }
                 Err(err) => {
                     tracing::warn!(
-                        "failed to parse rawr auto-compaction prompt frontmatter at {}: {err}",
-                        prompt_path.display()
+                        "failed to parse rawr auto-compaction prompt frontmatter: {err}"
                     );
                 }
             }
@@ -1556,6 +1522,37 @@ impl ChatWidget {
         let body_prompt = body.trim();
         if !body_prompt.is_empty() {
             settings.agent_packet_prompt = body_prompt.to_string();
+        }
+
+        if let Some(config) = self.config.rawr_auto_compaction.as_ref() {
+            if let Some(mode) = config.mode {
+                settings.mode = mode;
+            }
+            if let Some(packet_author) = config.packet_author {
+                settings.packet_author = packet_author;
+            }
+            if let Some(trigger) = config.trigger.as_ref() {
+                if let Some(percent_remaining_lt) = trigger.percent_remaining_lt {
+                    settings.prompt_frontmatter.trigger.percent_remaining_lt = percent_remaining_lt;
+                }
+                if let Some(emergency_percent_remaining_lt) = trigger.emergency_percent_remaining_lt
+                {
+                    settings
+                        .prompt_frontmatter
+                        .trigger
+                        .emergency_percent_remaining_lt = emergency_percent_remaining_lt;
+                }
+                if let Some(boundaries) = trigger.auto_requires_any_boundary.as_ref() {
+                    settings
+                        .prompt_frontmatter
+                        .trigger
+                        .auto_requires_any_boundary = boundaries.clone();
+                }
+            }
+            if let Some(packet) = config.packet.as_ref()
+                && let Some(max_tail_chars) = packet.max_tail_chars {
+                    settings.prompt_frontmatter.packet.max_tail_chars = max_tail_chars;
+                }
         }
 
         settings
@@ -1642,6 +1639,7 @@ impl ChatWidget {
             None => {
                 self.bottom_pane.set_context_window(None, None);
                 self.token_info = None;
+                self.status_token_info = None;
             }
         }
     }
@@ -1650,6 +1648,7 @@ impl ChatWidget {
         let percent = self.context_remaining_percent(&info);
         let used_tokens = self.context_used_tokens(&info, percent.is_some());
         self.bottom_pane.set_context_window(percent, used_tokens);
+        self.status_token_info = Some(info.clone());
         self.token_info = Some(info);
     }
 
@@ -2682,6 +2681,7 @@ impl ChatWidget {
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             token_info: None,
+            status_token_info: None,
             rate_limit_snapshot: None,
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
@@ -2824,6 +2824,7 @@ impl ChatWidget {
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             token_info: None,
+            status_token_info: None,
             rate_limit_snapshot: None,
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
@@ -2955,6 +2956,7 @@ impl ChatWidget {
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             token_info: None,
+            status_token_info: None,
             rate_limit_snapshot: None,
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
@@ -4016,7 +4018,7 @@ impl ChatWidget {
 
     pub(crate) fn add_status_output(&mut self) {
         let default_usage = TokenUsage::default();
-        let token_info = self.token_info.as_ref();
+        let token_info = self.status_token_info.as_ref().or(self.token_info.as_ref());
         let total_usage = token_info
             .map(|ti| &ti.total_token_usage)
             .unwrap_or(&default_usage);

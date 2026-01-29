@@ -804,6 +804,89 @@
       },
       "type": "object"
     },
+    "RawrAutoCompactionBoundary": {
+      "enum": [
+        "commit",
+        "plan_checkpoint",
+        "agent_done",
+        "turn_complete"
+      ],
+      "type": "string"
+    },
+    "RawrAutoCompactionMode": {
+      "enum": [
+        "tag",
+        "suggest",
+        "auto"
+      ],
+      "type": "string"
+    },
+    "RawrAutoCompactionPacketAuthor": {
+      "enum": [
+        "watcher",
+        "agent"
+      ],
+      "type": "string"
+    },
+    "RawrAutoCompactionPacketToml": {
+      "additionalProperties": false,
+      "properties": {
+        "max_tail_chars": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "RawrAutoCompactionToml": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "$ref": "#/definitions/RawrAutoCompactionMode"
+        },
+        "packet": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RawrAutoCompactionPacketToml"
+            }
+          ],
+          "default": null
+        },
+        "packet_author": {
+          "$ref": "#/definitions/RawrAutoCompactionPacketAuthor"
+        },
+        "trigger": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RawrAutoCompactionTriggerToml"
+            }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
+    },
+    "RawrAutoCompactionTriggerToml": {
+      "additionalProperties": false,
+      "properties": {
+        "auto_requires_any_boundary": {
+          "items": {
+            "$ref": "#/definitions/RawrAutoCompactionBoundary"
+          },
+          "type": "array"
+        },
+        "emergency_percent_remaining_lt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "percent_remaining_lt": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ReasoningEffort": {
       "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
       "enum": [
@@ -1469,6 +1552,15 @@
         "$ref": "#/definitions/ProjectConfig"
       },
       "type": "object"
+    },
+    "rawr_auto_compaction": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RawrAutoCompactionToml"
+        }
+      ],
+      "default": null,
+      "description": "Rawr auto-compaction watcher settings."
     },
     "review_model": {
       "description": "Review model override used by the `/review` feature.",

@@ -337,10 +337,7 @@ async fn manual_compact_uses_custom_prompt() {
         config.model_provider = model_provider;
         config.compact_prompt = Some(custom_prompt.to_string());
     });
-    let test = builder
-        .build(&server)
-        .await
-        .expect("create conversation");
+    let test = builder.build(&server).await.expect("create conversation");
     let codex = test.codex.clone();
     let rollout_path = test.session_configured.rollout_path.expect("rollout path");
 

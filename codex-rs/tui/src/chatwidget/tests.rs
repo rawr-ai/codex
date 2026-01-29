@@ -66,6 +66,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::Settings;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffortPreset;
@@ -91,16 +92,6 @@ use tempfile::tempdir;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
 use toml::Value as TomlValue;
-
-#[cfg(target_os = "windows")]
-fn set_windows_sandbox_enabled(enabled: bool) {
-    codex_core::set_windows_sandbox_enabled(enabled);
-}
-
-#[cfg(target_os = "windows")]
-fn set_windows_elevated_sandbox_enabled(enabled: bool) {
-    codex_core::set_windows_elevated_sandbox_enabled(enabled);
-}
 
 async fn test_config() -> Config {
     // Use base defaults to avoid depending on host state.
@@ -365,6 +356,7 @@ async fn interrupted_turn_restores_queued_messages_with_images_and_elements() {
             path: first_images[0].clone(),
         }],
         text_elements: first_elements,
+        mention_paths: HashMap::new(),
     });
     chat.queued_user_messages.push_back(UserMessage {
         text: second_text,
@@ -373,6 +365,7 @@ async fn interrupted_turn_restores_queued_messages_with_images_and_elements() {
             path: second_images[0].clone(),
         }],
         text_elements: second_elements,
+        mention_paths: HashMap::new(),
     });
     chat.refresh_queued_user_messages();
 
@@ -452,6 +445,7 @@ async fn remap_placeholders_uses_attachment_labels() {
         text,
         text_elements: elements,
         local_images: attachments,
+        mention_paths: HashMap::new(),
     };
     let mut next_label = 3usize;
     let remapped = remap_placeholders_for_message(message, &mut next_label);
@@ -512,6 +506,7 @@ async fn remap_placeholders_uses_byte_ranges_when_placeholder_missing() {
         text,
         text_elements: elements,
         local_images: attachments,
+        mention_paths: HashMap::new(),
     };
     let mut next_label = 3usize;
     let remapped = remap_placeholders_for_message(message, &mut next_label);
@@ -789,7 +784,7 @@ async fn make_chatwidget_manual(
         },
     };
     let current_collaboration_mode = base_mode;
-    let widget = ChatWidget {
+    let mut widget = ChatWidget {
         app_event_tx,
         codex_op_tx: op_tx,
         bottom_pane: bottom,
@@ -801,7 +796,7 @@ async fn make_chatwidget_manual(
         auth_manager,
         models_manager,
         otel_manager,
-        session_header: SessionHeader::new(resolved_model),
+        session_header: SessionHeader::new(resolved_model.clone()),
         initial_user_message: None,
         token_info: None,
         rate_limit_snapshot: None,
@@ -820,6 +815,7 @@ async fn make_chatwidget_manual(
         unified_exec_processes: Vec::new(),
         agent_turn_running: false,
         mcp_startup_status: None,
+        connectors_cache: ConnectorsCacheState::default(),
         interrupts: InterruptManager::new(),
         reasoning_buffer: String::new(),
         full_reasoning_buffer: String::new(),
@@ -849,6 +845,7 @@ async fn make_chatwidget_manual(
         rawr_saw_plan_checkpoint_this_turn: false,
         rawr_preflight_compaction_pending: None,
     };
+    widget.set_model(&resolved_model);
     (widget, rx, op_rx)
 }
 
@@ -2104,10 +2101,7 @@ async fn ctrl_c_cleared_prompt_is_recoverable_via_history() {
     assert!(!chat.bottom_pane.quit_shortcut_hint_visible());
 
     let images = chat.bottom_pane.take_recent_submission_images();
-    assert!(
-        images.is_empty(),
-        "attachments are not preserved in history recall"
-    );
+    assert_eq!(vec![PathBuf::from("/tmp/preview.png")], images);
 }
 
 #[tokio::test]
@@ -2764,6 +2758,26 @@ async fn collab_mode_enabling_keeps_custom_until_selected() {
 }
 
 #[tokio::test]
+async fn user_turn_includes_personality_from_config() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("bengalfox")).await;
+    chat.set_feature_enabled(Feature::Personality, true);
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_model("bengalfox");
+    chat.set_personality(Personality::Friendly);
+
+    chat.bottom_pane
+        .set_composer_text("hello".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn {
+            personality: Some(Personality::Friendly),
+            ..
+        } => {}
+        other => panic!("expected Op::UserTurn with friendly personality, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn slash_quit_requests_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
@@ -3237,13 +3251,13 @@ async fn experimental_features_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 
     let features = vec![
-        BetaFeatureItem {
+        ExperimentalFeatureItem {
             feature: Feature::GhostCommit,
             name: "Ghost snapshots".to_string(),
             description: "Capture undo snapshots each turn.".to_string(),
             enabled: false,
         },
-        BetaFeatureItem {
+        ExperimentalFeatureItem {
             feature: Feature::ShellTool,
             name: "Shell tool".to_string(),
             description: "Allow the model to run shell commands.".to_string(),
@@ -3263,7 +3277,7 @@ async fn experimental_features_toggle_saves_on_exit() {
 
     let expected_feature = Feature::GhostCommit;
     let view = ExperimentalFeaturesView::new(
-        vec![BetaFeatureItem {
+        vec![ExperimentalFeatureItem {
             feature: expected_feature,
             name: "Ghost snapshots".to_string(),
             description: "Capture undo snapshots each turn.".to_string(),
@@ -3308,6 +3322,16 @@ async fn model_selection_popup_snapshot() {
 }
 
 #[tokio::test]
+async fn personality_selection_popup_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("bengalfox")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.open_personality_popup();
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert_snapshot!("personality_selection_popup", popup);
+}
+
+#[tokio::test]
 async fn model_picker_hides_show_in_picker_false_models_from_cache() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("test-visible-model")).await;
     chat.thread_id = Some(ThreadId::new());
@@ -3321,6 +3345,7 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
             effort: ReasoningEffortConfig::Medium,
             description: "medium".to_string(),
         }],
+        supports_personality: false,
         is_default: false,
         upgrade: None,
         show_in_picker,
@@ -3365,16 +3390,9 @@ async fn approvals_selection_popup_snapshot() {
 async fn approvals_selection_popup_snapshot_windows_degraded_sandbox() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    let was_sandbox_enabled = codex_core::get_platform_sandbox().is_some();
-    let was_elevated_enabled = codex_core::is_windows_elevated_sandbox_enabled();
-
     chat.config.notices.hide_full_access_warning = None;
-    chat.config.features.enable(Feature::WindowsSandbox);
-    chat.config
-        .features
-        .disable(Feature::WindowsSandboxElevated);
-    set_windows_sandbox_enabled(true);
-    set_windows_elevated_sandbox_enabled(false);
+    chat.set_feature_enabled(Feature::WindowsSandbox, true);
+    chat.set_feature_enabled(Feature::WindowsSandboxElevated, false);
 
     chat.open_approvals_popup();
 
@@ -3382,10 +3400,6 @@ async fn approvals_selection_popup_snapshot_windows_degraded_sandbox() {
     insta::with_settings!({ snapshot_suffix => "windows_degraded" }, {
         assert_snapshot!("approvals_selection_popup", popup);
     });
-
-    // Avoid leaking sandbox global state into other tests.
-    set_windows_sandbox_enabled(was_sandbox_enabled);
-    set_windows_elevated_sandbox_enabled(was_elevated_enabled);
 }
 
 #[tokio::test]
@@ -3448,7 +3462,8 @@ async fn windows_auto_mode_prompt_requests_enabling_sandbox_feature() {
 async fn startup_prompts_for_windows_sandbox_when_agent_requested() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    set_windows_sandbox_enabled(false);
+    chat.set_feature_enabled(Feature::WindowsSandbox, false);
+    chat.set_feature_enabled(Feature::WindowsSandboxElevated, false);
     chat.config.forced_auto_mode_downgraded_on_windows = true;
 
     chat.maybe_prompt_windows_sandbox_enable();
@@ -3466,8 +3481,6 @@ async fn startup_prompts_for_windows_sandbox_when_agent_requested() {
         popup.contains("Stay in"),
         "expected startup prompt to offer staying in current mode: {popup}"
     );
-
-    set_windows_sandbox_enabled(true);
 }
 
 #[tokio::test]
@@ -3533,6 +3546,7 @@ async fn single_reasoning_option_skips_selection() {
         description: "".to_string(),
         default_reasoning_effort: ReasoningEffortConfig::High,
         supported_reasoning_efforts: single_effort,
+        supports_personality: false,
         is_default: false,
         upgrade: None,
         show_in_picker: true,

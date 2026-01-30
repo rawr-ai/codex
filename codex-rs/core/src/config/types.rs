@@ -720,6 +720,9 @@ pub struct RawrAutoCompactionPacketToml {
 pub struct RawrAutoCompactionToml {
     pub mode: Option<RawrAutoCompactionMode>,
     pub packet_author: Option<RawrAutoCompactionPacketAuthor>,
+    /// When enabled, the watcher may ask the in-session agent to write a scratchpad file before
+    /// compaction so verbatim research notes/drafts survive history rewrite.
+    pub scratch_write_enabled: Option<bool>,
     /// Optional model override used for compaction requests triggered by the watcher.
     pub compaction_model: Option<String>,
     /// Optional reasoning effort override used for watcher-triggered compactions.

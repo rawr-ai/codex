@@ -905,6 +905,7 @@ async fn make_chatwidget_manual(
         rawr_saw_plan_checkpoint_this_turn: false,
         rawr_saw_pr_checkpoint_this_turn: false,
         rawr_preflight_compaction_pending: None,
+        rawr_post_compact_handoff_pending: None,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)
@@ -1197,7 +1198,14 @@ async fn rawr_auto_compaction_defers_to_next_user_turn_when_turn_complete_bounda
         UserInput::Text { text, .. } => text.clone(),
         other => panic!("expected UserInput::Text, got {other:?}"),
     };
-    assert_eq!(text, "next user message");
+    assert!(
+        text.contains("Continuation context packet"),
+        "expected post-compaction handoff packet prefix, got: {text}"
+    );
+    assert!(
+        text.contains("next user message"),
+        "expected queued user message appended after handoff, got: {text}"
+    );
 }
 
 #[tokio::test]
@@ -1306,6 +1314,87 @@ async fn rawr_auto_compaction_auto_agent_packet_e2e() {
         other => panic!("expected UserInput::Text, got {other:?}"),
     };
     assert_eq!(text, "PACKET CONTENTS");
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_scratch_write_is_included_in_agent_packet_prompt_when_enabled() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.rawr_saw_commit_this_turn = true;
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Agent,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+    settings.agent_packet_prompt = "PLEASE WRITE PACKET".to_string();
+    settings.scratch_write_enabled = true;
+    settings.scratch_write_prompt = "SCRATCH TO {scratch_file}".to_string();
+
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings.clone());
+    let prompt_turn = next_submit_op(&mut op_rx);
+    let Op::UserTurn { items, .. } = prompt_turn else {
+        panic!("expected Op::UserTurn");
+    };
+    let prompt = match &items[0] {
+        UserInput::Text { text, .. } => text.clone(),
+        other => panic!("expected UserInput::Text, got {other:?}"),
+    };
+    assert!(
+        prompt.contains(".scratch/agent-codex.scratch.md"),
+        "expected scratch file path, got: {prompt}"
+    );
+    assert!(
+        prompt.contains("PLEASE WRITE PACKET"),
+        "expected continuation packet prompt, got: {prompt}"
+    );
+
+    // Agent returns the packet; watcher triggers compaction.
+    chat.maybe_rawr_auto_compact_with_settings(Some("PACKET CONTENTS"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_scratch_write_is_requested_before_compacting_in_watcher_mode() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.rawr_saw_commit_this_turn = true;
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+    settings.scratch_write_enabled = true;
+    settings.scratch_write_prompt = "SCRATCH TO {scratch_file}".to_string();
+
+    // First pass requests scratch write (no compaction yet).
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), false);
+    let prompt_turn = next_submit_op(&mut op_rx);
+    let Op::UserTurn { items, .. } = prompt_turn else {
+        panic!("expected Op::UserTurn");
+    };
+    let prompt = match &items[0] {
+        UserInput::Text { text, .. } => text.clone(),
+        other => panic!("expected UserInput::Text, got {other:?}"),
+    };
+    assert!(
+        prompt.contains(".scratch/agent-codex.scratch.md"),
+        "expected scratch file path, got: {prompt}"
+    );
+
+    // Second pass: scratch write turn completed -> watcher compacts.
+    chat.maybe_rawr_auto_compact_with_settings(Some("scratch done"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
 }
 
 #[tokio::test]

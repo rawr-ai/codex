@@ -899,6 +899,10 @@
         "packet_author": {
           "$ref": "#/definitions/RawrAutoCompactionPacketAuthor"
         },
+        "scratch_write_enabled": {
+          "description": "When enabled, the watcher may ask the in-session agent to write a scratchpad file before compaction so verbatim research notes/drafts survive history rewrite.",
+          "type": "boolean"
+        },
         "trigger": {
           "allOf": [
             {

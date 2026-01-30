@@ -4008,7 +4008,7 @@ impl ChatWidget {
         }
     }
 
-    fn submit_user_message(&mut self, user_message: UserMessage) {
+    fn submit_user_message(&mut self, mut user_message: UserMessage) {
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
             self.queued_user_messages.push_front(user_message);
@@ -4035,6 +4035,20 @@ impl ChatWidget {
             tracing::warn!(
                 "rawr preflight compaction was expected but missing; continuing without preflight"
             );
+        }
+
+        if self
+            .rawr_post_compact_handoff_pending
+            .as_ref()
+            .is_some_and(|_| !user_message.text.trim_start().starts_with('!'))
+        {
+            if let Some(handoff) = self.rawr_post_compact_handoff_pending.take() {
+                user_message.text = format!(
+                    "{handoff}\n\n---\n\n{original}",
+                    original = user_message.text
+                );
+                user_message.text_elements.clear();
+            }
         }
 
         let UserMessage {

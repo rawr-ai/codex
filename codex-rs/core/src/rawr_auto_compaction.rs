@@ -39,7 +39,6 @@ impl RawrAutoCompactionThresholds {
 
         let ready = trigger
             .ready_percent_remaining_lt
-            .or(trigger.percent_remaining_lt)
             .unwrap_or(defaults.ready_percent_remaining_lt);
 
         Self {

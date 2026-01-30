@@ -940,13 +940,8 @@
           "format": "int64",
           "type": "integer"
         },
-        "percent_remaining_lt": {
-          "description": "Back-compat: older configs used a single threshold.",
-          "format": "int64",
-          "type": "integer"
-        },
         "ready_percent_remaining_lt": {
-          "description": "Ready threshold (default behavior). When unset, falls back to `percent_remaining_lt`.",
+          "description": "Ready threshold (default behavior).",
           "format": "int64",
           "type": "integer"
         }

@@ -60,6 +60,10 @@ pub struct OtelManager {
 }
 
 impl OtelManager {
+    pub fn session_source(&self) -> &str {
+        self.metadata.session_source.as_str()
+    }
+
     pub fn with_model(mut self, model: &str, slug: &str) -> Self {
         self.metadata.model = model.to_owned();
         self.metadata.slug = slug.to_owned();

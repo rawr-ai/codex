@@ -20,9 +20,12 @@
 //! is in progress and while MCP server startup is in progress. Those lifecycles are tracked
 //! independently (`agent_turn_running` and `mcp_startup_status`) and synchronized via
 //! `update_task_running_state`.
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -621,6 +624,7 @@ pub(crate) struct ChatWidget {
     /// When compaction completes while a user message is queued, avoid starting an extra
     /// model turn by injecting the post-compaction handoff into the next queued user message.
     rawr_post_compact_handoff_pending: Option<String>,
+    rawr_scratch_agent_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -668,10 +672,7 @@ struct RawrAutoCompactionPromptFrontmatter {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawrAutoCompactionTriggerRules {
-    early_percent_remaining_lt: Option<i64>,
     ready_percent_remaining_lt: Option<i64>,
-    asap_percent_remaining_lt: Option<i64>,
-    percent_remaining_lt: i64,
     emergency_percent_remaining_lt: i64,
     auto_requires_any_boundary: Vec<RawrAutoCompactionBoundary>,
 }
@@ -679,10 +680,7 @@ struct RawrAutoCompactionTriggerRules {
 impl Default for RawrAutoCompactionTriggerRules {
     fn default() -> Self {
         Self {
-            early_percent_remaining_lt: Some(85),
             ready_percent_remaining_lt: Some(75),
-            asap_percent_remaining_lt: Some(65),
-            percent_remaining_lt: 75,
             emergency_percent_remaining_lt: 15,
             auto_requires_any_boundary: vec![
                 RawrAutoCompactionBoundary::Commit,
@@ -744,6 +742,12 @@ const RAWR_SCRATCH_WRITE_PROMPT_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../rawr/prompts/rawr-scratch-write.md"
 ));
+
+const RAWR_SCRATCH_FALLBACK_AGENT_NAMES: [&str; 24] = [
+    "Aria", "Atlas", "Beau", "Cleo", "Ezra", "Jade", "Juno", "Luna", "Milo", "Nova", "Orion",
+    "Pax", "Quinn", "Reid", "Remy", "Rhea", "Rory", "Sage", "Skye", "Toby", "Vera", "Wren", "Zane",
+    "Zoe",
+];
 
 fn default_rawr_agent_packet_prompt() -> String {
     [
@@ -1266,6 +1270,7 @@ impl ChatWidget {
         self.thread_id = Some(event.session_id);
         self.thread_name = event.thread_name.clone();
         self.forked_from = event.forked_from_id;
+        self.rawr_scratch_agent_name = None;
         self.current_rollout_path = event.rollout_path.clone();
         self.current_cwd = Some(event.cwd.clone());
         let initial_messages = event.initial_messages.clone();
@@ -1772,9 +1777,6 @@ impl ChatWidget {
             .prompt_frontmatter
             .trigger
             .ready_percent_remaining_lt
-            .or(Some(
-                settings.prompt_frontmatter.trigger.percent_remaining_lt,
-            ))
             .unwrap_or(75);
         if percent_remaining >= trigger_percent_remaining {
             return;
@@ -1906,7 +1908,11 @@ impl ChatWidget {
                             &trigger,
                             is_emergency,
                         );
-                        let scratch_file = do_scratch.then(|| self.rawr_scratch_file_rel_path());
+                        let scratch_file = if do_scratch {
+                            Some(self.rawr_scratch_file_rel_path())
+                        } else {
+                            None
+                        };
                         if let Some(scratch_file) = scratch_file.as_ref() {
                             trigger.scratch_file = Some(scratch_file.clone());
                         }
@@ -2127,7 +2133,11 @@ impl ChatWidget {
                 .trigger
                 .emergency_percent_remaining_lt;
         let do_scratch = self.rawr_should_schedule_scratch_write(&settings, &trigger, is_emergency);
-        let scratch_file = do_scratch.then(|| self.rawr_scratch_file_rel_path());
+        let scratch_file = if do_scratch {
+            Some(self.rawr_scratch_file_rel_path())
+        } else {
+            None
+        };
         if let Some(scratch_file) = scratch_file.as_ref() {
             trigger.scratch_file = Some(scratch_file.clone());
         }
@@ -2196,9 +2206,72 @@ impl ChatWidget {
             || self.had_work_activity
     }
 
-    fn rawr_scratch_file_rel_path(&self) -> String {
-        let agent_name = "codex";
+    fn rawr_scratch_file_rel_path(&mut self) -> String {
+        let agent_name = self.rawr_scratch_agent_name();
         format!(".scratch/agent-{agent_name}.scratch.md")
+    }
+
+    fn rawr_scratch_agent_name(&mut self) -> String {
+        if let Some(name) = self.rawr_scratch_agent_name.as_ref() {
+            return name.clone();
+        }
+
+        let name = self
+            .rawr_agent_identity_from_session_source()
+            .unwrap_or_else(|| self.rawr_random_agent_name());
+        let name = if name.is_empty() {
+            "codex".to_string()
+        } else {
+            name
+        };
+        self.rawr_scratch_agent_name = Some(name.clone());
+        name
+    }
+
+    fn rawr_agent_identity_from_session_source(&self) -> Option<String> {
+        let source = self.otel_manager.session_source();
+        let identity = source.strip_prefix("subagent_")?;
+        let sanitized = Self::rawr_sanitize_agent_name(identity);
+        if sanitized.is_empty() {
+            None
+        } else {
+            Some(sanitized)
+        }
+    }
+
+    fn rawr_random_agent_name(&self) -> String {
+        if RAWR_SCRATCH_FALLBACK_AGENT_NAMES.is_empty() {
+            return "codex".to_string();
+        }
+
+        let name = if let Some(thread_id) = self.thread_id {
+            let mut hasher = DefaultHasher::new();
+            thread_id.hash(&mut hasher);
+            let seed = hasher.finish() as usize;
+            RAWR_SCRATCH_FALLBACK_AGENT_NAMES[seed % RAWR_SCRATCH_FALLBACK_AGENT_NAMES.len()]
+        } else {
+            let mut rng = rand::rng();
+            let idx = rng.random_range(0..RAWR_SCRATCH_FALLBACK_AGENT_NAMES.len());
+            RAWR_SCRATCH_FALLBACK_AGENT_NAMES[idx]
+        };
+
+        Self::rawr_sanitize_agent_name(name)
+    }
+
+    fn rawr_sanitize_agent_name(name: &str) -> String {
+        let mut out = String::with_capacity(name.len());
+        let mut last_dash = false;
+        for ch in name.chars() {
+            let ch = ch.to_ascii_lowercase();
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch);
+                last_dash = false;
+            } else if !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
+        }
+        out.trim_matches('-').to_string()
     }
 
     fn rawr_build_scratch_write_prompt(
@@ -2307,26 +2380,11 @@ impl ChatWidget {
                 settings.scratch_write_enabled = enabled;
             }
             if let Some(trigger) = config.trigger.as_ref() {
-                if let Some(early_percent_remaining_lt) = trigger.early_percent_remaining_lt {
-                    settings
-                        .prompt_frontmatter
-                        .trigger
-                        .early_percent_remaining_lt = Some(early_percent_remaining_lt);
-                }
                 if let Some(ready_percent_remaining_lt) = trigger.ready_percent_remaining_lt {
                     settings
                         .prompt_frontmatter
                         .trigger
                         .ready_percent_remaining_lt = Some(ready_percent_remaining_lt);
-                }
-                if let Some(asap_percent_remaining_lt) = trigger.asap_percent_remaining_lt {
-                    settings
-                        .prompt_frontmatter
-                        .trigger
-                        .asap_percent_remaining_lt = Some(asap_percent_remaining_lt);
-                }
-                if let Some(percent_remaining_lt) = trigger.percent_remaining_lt {
-                    settings.prompt_frontmatter.trigger.percent_remaining_lt = percent_remaining_lt;
                 }
                 if let Some(emergency_percent_remaining_lt) = trigger.emergency_percent_remaining_lt
                 {
@@ -3637,6 +3695,7 @@ impl ChatWidget {
             rawr_saw_pr_checkpoint_this_turn: false,
             rawr_preflight_compaction_pending: None,
             rawr_post_compact_handoff_pending: None,
+            rawr_scratch_agent_name: None,
         };
 
         widget.prefetch_rate_limits();
@@ -3806,6 +3865,7 @@ impl ChatWidget {
             rawr_saw_pr_checkpoint_this_turn: false,
             rawr_preflight_compaction_pending: None,
             rawr_post_compact_handoff_pending: None,
+            rawr_scratch_agent_name: None,
         };
 
         widget.prefetch_rate_limits();
@@ -3964,6 +4024,7 @@ impl ChatWidget {
             rawr_saw_pr_checkpoint_this_turn: false,
             rawr_preflight_compaction_pending: None,
             rawr_post_compact_handoff_pending: None,
+            rawr_scratch_agent_name: None,
         };
 
         widget.prefetch_rate_limits();
@@ -4614,7 +4675,7 @@ impl ChatWidget {
         }
     }
 
-    fn submit_user_message(&mut self, user_message: UserMessage) {
+    fn submit_user_message(&mut self, mut user_message: UserMessage) {
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
             self.queued_user_messages.push_front(user_message);
@@ -4631,15 +4692,30 @@ impl ChatWidget {
                 .as_ref()
                 .is_some_and(|_| !user_message.text.trim_start().starts_with('!'))
         {
-            let trigger = self
-                .rawr_preflight_compaction_pending
-                .take()
-                .expect("preflight compaction pending should be set");
-            self.queued_user_messages.push_front(user_message);
-            self.refresh_queued_user_messages();
-            let settings = self.rawr_load_auto_compaction_settings();
-            self.rawr_begin_auto_compaction_from_trigger(trigger, settings);
-            return;
+            if let Some(trigger) = self.rawr_preflight_compaction_pending.take() {
+                self.queued_user_messages.push_front(user_message);
+                self.refresh_queued_user_messages();
+                let settings = self.rawr_load_auto_compaction_settings();
+                self.rawr_begin_auto_compaction_from_trigger(trigger, settings);
+                return;
+            }
+            tracing::warn!(
+                "rawr preflight compaction was expected but missing; continuing without preflight"
+            );
+        }
+
+        if self
+            .rawr_post_compact_handoff_pending
+            .as_ref()
+            .is_some_and(|_| !user_message.text.trim_start().starts_with('!'))
+        {
+            if let Some(handoff) = self.rawr_post_compact_handoff_pending.take() {
+                user_message.text = format!(
+                    "{handoff}\n\n---\n\n{original}",
+                    original = user_message.text
+                );
+                user_message.text_elements.clear();
+            }
         }
 
         let UserMessage {
@@ -5143,13 +5219,14 @@ impl ChatWidget {
             if is_local_shell {
                 return;
             }
-            let trigger = self
-                .rawr_preflight_compaction_pending
-                .take()
-                .expect("preflight compaction pending should be set");
-            let settings = self.rawr_load_auto_compaction_settings();
-            self.rawr_begin_auto_compaction_from_trigger(trigger, settings);
-            return;
+            if let Some(trigger) = self.rawr_preflight_compaction_pending.take() {
+                let settings = self.rawr_load_auto_compaction_settings();
+                self.rawr_begin_auto_compaction_from_trigger(trigger, settings);
+                return;
+            }
+            tracing::warn!(
+                "rawr preflight compaction was expected but missing; continuing without preflight"
+            );
         }
         if self.bottom_pane.is_task_running() {
             return;

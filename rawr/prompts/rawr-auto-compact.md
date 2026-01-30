@@ -1,14 +1,8 @@
 ---
 version: 0
 trigger:
-  # Early threshold: only compact on "big step" boundaries (topic/plan/PR).
-  early_percent_remaining_lt: 85
   # Ready threshold: compact on common boundaries like commits.
   ready_percent_remaining_lt: 75
-  # Asap threshold: compact at the next natural pause boundary.
-  asap_percent_remaining_lt: 65
-  # Back-compat: older configs used a single threshold.
-  percent_remaining_lt: 75
   # Safety valve: compact even without a “natural boundary” when remaining context drops below this.
   emergency_percent_remaining_lt: 15
   # In `auto` mode, compact only when at least one boundary signal is present (unless emergency threshold triggers).

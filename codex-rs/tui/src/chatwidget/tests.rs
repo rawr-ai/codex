@@ -979,6 +979,7 @@ async fn make_chatwidget_manual(
         rawr_saw_pr_checkpoint_this_turn: false,
         rawr_preflight_compaction_pending: None,
         rawr_post_compact_handoff_pending: None,
+        rawr_scratch_agent_name: None,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)
@@ -1083,7 +1084,10 @@ fn make_rawr_settings_for_test(
     packet_author: RawrAutoCompactionPacketAuthor,
 ) -> RawrAutoCompactionSettings {
     let mut settings = RawrAutoCompactionSettings::default_with_mode(mode, packet_author);
-    settings.prompt_frontmatter.trigger.percent_remaining_lt = 75;
+    settings
+        .prompt_frontmatter
+        .trigger
+        .ready_percent_remaining_lt = Some(75);
     settings
         .prompt_frontmatter
         .trigger
@@ -1418,7 +1422,7 @@ async fn rawr_auto_compaction_scratch_write_is_included_in_agent_packet_prompt_w
         other => panic!("expected UserInput::Text, got {other:?}"),
     };
     assert!(
-        prompt.contains(".scratch/agent-codex.scratch.md"),
+        prompt.contains(".scratch/agent-") && prompt.contains(".scratch.md"),
         "expected scratch file path, got: {prompt}"
     );
     assert!(
@@ -1427,7 +1431,7 @@ async fn rawr_auto_compaction_scratch_write_is_included_in_agent_packet_prompt_w
     );
 
     // Agent returns the packet; watcher triggers compaction.
-    chat.maybe_rawr_auto_compact_with_settings(Some("PACKET CONTENTS"), settings.clone());
+    chat.maybe_rawr_auto_compact_with_settings(Some("PACKET CONTENTS"), settings);
     assert_eq!(drain_for_compact(&mut rx), true);
 }
 
@@ -1461,12 +1465,12 @@ async fn rawr_auto_compaction_scratch_write_is_requested_before_compacting_in_wa
         other => panic!("expected UserInput::Text, got {other:?}"),
     };
     assert!(
-        prompt.contains(".scratch/agent-codex.scratch.md"),
+        prompt.contains(".scratch/agent-") && prompt.contains(".scratch.md"),
         "expected scratch file path, got: {prompt}"
     );
 
     // Second pass: scratch write turn completed -> watcher compacts.
-    chat.maybe_rawr_auto_compact_with_settings(Some("scratch done"), settings.clone());
+    chat.maybe_rawr_auto_compact_with_settings(Some("scratch done"), settings);
     assert_eq!(drain_for_compact(&mut rx), true);
 }
 

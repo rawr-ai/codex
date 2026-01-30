@@ -617,18 +617,39 @@ pub(crate) struct ChatWidget {
     rawr_saw_commit_this_turn: bool,
     rawr_saw_plan_checkpoint_this_turn: bool,
     rawr_saw_pr_checkpoint_this_turn: bool,
-    rawr_preflight_compaction_pending: Option<i64>,
+    rawr_preflight_compaction_pending: Option<RawrAutoCompactionTriggerContext>,
+    /// When compaction completes while a user message is queued, avoid starting an extra
+    /// model turn by injecting the post-compaction handoff into the next queued user message.
+    rawr_post_compact_handoff_pending: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawrAutoCompactionTriggerContext {
+    trigger_percent_remaining: i64,
+    saw_commit: bool,
+    saw_plan_checkpoint: bool,
+    saw_plan_update: bool,
+    saw_pr_checkpoint: bool,
+    agent_done: bool,
+    last_agent_message: Option<String>,
+    scratch_file: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RawrAutoCompactionState {
     Idle,
+    AwaitingScratchWrite {
+        trigger: RawrAutoCompactionTriggerContext,
+        packet_author: RawrAutoCompactionPacketAuthor,
+    },
     AwaitingPacket {
-        trigger_percent_remaining: i64,
+        trigger: RawrAutoCompactionTriggerContext,
+        packet_author: RawrAutoCompactionPacketAuthor,
     },
     Compacting {
+        trigger: RawrAutoCompactionTriggerContext,
+        packet_author: RawrAutoCompactionPacketAuthor,
         packet: String,
-        trigger_percent_remaining: i64,
         saw_context_compacted: bool,
         saw_turn_complete: bool,
         should_inject_packet: bool,
@@ -691,8 +712,10 @@ impl Default for RawrAutoCompactionPacketRules {
 struct RawrAutoCompactionSettings {
     mode: RawrAutoCompactionMode,
     packet_author: RawrAutoCompactionPacketAuthor,
+    scratch_write_enabled: bool,
     prompt_frontmatter: RawrAutoCompactionPromptFrontmatter,
     agent_packet_prompt: String,
+    scratch_write_prompt: String,
 }
 
 impl RawrAutoCompactionSettings {
@@ -704,8 +727,10 @@ impl RawrAutoCompactionSettings {
         Self {
             mode,
             packet_author,
+            scratch_write_enabled: false,
             prompt_frontmatter,
             agent_packet_prompt: default_rawr_agent_packet_prompt(),
+            scratch_write_prompt: default_rawr_scratch_write_prompt(),
         }
     }
 }
@@ -713,6 +738,11 @@ impl RawrAutoCompactionSettings {
 const RAWR_AUTO_COMPACT_PROMPT_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../rawr/prompts/rawr-auto-compact.md"
+));
+
+const RAWR_SCRATCH_WRITE_PROMPT_TEMPLATE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../rawr/prompts/rawr-scratch-write.md"
 ));
 
 fn default_rawr_agent_packet_prompt() -> String {
@@ -723,6 +753,22 @@ fn default_rawr_agent_packet_prompt() -> String {
         "- Keep it short and structured.",
         "- Include: overarching goal, current state, next steps, invariants/decisions, and a final directive to continue after compaction.",
         "- Do not include secrets; redact tokens/keys.",
+    ]
+    .join("\n")
+}
+
+fn default_rawr_scratch_write_prompt() -> String {
+    [
+        "[rawr] Before we compact this thread, write a scratchpad file with what you just worked on.",
+        "",
+        "Target file: `{scratch_file}`",
+        "",
+        "Requirements:",
+        "- Create the `.scratch/` directory if it doesn't exist.",
+        "- Append a new section (do not delete prior scratch content).",
+        "- Prefer verbatim notes/drafts over summaries; include raw details that are useful later.",
+        "- Include links/paths to any important files you edited or created.",
+        "- After writing, confirm in your next message that the scratch file was written and include the exact path.",
     ]
     .join("\n")
 }
@@ -1622,7 +1668,6 @@ impl ChatWidget {
         if self.is_review_mode {
             return;
         }
-        let has_queued_user_messages = !self.queued_user_messages.is_empty();
 
         match std::mem::replace(
             &mut self.rawr_auto_compaction_state,
@@ -1631,15 +1676,56 @@ impl ChatWidget {
             RawrAutoCompactionState::Idle => {
                 self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
             }
+            RawrAutoCompactionState::AwaitingScratchWrite {
+                trigger,
+                packet_author,
+            } => {
+                // Scratch write step completed (best-effort). Proceed to continuation packet step,
+                // which must happen immediately before compaction.
+                match packet_author {
+                    RawrAutoCompactionPacketAuthor::Watcher => {
+                        let packet = self.rawr_build_post_compact_packet(
+                            &trigger,
+                            settings.prompt_frontmatter.packet.max_tail_chars,
+                        );
+                        self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                            trigger,
+                            packet_author,
+                            packet,
+                            saw_context_compacted: false,
+                            saw_turn_complete: false,
+                            should_inject_packet: true,
+                        };
+                        self.rawr_trigger_compact();
+                        return;
+                    }
+                    RawrAutoCompactionPacketAuthor::Agent => {
+                        let scratch_file = trigger.scratch_file.clone();
+                        self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingPacket {
+                            trigger,
+                            packet_author,
+                        };
+                        let prompt = self.rawr_build_agent_continuation_packet_prompt(
+                            &settings,
+                            false,
+                            scratch_file.as_deref(),
+                        );
+                        self.rawr_request_packet_from_agent(prompt);
+                        return;
+                    }
+                }
+            }
             RawrAutoCompactionState::AwaitingPacket {
-                trigger_percent_remaining,
+                trigger,
+                packet_author,
             } => {
                 let packet = last_agent_message
                     .unwrap_or("Continue the remaining work after compaction.")
                     .to_string();
                 self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                    trigger,
+                    packet_author,
                     packet,
-                    trigger_percent_remaining,
                     saw_context_compacted: false,
                     saw_turn_complete: false,
                     should_inject_packet: true,
@@ -1648,22 +1734,24 @@ impl ChatWidget {
                 return;
             }
             RawrAutoCompactionState::Compacting {
+                trigger,
                 packet,
                 saw_context_compacted,
-                trigger_percent_remaining,
                 should_inject_packet,
+                packet_author,
                 ..
             } => {
                 if saw_context_compacted {
                     if should_inject_packet {
-                        self.rawr_inject_post_compact_packet(packet);
+                        self.rawr_inject_post_compact_packet(&trigger, packet);
                     } else {
                         self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
                     }
                 } else {
                     self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                        trigger,
+                        packet_author,
                         packet,
-                        trigger_percent_remaining,
                         saw_context_compacted: false,
                         saw_turn_complete: true,
                         should_inject_packet,
@@ -1757,15 +1845,26 @@ impl ChatWidget {
 
                 match settings.packet_author {
                     RawrAutoCompactionPacketAuthor::Watcher => {
-                        if has_queued_user_messages {
-                            self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
-                                packet: String::new(),
-                                trigger_percent_remaining: percent_remaining,
-                                saw_context_compacted: false,
-                                saw_turn_complete: false,
-                                should_inject_packet: false,
-                            };
-                            self.rawr_trigger_compact();
+                        let mut trigger = self.rawr_capture_auto_compaction_trigger(
+                            percent_remaining,
+                            last_agent_message,
+                            agent_done,
+                        );
+                        if self.rawr_should_schedule_scratch_write(
+                            &settings,
+                            &trigger,
+                            is_emergency,
+                        ) {
+                            let scratch_file = self.rawr_scratch_file_rel_path();
+                            trigger.scratch_file = Some(scratch_file.clone());
+                            self.rawr_auto_compaction_state =
+                                RawrAutoCompactionState::AwaitingScratchWrite {
+                                    trigger,
+                                    packet_author: RawrAutoCompactionPacketAuthor::Watcher,
+                                };
+                            let prompt = self
+                                .rawr_build_scratch_write_prompt(&settings, scratch_file.as_str());
+                            self.rawr_submit_injected_user_turn(prompt);
                             return;
                         }
 
@@ -1777,22 +1876,19 @@ impl ChatWidget {
                         if should_defer_to_next_user_turn
                             && self.rawr_preflight_compaction_pending.is_none()
                         {
-                            self.rawr_preflight_compaction_pending = Some(percent_remaining);
+                            self.rawr_preflight_compaction_pending = Some(trigger);
                             self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
                             return;
                         }
 
                         let packet = self.rawr_build_post_compact_packet(
-                            percent_remaining,
-                            last_agent_message,
+                            &trigger,
                             settings.prompt_frontmatter.packet.max_tail_chars,
-                            self.rawr_saw_commit_this_turn,
-                            self.rawr_saw_plan_checkpoint_this_turn,
-                            agent_done,
                         );
                         self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                            trigger,
+                            packet_author: RawrAutoCompactionPacketAuthor::Watcher,
                             packet,
-                            trigger_percent_remaining: percent_remaining,
                             saw_context_compacted: false,
                             saw_turn_complete: false,
                             should_inject_packet: true,
@@ -1800,10 +1896,30 @@ impl ChatWidget {
                         self.rawr_trigger_compact();
                     }
                     RawrAutoCompactionPacketAuthor::Agent => {
+                        let mut trigger = self.rawr_capture_auto_compaction_trigger(
+                            percent_remaining,
+                            last_agent_message,
+                            agent_done,
+                        );
+                        let do_scratch = self.rawr_should_schedule_scratch_write(
+                            &settings,
+                            &trigger,
+                            is_emergency,
+                        );
+                        let scratch_file = do_scratch.then(|| self.rawr_scratch_file_rel_path());
+                        if let Some(scratch_file) = scratch_file.as_ref() {
+                            trigger.scratch_file = Some(scratch_file.clone());
+                        }
                         self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingPacket {
-                            trigger_percent_remaining: percent_remaining,
+                            trigger,
+                            packet_author: RawrAutoCompactionPacketAuthor::Agent,
                         };
-                        self.rawr_request_packet_from_agent(settings.agent_packet_prompt);
+                        let prompt = self.rawr_build_agent_continuation_packet_prompt(
+                            &settings,
+                            do_scratch,
+                            scratch_file.as_deref(),
+                        );
+                        self.rawr_request_packet_from_agent(prompt);
                     }
                 }
             }
@@ -1812,11 +1928,12 @@ impl ChatWidget {
 
     fn rawr_trigger_compact(&mut self) {
         if let RawrAutoCompactionState::Compacting {
-            trigger_percent_remaining,
+            trigger,
+            packet_author,
             ..
         } = &self.rawr_auto_compaction_state
         {
-            let packet_author = match self.rawr_auto_compaction_packet_author() {
+            let packet_author = match packet_author {
                 RawrAutoCompactionPacketAuthor::Watcher => {
                     codex_core::protocol::CompactionPacketAuthor::Watcher
                 }
@@ -1828,11 +1945,11 @@ impl ChatWidget {
                 codex_core::compaction_audit::set_next_compaction_trigger(
                     thread_id,
                     codex_core::protocol::CompactionTrigger::AutoWatcher {
-                        trigger_percent_remaining: *trigger_percent_remaining,
-                        saw_commit: self.rawr_saw_commit_this_turn,
-                        saw_plan_checkpoint: self.rawr_saw_plan_checkpoint_this_turn,
-                        saw_plan_update: self.saw_plan_update_this_turn,
-                        saw_pr_checkpoint: self.rawr_saw_pr_checkpoint_this_turn,
+                        trigger_percent_remaining: trigger.trigger_percent_remaining,
+                        saw_commit: trigger.saw_commit,
+                        saw_plan_checkpoint: trigger.saw_plan_checkpoint,
+                        saw_plan_update: trigger.saw_plan_update,
+                        saw_pr_checkpoint: trigger.saw_pr_checkpoint,
                         packet_author,
                     },
                 );
@@ -1852,18 +1969,20 @@ impl ChatWidget {
             RawrAutoCompactionState::Idle,
         ) {
             RawrAutoCompactionState::Compacting {
+                trigger,
+                packet_author,
                 packet,
-                trigger_percent_remaining,
                 saw_turn_complete,
                 should_inject_packet,
                 ..
             } => {
                 if saw_turn_complete && should_inject_packet {
-                    self.rawr_inject_post_compact_packet(packet);
+                    self.rawr_inject_post_compact_packet(&trigger, packet);
                 } else {
                     self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                        trigger,
+                        packet_author,
                         packet,
-                        trigger_percent_remaining,
                         saw_context_compacted: true,
                         saw_turn_complete,
                         should_inject_packet,
@@ -1876,9 +1995,18 @@ impl ChatWidget {
         }
     }
 
-    fn rawr_inject_post_compact_packet(&mut self, packet: String) {
+    fn rawr_inject_post_compact_packet(
+        &mut self,
+        trigger: &RawrAutoCompactionTriggerContext,
+        packet: String,
+    ) {
         self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
-        self.rawr_submit_injected_user_turn(packet);
+        let text = self.rawr_build_post_compact_handoff_message(trigger, packet);
+        if self.queued_user_messages.is_empty() {
+            self.rawr_submit_injected_user_turn(text);
+        } else {
+            self.rawr_post_compact_handoff_pending = Some(text);
+        }
     }
 
     fn rawr_submit_injected_user_turn(&mut self, text: String) {
@@ -1925,14 +2053,15 @@ impl ChatWidget {
 
     fn rawr_build_post_compact_packet(
         &self,
-        trigger_percent_remaining: i64,
-        last_agent_message: Option<&str>,
+        trigger: &RawrAutoCompactionTriggerContext,
         max_tail_chars: usize,
-        saw_commit: bool,
-        saw_plan_checkpoint: bool,
-        agent_done: bool,
     ) -> String {
-        let mut tail = last_agent_message.unwrap_or("").trim().to_string();
+        let mut tail = trigger
+            .last_agent_message
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if tail.len() > max_tail_chars {
             tail.truncate(max_tail_chars);
             tail.push('…');
@@ -1946,10 +2075,12 @@ impl ChatWidget {
         lines.push(String::new());
         lines.push("Why compaction happened".to_string());
         lines.push(format!(
-            "- Triggered by rawr auto-compaction watcher at {trigger_percent_remaining}% context remaining."
+            "- Triggered by rawr auto-compaction watcher at {}% context remaining.",
+            trigger.trigger_percent_remaining
         ));
         lines.push(format!(
-            "- Natural boundary signals: commit={saw_commit}, plan_checkpoint={saw_plan_checkpoint}, agent_done={agent_done}"
+            "- Natural boundary signals: commit={}, plan_checkpoint={}, agent_done={}",
+            trigger.saw_commit, trigger.saw_plan_checkpoint, trigger.agent_done
         ));
         lines.push(String::new());
         lines.push("Last agent output (memory trigger)".to_string());
@@ -1965,6 +2096,175 @@ impl ChatWidget {
         );
 
         lines.join("\n")
+    }
+
+    fn rawr_capture_auto_compaction_trigger(
+        &self,
+        trigger_percent_remaining: i64,
+        last_agent_message: Option<&str>,
+        agent_done: bool,
+    ) -> RawrAutoCompactionTriggerContext {
+        RawrAutoCompactionTriggerContext {
+            trigger_percent_remaining,
+            saw_commit: self.rawr_saw_commit_this_turn,
+            saw_plan_checkpoint: self.rawr_saw_plan_checkpoint_this_turn,
+            saw_plan_update: self.saw_plan_update_this_turn,
+            saw_pr_checkpoint: self.rawr_saw_pr_checkpoint_this_turn,
+            agent_done,
+            last_agent_message: last_agent_message.map(str::to_string),
+            scratch_file: None,
+        }
+    }
+
+    fn rawr_begin_auto_compaction_from_trigger(
+        &mut self,
+        mut trigger: RawrAutoCompactionTriggerContext,
+        settings: RawrAutoCompactionSettings,
+    ) {
+        let is_emergency = trigger.trigger_percent_remaining
+            < settings
+                .prompt_frontmatter
+                .trigger
+                .emergency_percent_remaining_lt;
+        let do_scratch = self.rawr_should_schedule_scratch_write(&settings, &trigger, is_emergency);
+        let scratch_file = do_scratch.then(|| self.rawr_scratch_file_rel_path());
+        if let Some(scratch_file) = scratch_file.as_ref() {
+            trigger.scratch_file = Some(scratch_file.clone());
+        }
+
+        match settings.packet_author {
+            RawrAutoCompactionPacketAuthor::Watcher => {
+                if let Some(scratch_file) = scratch_file.as_ref() {
+                    self.rawr_auto_compaction_state =
+                        RawrAutoCompactionState::AwaitingScratchWrite {
+                            trigger,
+                            packet_author: RawrAutoCompactionPacketAuthor::Watcher,
+                        };
+                    let prompt =
+                        self.rawr_build_scratch_write_prompt(&settings, scratch_file.as_str());
+                    self.rawr_submit_injected_user_turn(prompt);
+                    return;
+                }
+
+                let packet = self.rawr_build_post_compact_packet(
+                    &trigger,
+                    settings.prompt_frontmatter.packet.max_tail_chars,
+                );
+
+                self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                    trigger,
+                    packet_author: RawrAutoCompactionPacketAuthor::Watcher,
+                    packet,
+                    saw_context_compacted: false,
+                    saw_turn_complete: false,
+                    should_inject_packet: true,
+                };
+                self.rawr_trigger_compact();
+            }
+            RawrAutoCompactionPacketAuthor::Agent => {
+                self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingPacket {
+                    trigger,
+                    packet_author: RawrAutoCompactionPacketAuthor::Agent,
+                };
+                let prompt = self.rawr_build_agent_continuation_packet_prompt(
+                    &settings,
+                    do_scratch,
+                    scratch_file.as_deref(),
+                );
+                self.rawr_request_packet_from_agent(prompt);
+            }
+        }
+    }
+
+    fn rawr_should_schedule_scratch_write(
+        &self,
+        settings: &RawrAutoCompactionSettings,
+        trigger: &RawrAutoCompactionTriggerContext,
+        is_emergency: bool,
+    ) -> bool {
+        if !settings.scratch_write_enabled {
+            return false;
+        }
+        if is_emergency {
+            return false;
+        }
+        trigger.agent_done
+            || trigger.saw_plan_checkpoint
+            || trigger.saw_plan_update
+            || trigger.saw_pr_checkpoint
+            || trigger.saw_commit
+            || self.had_work_activity
+    }
+
+    fn rawr_scratch_file_rel_path(&self) -> String {
+        let agent_name = "codex";
+        format!(".scratch/agent-{agent_name}.scratch.md")
+    }
+
+    fn rawr_build_scratch_write_prompt(
+        &self,
+        settings: &RawrAutoCompactionSettings,
+        scratch_file: &str,
+    ) -> String {
+        if settings.scratch_write_prompt.contains("{scratch_file}") {
+            settings
+                .scratch_write_prompt
+                .replace("{scratch_file}", scratch_file)
+        } else {
+            format!(
+                "{}\n\nTarget file: `{scratch_file}`",
+                settings.scratch_write_prompt.trim_end()
+            )
+        }
+    }
+
+    fn rawr_build_agent_continuation_packet_prompt(
+        &self,
+        settings: &RawrAutoCompactionSettings,
+        do_scratch: bool,
+        scratch_file: Option<&str>,
+    ) -> String {
+        if !do_scratch {
+            if let Some(scratch_file) = scratch_file {
+                return format!(
+                    "Scratchpad: `{scratch_file}`\n\n{}",
+                    settings.agent_packet_prompt.trim()
+                );
+            }
+            return settings.agent_packet_prompt.clone();
+        }
+
+        let scratch_prompt = if let Some(scratch_file) = scratch_file {
+            if settings.scratch_write_prompt.contains("{scratch_file}") {
+                settings
+                    .scratch_write_prompt
+                    .replace("{scratch_file}", scratch_file)
+            } else {
+                format!(
+                    "{}\n\nTarget file: `{scratch_file}`",
+                    settings.scratch_write_prompt.trim_end()
+                )
+            }
+        } else {
+            settings.scratch_write_prompt.clone()
+        };
+
+        format!(
+            "{scratch_prompt}\n\n---\n\n{packet_prompt}",
+            packet_prompt = settings.agent_packet_prompt.trim()
+        )
+    }
+
+    fn rawr_build_post_compact_handoff_message(
+        &self,
+        trigger: &RawrAutoCompactionTriggerContext,
+        packet: String,
+    ) -> String {
+        if let Some(scratch_file) = trigger.scratch_file.as_deref() {
+            format!("Scratchpad: `{scratch_file}`\n\n{packet}")
+        } else {
+            packet
+        }
     }
 
     fn rawr_load_auto_compaction_settings(&self) -> RawrAutoCompactionSettings {
@@ -1991,12 +2291,20 @@ impl ChatWidget {
             settings.agent_packet_prompt = body_prompt.to_string();
         }
 
+        let scratch_prompt = RAWR_SCRATCH_WRITE_PROMPT_TEMPLATE.trim();
+        if !scratch_prompt.is_empty() {
+            settings.scratch_write_prompt = scratch_prompt.to_string();
+        }
+
         if let Some(config) = self.config.rawr_auto_compaction.as_ref() {
             if let Some(mode) = config.mode {
                 settings.mode = mode;
             }
             if let Some(packet_author) = config.packet_author {
                 settings.packet_author = packet_author;
+            }
+            if let Some(enabled) = config.scratch_write_enabled {
+                settings.scratch_write_enabled = enabled;
             }
             if let Some(trigger) = config.trigger.as_ref() {
                 if let Some(early_percent_remaining_lt) = trigger.early_percent_remaining_lt {
@@ -3328,6 +3636,7 @@ impl ChatWidget {
             rawr_saw_plan_checkpoint_this_turn: false,
             rawr_saw_pr_checkpoint_this_turn: false,
             rawr_preflight_compaction_pending: None,
+            rawr_post_compact_handoff_pending: None,
         };
 
         widget.prefetch_rate_limits();
@@ -3496,6 +3805,7 @@ impl ChatWidget {
             rawr_saw_plan_checkpoint_this_turn: false,
             rawr_saw_pr_checkpoint_this_turn: false,
             rawr_preflight_compaction_pending: None,
+            rawr_post_compact_handoff_pending: None,
         };
 
         widget.prefetch_rate_limits();
@@ -3653,6 +3963,7 @@ impl ChatWidget {
             rawr_saw_plan_checkpoint_this_turn: false,
             rawr_saw_pr_checkpoint_this_turn: false,
             rawr_preflight_compaction_pending: None,
+            rawr_post_compact_handoff_pending: None,
         };
 
         widget.prefetch_rate_limits();
@@ -4317,22 +4628,17 @@ impl ChatWidget {
             && !self.is_review_mode
             && self
                 .rawr_preflight_compaction_pending
+                .as_ref()
                 .is_some_and(|_| !user_message.text.trim_start().starts_with('!'))
         {
-            let trigger_percent_remaining = self
+            let trigger = self
                 .rawr_preflight_compaction_pending
                 .take()
                 .expect("preflight compaction pending should be set");
             self.queued_user_messages.push_front(user_message);
             self.refresh_queued_user_messages();
-            self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
-                packet: String::new(),
-                trigger_percent_remaining,
-                saw_context_compacted: false,
-                saw_turn_complete: false,
-                should_inject_packet: false,
-            };
-            self.rawr_trigger_compact();
+            let settings = self.rawr_load_auto_compaction_settings();
+            self.rawr_begin_auto_compaction_from_trigger(trigger, settings);
             return;
         }
 
@@ -4819,33 +5125,46 @@ impl ChatWidget {
     fn maybe_send_next_queued_input(&mut self) {
         if matches!(
             self.rawr_auto_compaction_state,
-            RawrAutoCompactionState::Compacting {
-                saw_context_compacted: false,
-                ..
-            }
+            RawrAutoCompactionState::AwaitingScratchWrite { .. }
+                | RawrAutoCompactionState::AwaitingPacket { .. }
+                | RawrAutoCompactionState::Compacting {
+                    saw_context_compacted: false,
+                    ..
+                }
         ) {
             return;
         }
         if self.rawr_preflight_compaction_pending.is_some() && !self.queued_user_messages.is_empty()
         {
-            let trigger_percent_remaining = self
+            let is_local_shell = self
+                .queued_user_messages
+                .front()
+                .is_some_and(|msg| msg.text.trim_start().starts_with('!'));
+            if is_local_shell {
+                return;
+            }
+            let trigger = self
                 .rawr_preflight_compaction_pending
                 .take()
                 .expect("preflight compaction pending should be set");
-            self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
-                packet: String::new(),
-                trigger_percent_remaining,
-                saw_context_compacted: false,
-                saw_turn_complete: false,
-                should_inject_packet: false,
-            };
-            self.rawr_trigger_compact();
+            let settings = self.rawr_load_auto_compaction_settings();
+            self.rawr_begin_auto_compaction_from_trigger(trigger, settings);
             return;
         }
         if self.bottom_pane.is_task_running() {
             return;
         }
         if let Some(user_message) = self.queued_user_messages.pop_front() {
+            let mut user_message = user_message;
+            if !user_message.text.trim_start().starts_with('!')
+                && let Some(handoff) = self.rawr_post_compact_handoff_pending.take()
+            {
+                user_message.text = format!(
+                    "{handoff}\n\n---\n\n{original}",
+                    original = user_message.text
+                );
+                user_message.text_elements.clear();
+            }
             self.submit_user_message(user_message);
         }
         // Update the list to reflect the remaining queued messages (if any).

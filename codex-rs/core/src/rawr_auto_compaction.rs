@@ -1,9 +1,13 @@
 use crate::config::Config;
 use crate::config::types::RawrAutoCompactionBoundary;
 use crate::features::Feature;
-use crate::protocol::CompactionPacketAuthor;
+use codex_protocol::ThreadId;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_protocol::protocol::SessionSource;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawrAutoCompactionTier {
@@ -85,20 +89,21 @@ impl RawrAutoCompactionSignals {
     }
 }
 
-pub(crate) fn rawr_packet_author(config: &Config) -> CompactionPacketAuthor {
-    config
-        .rawr_auto_compaction
-        .as_ref()
-        .and_then(|rawr| rawr.packet_author)
-        .map_or(CompactionPacketAuthor::Watcher, |author| match author {
-            crate::config::types::RawrAutoCompactionPacketAuthor::Watcher => {
-                CompactionPacketAuthor::Watcher
-            }
-            crate::config::types::RawrAutoCompactionPacketAuthor::Agent => {
-                CompactionPacketAuthor::Agent
-            }
-        })
-}
+const RAWR_AUTO_COMPACT_PROMPT_TEMPLATE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../rawr/prompts/rawr-auto-compact.md"
+));
+
+const RAWR_SCRATCH_WRITE_PROMPT_TEMPLATE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../rawr/prompts/rawr-scratch-write.md"
+));
+
+const RAWR_SCRATCH_FALLBACK_AGENT_NAMES: [&str; 24] = [
+    "Aria", "Atlas", "Beau", "Cleo", "Ezra", "Jade", "Juno", "Luna", "Milo", "Nova", "Orion",
+    "Pax", "Quinn", "Reid", "Remy", "Rhea", "Rory", "Sage", "Skye", "Toby", "Vera", "Wren", "Zane",
+    "Zoe",
+];
 
 pub(crate) fn rawr_command_looks_like_git_commit(command: &[String]) -> bool {
     if command.is_empty() {
@@ -230,6 +235,201 @@ pub(crate) fn rawr_pick_tier(
         return Some(RawrAutoCompactionTier::Early);
     }
     None
+}
+
+pub(crate) fn rawr_load_agent_packet_prompt() -> String {
+    let (frontmatter, body) = split_yaml_frontmatter(RAWR_AUTO_COMPACT_PROMPT_TEMPLATE);
+    let prompt = body.trim();
+    if !prompt.is_empty() {
+        return prompt.to_string();
+    }
+    if let Some(frontmatter) = frontmatter {
+        let trimmed = frontmatter.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    default_rawr_agent_packet_prompt()
+}
+
+pub(crate) fn rawr_load_scratch_write_prompt() -> String {
+    let prompt = RAWR_SCRATCH_WRITE_PROMPT_TEMPLATE.trim();
+    if !prompt.is_empty() {
+        return prompt.to_string();
+    }
+    default_rawr_scratch_write_prompt()
+}
+
+pub(crate) fn rawr_build_scratch_write_prompt(prompt: &str, scratch_file: &str) -> String {
+    if prompt.contains("{scratch_file}") {
+        prompt.replace("{scratch_file}", scratch_file)
+    } else {
+        let prompt = prompt.trim_end();
+        format!("{prompt}\n\nTarget file: `{scratch_file}`")
+    }
+}
+
+pub(crate) fn rawr_build_agent_continuation_packet_prompt(
+    packet_prompt: &str,
+    scratch_prompt: &str,
+    do_scratch: bool,
+    scratch_file: Option<&str>,
+) -> String {
+    if !do_scratch {
+        if let Some(scratch_file) = scratch_file {
+            let packet_prompt = packet_prompt.trim();
+            return format!("Scratchpad: `{scratch_file}`\n\n{packet_prompt}");
+        }
+        return packet_prompt.trim().to_string();
+    }
+
+    let scratch_prompt = if let Some(scratch_file) = scratch_file {
+        rawr_build_scratch_write_prompt(scratch_prompt, scratch_file)
+    } else {
+        scratch_prompt.to_string()
+    };
+
+    format!(
+        "{scratch_prompt}\n\n---\n\n{packet_prompt}",
+        packet_prompt = packet_prompt.trim()
+    )
+}
+
+pub(crate) fn rawr_build_post_compact_handoff_message(
+    packet: String,
+    scratch_file: Option<&str>,
+) -> String {
+    if let Some(scratch_file) = scratch_file {
+        format!("Scratchpad: `{scratch_file}`\n\n{packet}")
+    } else {
+        packet
+    }
+}
+
+pub(crate) fn rawr_should_schedule_scratch_write(
+    scratch_write_enabled: bool,
+    is_emergency: bool,
+    signals: &RawrAutoCompactionSignals,
+) -> bool {
+    if !scratch_write_enabled || is_emergency {
+        return false;
+    }
+    signals.saw_commit
+        || signals.saw_plan_checkpoint
+        || signals.saw_plan_update
+        || signals.saw_pr_checkpoint
+        || signals.saw_agent_done
+}
+
+pub(crate) fn rawr_scratch_file_rel_path(
+    session_source: &SessionSource,
+    thread_id: &ThreadId,
+) -> String {
+    let agent_name = rawr_scratch_agent_name(session_source, thread_id);
+    format!(".scratch/agent-{agent_name}.scratch.md")
+}
+
+fn rawr_scratch_agent_name(session_source: &SessionSource, thread_id: &ThreadId) -> String {
+    let name = rawr_agent_identity_from_session_source(session_source)
+        .unwrap_or_else(|| rawr_random_agent_name(thread_id));
+    let name = if name.is_empty() {
+        "codex".to_string()
+    } else {
+        name
+    };
+    name
+}
+
+fn rawr_agent_identity_from_session_source(source: &SessionSource) -> Option<String> {
+    let identity = source.to_string();
+    let identity = identity.strip_prefix("subagent_")?;
+    let sanitized = rawr_sanitize_agent_name(identity);
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+fn rawr_random_agent_name(thread_id: &ThreadId) -> String {
+    if RAWR_SCRATCH_FALLBACK_AGENT_NAMES.is_empty() {
+        return "codex".to_string();
+    }
+    let mut hasher = DefaultHasher::new();
+    thread_id.hash(&mut hasher);
+    let seed = hasher.finish() as usize;
+    RAWR_SCRATCH_FALLBACK_AGENT_NAMES[seed % RAWR_SCRATCH_FALLBACK_AGENT_NAMES.len()].to_string()
+}
+
+fn rawr_sanitize_agent_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_dash = false;
+    for ch in name.chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn split_yaml_frontmatter(contents: &str) -> (Option<&str>, &str) {
+    let mut iter = contents.split_inclusive('\n');
+    let Some(first_line) = iter.next() else {
+        return (None, contents);
+    };
+    if first_line.trim_end_matches(['\r', '\n']) != "---" {
+        return (None, contents);
+    }
+
+    let frontmatter_start = first_line.len();
+    let mut cursor = frontmatter_start;
+
+    for piece in iter {
+        let piece_start = cursor;
+        let line = piece.trim_end_matches(['\r', '\n']);
+        if line == "---" {
+            let frontmatter = &contents[frontmatter_start..piece_start];
+            let body_start = piece_start.saturating_add(piece.len());
+            let body = contents.get(body_start..).unwrap_or("");
+            return (Some(frontmatter), body);
+        }
+        cursor = cursor.saturating_add(piece.len());
+    }
+
+    (None, contents)
+}
+
+fn default_rawr_agent_packet_prompt() -> String {
+    [
+        "[rawr] Before we compact this thread, produce a **continuation context packet** for yourself.",
+        "",
+        "Requirements:",
+        "- Keep it short and structured.",
+        "- Include: overarching goal, current state, next steps, invariants/decisions, and a final directive to continue after compaction.",
+        "- Do not include secrets; redact tokens/keys.",
+    ]
+    .join("\n")
+}
+
+fn default_rawr_scratch_write_prompt() -> String {
+    [
+        "[rawr] Before we compact this thread, write a scratchpad file with what you just worked on.",
+        "",
+        "Target file: `{scratch_file}`",
+        "",
+        "Requirements:",
+        "- Create the `.scratch/` directory if it doesn't exist.",
+        "- Append a new section (do not delete prior scratch content).",
+        "- Prefer verbatim notes/drafts over summaries; include raw details that are useful later.",
+        "- Include links/paths to any important files you edited or created.",
+        "- After writing, confirm in your next message that the scratch file was written and include the exact path.",
+    ]
+    .join("\n")
 }
 
 pub(crate) fn rawr_should_compact_mid_turn(

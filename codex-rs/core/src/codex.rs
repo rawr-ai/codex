@@ -129,6 +129,7 @@ use crate::protocol::AgentReasoningSectionBreakEvent;
 use crate::protocol::ApplyPatchApprovalRequestEvent;
 use crate::protocol::AskForApproval;
 use crate::protocol::BackgroundEventEvent;
+use crate::protocol::CompactionPacketAuthor;
 use crate::protocol::DeprecationNoticeEvent;
 use crate::protocol::ErrorEvent;
 use crate::protocol::Event;
@@ -452,6 +453,7 @@ pub(crate) struct Session {
     pub(crate) services: SessionServices,
     next_internal_sub_id: AtomicU64,
     rawr_auto_compaction_signals: Mutex<RawrAutoCompactionSignals>,
+    auto_compaction_rearm: Mutex<AutoCompactionRearmState>,
 }
 
 /// The context needed for a single turn of the thread.
@@ -878,6 +880,7 @@ impl Session {
             services,
             next_internal_sub_id: AtomicU64::new(0),
             rawr_auto_compaction_signals: Mutex::new(RawrAutoCompactionSignals::default()),
+            auto_compaction_rearm: Mutex::new(AutoCompactionRearmState::default()),
         });
 
         // Dispatch the SessionConfiguredEvent first and then report any errors.
@@ -1879,6 +1882,20 @@ impl Session {
         } else {
             RawrAutoCompactionSignals::default()
         }
+    }
+
+    pub(crate) async fn auto_compaction_can_rearm(
+        &self,
+        total_usage_tokens: i64,
+        min_tokens_since_compaction: i64,
+    ) -> bool {
+        let guard = self.auto_compaction_rearm.lock().await;
+        guard.can_rearm(total_usage_tokens, min_tokens_since_compaction)
+    }
+
+    pub(crate) async fn auto_compaction_record_compaction(&self, total_usage_tokens: i64) {
+        let mut guard = self.auto_compaction_rearm.lock().await;
+        guard.record_compaction(total_usage_tokens);
     }
 
     pub(crate) async fn collaboration_mode(&self) -> CollaborationMode {
@@ -3231,6 +3248,127 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct RawrMidTurnTriggerContext {
+    trigger_percent_remaining: i64,
+    trigger_total_tokens: i64,
+    saw_commit: bool,
+    saw_plan_checkpoint: bool,
+    saw_plan_update: bool,
+    saw_pr_checkpoint: bool,
+    scratch_file: Option<String>,
+}
+
+#[derive(Debug)]
+enum RawrMidTurnCompactionPhase {
+    Idle,
+    AwaitingPacket { trigger: RawrMidTurnTriggerContext },
+    AwaitingHandoff,
+}
+
+#[derive(Debug)]
+struct RawrMidTurnCompactionState {
+    phase: RawrMidTurnCompactionPhase,
+    pending_injection: Option<String>,
+    last_compaction_total_tokens: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+struct AutoCompactionRearmState {
+    last_compaction_total_tokens: Option<i64>,
+}
+
+impl AutoCompactionRearmState {
+    fn can_rearm(&self, total_usage_tokens: i64, min_tokens_since_compaction: i64) -> bool {
+        self.last_compaction_total_tokens
+            .map(|last| total_usage_tokens.saturating_sub(last) >= min_tokens_since_compaction)
+            .unwrap_or(true)
+    }
+
+    fn record_compaction(&mut self, total_usage_tokens: i64) {
+        self.last_compaction_total_tokens = Some(total_usage_tokens);
+    }
+}
+
+impl RawrMidTurnCompactionState {
+    fn new() -> Self {
+        Self {
+            phase: RawrMidTurnCompactionPhase::Idle,
+            pending_injection: None,
+            last_compaction_total_tokens: None,
+        }
+    }
+
+    fn take_pending_injection(&mut self) -> Option<String> {
+        self.pending_injection.take()
+    }
+
+    fn start_pre_compact(&mut self, prompt: String, trigger: RawrMidTurnTriggerContext) {
+        self.phase = RawrMidTurnCompactionPhase::AwaitingPacket { trigger };
+        self.pending_injection = Some(prompt);
+    }
+
+    fn is_awaiting_packet(&self) -> bool {
+        matches!(
+            self.phase,
+            RawrMidTurnCompactionPhase::AwaitingPacket { .. }
+        )
+    }
+
+    fn take_trigger(&mut self) -> Option<RawrMidTurnTriggerContext> {
+        match std::mem::replace(&mut self.phase, RawrMidTurnCompactionPhase::Idle) {
+            RawrMidTurnCompactionPhase::AwaitingPacket { trigger } => Some(trigger),
+            other => {
+                self.phase = other;
+                None
+            }
+        }
+    }
+
+    fn schedule_handoff(&mut self, handoff: String) {
+        self.phase = RawrMidTurnCompactionPhase::AwaitingHandoff;
+        self.pending_injection = Some(handoff);
+    }
+
+    fn finish_handoff(&mut self) {
+        self.phase = RawrMidTurnCompactionPhase::Idle;
+    }
+
+    fn record_compaction(&mut self, total_usage_tokens: i64) {
+        self.last_compaction_total_tokens = Some(total_usage_tokens);
+    }
+
+    fn can_rearm(&self, total_usage_tokens: i64, min_tokens_since_compaction: i64) -> bool {
+        self.last_compaction_total_tokens
+            .map(|last| total_usage_tokens.saturating_sub(last) >= min_tokens_since_compaction)
+            .unwrap_or(true)
+    }
+}
+
+fn rawr_mid_turn_min_tokens_since_compaction(context_window: Option<i64>) -> i64 {
+    match context_window {
+        Some(window) => window.saturating_div(50).max(64),
+        None => 256,
+    }
+}
+
+async fn rawr_inject_synthetic_user_message(
+    sess: &Session,
+    turn_context: &TurnContext,
+    text: String,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let items = vec![UserInput::Text {
+        text,
+        text_elements: Vec::new(),
+    }];
+    let response_item: ResponseItem = ResponseInputItem::from(items.clone()).into();
+    sess.record_user_prompt_and_emit_turn_item(turn_context, &items, response_item)
+        .await;
+}
+
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
 /// replies with either:
 ///
@@ -3259,14 +3397,22 @@ pub(crate) async fn run_turn(
     let total_usage_tokens = sess.get_total_token_usage().await;
     let rawr_auto_compaction_enabled = sess.enabled(Feature::RawrAutoCompaction);
     let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
+    let min_tokens_since_compaction =
+        rawr_mid_turn_min_tokens_since_compaction(turn_context.client.get_model_context_window());
     let event = EventMsg::TurnStarted(TurnStartedEvent {
         model_context_window: turn_context.client.get_model_context_window(),
     });
     sess.send_event(&turn_context, event).await;
     sess.rawr_reset_auto_compaction_signals(turn_context.sub_id.clone())
         .await;
-    if !rawr_auto_compaction_enabled && total_usage_tokens >= auto_compact_limit {
-        run_auto_compact(&sess, &turn_context).await;
+    if !rawr_auto_compaction_enabled
+        && total_usage_tokens >= auto_compact_limit
+        && sess
+            .auto_compaction_can_rearm(total_usage_tokens, min_tokens_since_compaction)
+            .await
+    {
+        let total_after = run_auto_compact(&sess, &turn_context).await;
+        sess.auto_compaction_record_compaction(total_after).await;
     }
 
     let skills_outcome = Some(
@@ -3346,8 +3492,20 @@ pub(crate) async fn run_turn(
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
 
     let mut client_session = turn_context.client.new_session();
+    let mut rawr_mid_turn_state = RawrMidTurnCompactionState::new();
 
     loop {
+        if let Some(injection) = rawr_mid_turn_state.take_pending_injection() {
+            rawr_inject_synthetic_user_message(sess.as_ref(), turn_context.as_ref(), injection)
+                .await;
+            if matches!(
+                rawr_mid_turn_state.phase,
+                RawrMidTurnCompactionPhase::AwaitingHandoff
+            ) {
+                rawr_mid_turn_state.finish_handoff();
+            }
+        }
+
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
@@ -3404,6 +3562,43 @@ pub(crate) async fn run_turn(
                         )
                         .await;
                     }
+                    if rawr_mid_turn_state.is_awaiting_packet() {
+                        if needs_follow_up {
+                            continue;
+                        }
+                        if let Some(packet) = sampling_request_last_agent_message {
+                            if let Some(trigger) = rawr_mid_turn_state.take_trigger() {
+                                let pre_compact_tokens = trigger.trigger_total_tokens;
+                                let handoff = crate::rawr_auto_compaction::rawr_build_post_compact_handoff_message(
+                                    packet,
+                                    trigger.scratch_file.as_deref(),
+                                );
+                                crate::compaction_audit::set_next_compaction_trigger(
+                                    sess.conversation_id,
+                                    codex_protocol::protocol::CompactionTrigger::AutoWatcher {
+                                        trigger_percent_remaining: trigger
+                                            .trigger_percent_remaining,
+                                        saw_commit: trigger.saw_commit,
+                                        saw_plan_checkpoint: trigger.saw_plan_checkpoint,
+                                        saw_plan_update: trigger.saw_plan_update,
+                                        saw_pr_checkpoint: trigger.saw_pr_checkpoint,
+                                        packet_author: CompactionPacketAuthor::Agent,
+                                    },
+                                );
+                                run_rawr_auto_compact(&sess, &turn_context).await;
+                                let total_usage_tokens = sess.get_total_token_usage().await;
+                                rawr_mid_turn_state
+                                    .record_compaction(pre_compact_tokens.min(total_usage_tokens));
+                                rawr_mid_turn_state.schedule_handoff(handoff);
+                                sess.rawr_reset_auto_compaction_signals(
+                                    turn_context.sub_id.clone(),
+                                )
+                                .await;
+                            }
+                            continue;
+                        }
+                        continue;
+                    }
                     if needs_follow_up {
                         let config = turn_context.client.config();
                         let percent_remaining = turn_context
@@ -3427,26 +3622,64 @@ pub(crate) async fn run_turn(
                         let signals = sess
                             .rawr_auto_compaction_signals(turn_context.sub_id.as_str())
                             .await;
-                        if crate::rawr_auto_compaction::rawr_should_compact_mid_turn(
-                            config.as_ref(),
-                            percent_remaining,
-                            &signals,
-                            boundaries_required,
-                        ) {
-                            crate::compaction_audit::set_next_compaction_trigger(
-                                sess.conversation_id,
-                                codex_protocol::protocol::CompactionTrigger::AutoWatcher {
-                                    trigger_percent_remaining: percent_remaining,
-                                    saw_commit: signals.saw_commit,
-                                    saw_plan_checkpoint: signals.saw_plan_checkpoint,
-                                    saw_plan_update: signals.saw_plan_update,
-                                    saw_pr_checkpoint: signals.saw_pr_checkpoint,
-                                    packet_author: crate::rawr_auto_compaction::rawr_packet_author(
-                                        config.as_ref(),
-                                    ),
-                                },
+                        if rawr_mid_turn_state
+                            .can_rearm(total_usage_tokens, min_tokens_since_compaction)
+                            && crate::rawr_auto_compaction::rawr_should_compact_mid_turn(
+                                config.as_ref(),
+                                percent_remaining,
+                                &signals,
+                                boundaries_required,
+                            )
+                        {
+                            let tier = crate::rawr_auto_compaction::rawr_pick_tier(
+                                crate::rawr_auto_compaction::RawrAutoCompactionThresholds::from_config(
+                                    config.as_ref(),
+                                ),
+                                percent_remaining,
                             );
-                            run_rawr_auto_compact(&sess, &turn_context).await;
+                            let is_emergency = tier
+                                == Some(
+                                    crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency,
+                                );
+                            let scratch_write_enabled = config
+                                .rawr_auto_compaction
+                                .as_ref()
+                                .and_then(|rawr| rawr.scratch_write_enabled)
+                                .unwrap_or(false);
+                            let do_scratch =
+                                crate::rawr_auto_compaction::rawr_should_schedule_scratch_write(
+                                    scratch_write_enabled,
+                                    is_emergency,
+                                    &signals,
+                                );
+                            let scratch_file = if do_scratch {
+                                Some(crate::rawr_auto_compaction::rawr_scratch_file_rel_path(
+                                    &turn_context.client.get_session_source(),
+                                    &sess.conversation_id,
+                                ))
+                            } else {
+                                None
+                            };
+                            let packet_prompt =
+                                crate::rawr_auto_compaction::rawr_load_agent_packet_prompt();
+                            let scratch_prompt =
+                                crate::rawr_auto_compaction::rawr_load_scratch_write_prompt();
+                            let prompt = crate::rawr_auto_compaction::rawr_build_agent_continuation_packet_prompt(
+                                packet_prompt.as_str(),
+                                scratch_prompt.as_str(),
+                                do_scratch,
+                                scratch_file.as_deref(),
+                            );
+                            let trigger = RawrMidTurnTriggerContext {
+                                trigger_percent_remaining: percent_remaining,
+                                trigger_total_tokens: total_usage_tokens,
+                                saw_commit: signals.saw_commit,
+                                saw_plan_checkpoint: signals.saw_plan_checkpoint,
+                                saw_plan_update: signals.saw_plan_update,
+                                saw_pr_checkpoint: signals.saw_pr_checkpoint,
+                                scratch_file,
+                            };
+                            rawr_mid_turn_state.start_pre_compact(prompt, trigger);
                             continue;
                         }
                     }
@@ -3454,7 +3687,13 @@ pub(crate) async fn run_turn(
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if token_limit_reached && needs_follow_up && !rawr_auto_compaction_enabled {
-                    run_auto_compact(&sess, &turn_context).await;
+                    if sess
+                        .auto_compaction_can_rearm(total_usage_tokens, min_tokens_since_compaction)
+                        .await
+                    {
+                        let total_after = run_auto_compact(&sess, &turn_context).await;
+                        sess.auto_compaction_record_compaction(total_after).await;
+                    }
                     continue;
                 }
 
@@ -3505,12 +3744,25 @@ pub(crate) async fn run_turn(
     last_agent_message
 }
 
-async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
-    if should_use_remote_compact_task(sess.as_ref(), &turn_context.client.get_provider()) {
+async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) -> i64 {
+    let auto_compact_limit = turn_context
+        .client
+        .get_model_info()
+        .auto_compact_token_limit()
+        .unwrap_or(i64::MAX);
+    let use_remote =
+        should_use_remote_compact_task(sess.as_ref(), &turn_context.client.get_provider());
+    if use_remote {
         run_inline_remote_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await;
     } else {
         run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await;
     }
+    let mut total_usage_tokens = sess.get_total_token_usage().await;
+    if use_remote && total_usage_tokens >= auto_compact_limit {
+        run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await;
+        total_usage_tokens = sess.get_total_token_usage().await;
+    }
+    total_usage_tokens
 }
 
 async fn rawr_compaction_turn_context(
@@ -3580,7 +3832,7 @@ async fn rawr_compaction_turn_context(
 }
 
 async fn run_rawr_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
-    run_auto_compact(
+    let _ = run_auto_compact(
         sess,
         &rawr_compaction_turn_context(sess, turn_context).await,
     )
@@ -5004,6 +5256,7 @@ mod tests {
             services,
             next_internal_sub_id: AtomicU64::new(0),
             rawr_auto_compaction_signals: Mutex::new(RawrAutoCompactionSignals::default()),
+            auto_compaction_rearm: Mutex::new(AutoCompactionRearmState::default()),
         };
 
         (session, turn_context)
@@ -5117,6 +5370,7 @@ mod tests {
             services,
             next_internal_sub_id: AtomicU64::new(0),
             rawr_auto_compaction_signals: Mutex::new(RawrAutoCompactionSignals::default()),
+            auto_compaction_rearm: Mutex::new(AutoCompactionRearmState::default()),
         });
 
         (session, turn_context, rx_event)

@@ -6,6 +6,9 @@ use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::compaction_audit;
 use codex_core::config::Config;
+use codex_core::config::types::RawrAutoCompactionPacketAuthor;
+use codex_core::config::types::RawrAutoCompactionToml;
+use codex_core::config::types::RawrAutoCompactionTriggerToml;
 use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::CompactionPacketAuthor;
@@ -20,6 +23,8 @@ use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol::WarningEvent;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_local_shell_call;
 use core_test_support::responses::ev_reasoning_item;
@@ -27,6 +32,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
+use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
 
 use core_test_support::responses::ev_assistant_message;
@@ -42,7 +48,6 @@ use core_test_support::responses::sse;
 use core_test_support::responses::sse_failed;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
-use pretty_assertions::assert_eq;
 use serde_json::json;
 use wiremock::MockServer;
 // --- Test helpers -----------------------------------------------------------
@@ -58,6 +63,7 @@ const SECOND_LARGE_REPLY: &str = "SECOND_LARGE_REPLY";
 const FIRST_AUTO_SUMMARY: &str = "FIRST_AUTO_SUMMARY";
 const SECOND_AUTO_SUMMARY: &str = "SECOND_AUTO_SUMMARY";
 const FINAL_REPLY: &str = "FINAL_REPLY";
+const RAWR_PACKET_PROMPT_SNIPPET: &str = "[rawr] Agent: before we compact this thread";
 const CONTEXT_LIMIT_MESSAGE: &str =
     "Your input exceeds the context window of this model. Please adjust your input and try again.";
 const DUMMY_FUNCTION_NAME: &str = "unsupported_tool";
@@ -114,6 +120,12 @@ fn non_openai_model_provider(server: &MockServer) -> ModelProviderInfo {
     provider
 }
 
+fn openai_model_provider(server: &MockServer) -> ModelProviderInfo {
+    let mut provider = built_in_model_providers()["openai"].clone();
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn summarize_context_three_requests_and_instructions() {
     skip_if_no_network!();
@@ -133,19 +145,23 @@ async fn summarize_context_three_requests_and_instructions() {
         ev_completed("r2"),
     ]);
 
-    // SSE 3: minimal completed; we only need to capture the request body.
-    let sse3 = sse(vec![ev_completed("r3")]);
+    // SSE 3: assistant reply so the turn completes cleanly.
+    let sse3 = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed("r3"),
+    ]);
 
     // Mount the three expected requests in sequence so the assertions below can
     // inspect them without relying on specific prompt markers.
     let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
 
     // Build config pointing to the mock server and spawn Codex.
-    let model_provider = non_openai_model_provider(&server);
+    let model_provider = openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
         config.model_auto_compact_token_limit = Some(200_000);
+        config.features.disable(Feature::RemoteCompaction);
     });
     let test = builder.build(&server).await.unwrap();
     let codex = test.codex.clone();
@@ -332,10 +348,11 @@ async fn manual_compact_uses_custom_prompt() {
 
     let custom_prompt = "Use this compact prompt instead";
 
-    let model_provider = non_openai_model_provider(&server);
+    let model_provider = openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         config.compact_prompt = Some(custom_prompt.to_string());
+        config.features.disable(Feature::RemoteCompaction);
     });
     let test = builder.build(&server).await.expect("create conversation");
     let codex = test.codex.clone();
@@ -442,12 +459,14 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
     ]);
     mount_sse_once(&server, sse_compact).await;
 
-    let model_provider = non_openai_model_provider(&server);
+    let model_provider = openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
+        config.features.disable(Feature::RemoteCompaction);
     });
-    let codex = builder.build(&server).await.unwrap().codex;
+    let test = builder.build(&server).await.unwrap();
+    let codex = test.codex.clone();
 
     // Trigger manual compact and collect TokenCount events for the compact turn.
     codex.submit(Op::Compact).await.unwrap();
@@ -501,12 +520,14 @@ async fn manual_compact_emits_context_compaction_items() {
     ]);
     mount_sse_sequence(&server, vec![sse1, sse2]).await;
 
-    let model_provider = non_openai_model_provider(&server);
+    let model_provider = openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
+        config.features.disable(Feature::RemoteCompaction);
     });
-    let codex = builder.build(&server).await.unwrap().codex;
+    let test = builder.build(&server).await.unwrap();
+    let codex = test.codex.clone();
 
     codex
         .submit(Op::UserInput {
@@ -1135,14 +1156,15 @@ async fn auto_compact_runs_after_token_limit_hit() {
 
     let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
 
-    let model_provider = non_openai_model_provider(&server);
+    let model_provider = openai_model_provider(&server);
 
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
         config.model_auto_compact_token_limit = Some(200_000);
     });
-    let codex = builder.build(&server).await.unwrap().codex;
+    let test = builder.build(&server).await.unwrap();
+    let codex = test.codex.clone();
 
     codex
         .submit(Op::UserInput {
@@ -1325,7 +1347,7 @@ async fn auto_compact_emits_context_compaction_items() {
 
     mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
 
-    let model_provider = non_openai_model_provider(&server);
+    let model_provider = openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
@@ -1408,7 +1430,7 @@ async fn auto_compact_starts_after_turn_started() {
 
     mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
 
-    let model_provider = non_openai_model_provider(&server);
+    let model_provider = openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
@@ -2076,7 +2098,7 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
     ]);
     let sse4 = sse(vec![
         ev_assistant_message("m4", SECOND_LARGE_REPLY),
-        ev_completed_with_tokens("r4", 450),
+        ev_completed_with_tokens("r4", 2_000),
     ]);
     let second_summary_payload = auto_summary(SECOND_AUTO_SUMMARY);
     let sse5 = sse(vec![
@@ -2097,7 +2119,9 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
+        config.model_context_window = Some(200);
         config.model_auto_compact_token_limit = Some(200);
+        config.base_instructions = Some(String::new());
     });
     let codex = builder.build(&server).await.unwrap().codex;
 
@@ -2167,6 +2191,63 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_compact_skips_repeat_when_tokens_do_not_rearm() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let sse1 = sse(vec![
+        ev_function_call("call-1", DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r1", 500),
+    ]);
+    let sse2 = sse(vec![
+        ev_function_call("call-2", DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r2", 5),
+    ]);
+    let sse3 = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_tokens("r3", 10),
+    ]);
+    let _request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
+
+    let compacted_history = vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "auto compacted".to_string(),
+        }],
+        end_turn: None,
+    }];
+    let compact_mock =
+        mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
+
+    let model_provider = openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_context_window = Some(10_000);
+        config.model_auto_compact_token_limit = Some(1);
+        config.features.enable(Feature::RemoteCompaction);
+    });
+    let codex = builder.build(&server).await.unwrap().codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "auto compact loop guard".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+
+    assert_eq!(compact_mock.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compact_triggers_after_function_call_over_95_percent_usage() {
     skip_if_no_network!();
 
@@ -2199,7 +2280,7 @@ async fn auto_compact_triggers_after_function_call_over_95_percent_usage() {
     // We don't assert on the post-compact request, so no need to keep its mock.
     mount_sse_once(&server, post_auto_compact_turn).await;
 
-    let model_provider = non_openai_model_provider(&server);
+    let model_provider = openai_model_provider(&server);
 
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
@@ -2207,7 +2288,8 @@ async fn auto_compact_triggers_after_function_call_over_95_percent_usage() {
         config.model_context_window = Some(context_window);
         config.model_auto_compact_token_limit = Some(limit);
     });
-    let codex = builder.build(&server).await.unwrap().codex;
+    let test = builder.build(&server).await.unwrap();
+    let codex = test.codex.clone();
 
     codex
         .submit(Op::UserInput {
@@ -2268,6 +2350,280 @@ async fn auto_compact_triggers_after_function_call_over_95_percent_usage() {
         body_contains_text(&auto_compact_body, SUMMARIZATION_PROMPT),
         "auto compact request should include the summarization prompt after exceeding 95% (limit {limit})"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rawr_mid_turn_compaction_injects_packet_and_handoff() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let sse1 = sse(vec![
+        ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r1", 95),
+    ]);
+    let sse2 = sse(vec![
+        ev_assistant_message("m2", "PACKET CONTENTS"),
+        ev_completed_with_tokens("r2", 10),
+    ]);
+    let sse3 = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_tokens("r3", 10),
+    ]);
+
+    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
+
+    let compacted_history = vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "RAWr mid-turn compacted".to_string(),
+        }],
+        end_turn: None,
+    }];
+    let compact_mock =
+        mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
+
+    let model_provider = openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(100);
+            config.model_auto_compact_token_limit = Some(10_000);
+            config.features.enable(Feature::RawrAutoCompaction);
+            config.features.enable(Feature::RemoteCompaction);
+            config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
+                packet_author: Some(RawrAutoCompactionPacketAuthor::Agent),
+                scratch_write_enabled: Some(false),
+                trigger: Some(RawrAutoCompactionTriggerToml {
+                    emergency_percent_remaining_lt: Some(100),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        });
+    let codex = builder.build(&server).await.unwrap().codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "rawr mid-turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let turn_started = wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnStarted(_))).await;
+    let EventMsg::TurnStarted(started) = turn_started else {
+        panic!("expected TurnStarted event");
+    };
+    assert_eq!(started.model_context_window, Some(95));
+
+    wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+
+    let request_bodies: Vec<String> = request_log
+        .requests()
+        .into_iter()
+        .map(|request| request.body_json().to_string())
+        .collect();
+    assert_eq!(request_bodies.len(), 3);
+    assert!(
+        body_contains_text(&request_bodies[1], RAWR_PACKET_PROMPT_SNIPPET),
+        "expected mid-turn packet prompt injection"
+    );
+    assert!(
+        request_bodies[2].contains("PACKET CONTENTS"),
+        "expected post-compact handoff injection"
+    );
+    assert_eq!(compact_mock.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rawr_mid_turn_compaction_rearms_after_token_growth() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let sse1 = sse(vec![
+        ev_function_call("call-1", DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r1", 190),
+    ]);
+    let sse2 = sse(vec![
+        ev_assistant_message("m2", "PACKET ONE"),
+        ev_completed_with_tokens("r2", 10),
+    ]);
+    let sse3 = sse(vec![
+        ev_function_call("call-2", DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r3", 1_000),
+    ]);
+    let sse4 = sse(vec![
+        ev_assistant_message("m4", "PACKET TWO"),
+        ev_completed_with_tokens("r4", 10),
+    ]);
+    let sse5 = sse(vec![
+        ev_assistant_message("m5", FINAL_REPLY),
+        ev_completed_with_tokens("r5", 10),
+    ]);
+
+    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4, sse5]).await;
+
+    let compacted_history = vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "RAWr mid-turn compacted".to_string(),
+        }],
+        end_turn: None,
+    }];
+    let _compact_mock1 = mount_compact_json_once(
+        &server,
+        serde_json::json!({ "output": compacted_history.clone() }),
+    )
+    .await;
+    let _compact_mock2 =
+        mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
+
+    let model_provider = openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_context_window = Some(200);
+        config.model_auto_compact_token_limit = Some(10_000);
+        config.features.enable(Feature::RawrAutoCompaction);
+        config.features.enable(Feature::RemoteCompaction);
+        config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
+            packet_author: Some(RawrAutoCompactionPacketAuthor::Agent),
+            scratch_write_enabled: Some(false),
+            trigger: Some(RawrAutoCompactionTriggerToml {
+                emergency_percent_remaining_lt: Some(90),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    });
+    let test = builder.build(&server).await.unwrap();
+    let codex = test.codex.clone();
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "rawr mid-turn rearm".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+
+    let request_bodies: Vec<String> = request_log
+        .requests()
+        .into_iter()
+        .map(|request| request.body_json().to_string())
+        .collect();
+    let rawr_prompt_count = request_bodies
+        .iter()
+        .filter(|body| body_contains_text(body, RAWR_PACKET_PROMPT_SNIPPET))
+        .count();
+    assert_eq!(rawr_prompt_count, 2);
+    assert_eq!(_compact_mock1.requests().len(), 1);
+    assert_eq!(_compact_mock2.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rawr_mid_turn_compaction_includes_scratch_prompt_and_handoff() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let sse1 = sse(vec![
+        ev_assistant_message("m1", "done. Next: continue."),
+        ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r1", 30),
+    ]);
+    let sse2 = sse(vec![
+        ev_assistant_message("m2", "PACKET CONTENTS"),
+        ev_completed_with_tokens("r2", 10),
+    ]);
+    let sse3 = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_tokens("r3", 10),
+    ]);
+
+    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
+
+    let compacted_history = vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "RAWr mid-turn compacted".to_string(),
+        }],
+        end_turn: None,
+    }];
+    let compact_mock =
+        mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
+
+    let model_provider = openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(100);
+            config.model_auto_compact_token_limit = Some(10_000);
+            config.features.enable(Feature::RawrAutoCompaction);
+            config.features.enable(Feature::RemoteCompaction);
+            config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
+                packet_author: Some(RawrAutoCompactionPacketAuthor::Agent),
+                scratch_write_enabled: Some(true),
+                trigger: Some(RawrAutoCompactionTriggerToml {
+                    ready_percent_remaining_lt: Some(80),
+                    emergency_percent_remaining_lt: Some(5),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        });
+    let codex = builder.build(&server).await.unwrap().codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "rawr mid-turn scratch".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+
+    let request_bodies: Vec<String> = request_log
+        .requests()
+        .into_iter()
+        .map(|request| request.body_json().to_string())
+        .collect();
+    assert_eq!(request_bodies.len(), 3);
+    assert!(
+        request_bodies[1].contains(".scratch/agent-") && request_bodies[1].contains(".scratch.md"),
+        "expected scratch file path in packet prompt"
+    );
+    assert!(
+        body_contains_text(&request_bodies[1], RAWR_PACKET_PROMPT_SNIPPET),
+        "expected continuation packet prompt after scratch write"
+    );
+    assert!(
+        request_bodies[2].contains("Scratchpad: `.scratch/agent-")
+            && request_bodies[2].contains("PACKET CONTENTS"),
+        "expected scratch handoff prefix and packet contents"
+    );
+    assert_eq!(compact_mock.requests().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

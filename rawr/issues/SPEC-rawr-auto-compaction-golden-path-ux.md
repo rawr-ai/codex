@@ -71,7 +71,10 @@ Pre-compact requests are ordered and must be fulfilled in order before compactio
    - Intended to preserve details that should survive compaction but don’t necessarily belong in the continuation packet.
    - File convention:
      - Directory: `.scratch/` (created if missing)
-     - Filename: `agent-<name>.scratch.md` (e.g., `agent-codex.scratch.md`)
+     - Filename: `agent-<name>.scratch.md`
+       - Prefer a real agent identity when available (e.g., subagent name).
+       - Otherwise use a stable, human-ish fallback name per session.
+       - Only fall back to `agent-codex` if no name can be derived.
    - When scheduled, it must run **before** continuation packet creation.
 
 ### Scheduling rules

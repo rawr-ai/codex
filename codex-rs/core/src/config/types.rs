@@ -699,12 +699,10 @@ pub enum RawrAutoCompactionBoundary {
 pub struct RawrAutoCompactionTriggerToml {
     /// Early (opportunistic) threshold: only compact on big-ish step boundaries.
     pub early_percent_remaining_lt: Option<i64>,
-    /// Ready threshold (default behavior). When unset, falls back to `percent_remaining_lt`.
+    /// Ready threshold (default behavior).
     pub ready_percent_remaining_lt: Option<i64>,
     /// Asap threshold: compact at the next natural pause boundary.
     pub asap_percent_remaining_lt: Option<i64>,
-    /// Back-compat: older configs used a single threshold.
-    pub percent_remaining_lt: Option<i64>,
     pub emergency_percent_remaining_lt: Option<i64>,
     pub auto_requires_any_boundary: Option<Vec<RawrAutoCompactionBoundary>>,
 }

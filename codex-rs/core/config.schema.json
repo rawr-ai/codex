@@ -843,6 +843,51 @@
       },
       "type": "object"
     },
+    "RawrAutoCompactionPolicyTierToml": {
+      "additionalProperties": false,
+      "properties": {
+        "decision_prompt_path": {
+          "description": "Optional prompt file used to make a judgement call before compaction triggers in this tier.\n\nThis prompt should instruct the watcher to output a structured decision (e.g. JSON) indicating whether to compact now vs. defer.",
+          "type": "string"
+        },
+        "percent_remaining_lt": {
+          "description": "Trigger threshold for this tier. When `percent_remaining < percent_remaining_lt`, this tier is eligible.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "plan_boundaries_require_semantic_break": {
+          "description": "When enabled, plan-based boundaries (`plan_update`, `plan_checkpoint`) only count when there is a semantic break in the conversation (agent_done/topic_shift/concluding), unless a non-plan boundary (commit/pr) is also present.",
+          "type": "boolean"
+        },
+        "requires_any_boundary": {
+          "description": "Boundaries that may trigger compaction for this tier (commit/pr/plan/etc).\n\nIf unset, defaults are used.",
+          "items": {
+            "$ref": "#/definitions/RawrAutoCompactionBoundary"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "RawrAutoCompactionPolicyToml": {
+      "additionalProperties": false,
+      "description": "Per-tier auto-compaction policy configuration.\n\nThis is the primary (preferred) way to configure RAWR auto-compaction. The legacy `rawr_auto_compaction.trigger.*` fields are still supported as a fallback.",
+      "properties": {
+        "asap": {
+          "$ref": "#/definitions/RawrAutoCompactionPolicyTierToml"
+        },
+        "early": {
+          "$ref": "#/definitions/RawrAutoCompactionPolicyTierToml"
+        },
+        "emergency": {
+          "$ref": "#/definitions/RawrAutoCompactionPolicyTierToml"
+        },
+        "ready": {
+          "$ref": "#/definitions/RawrAutoCompactionPolicyTierToml"
+        }
+      },
+      "type": "object"
+    },
     "RawrAutoCompactionToml": {
       "additionalProperties": false,
       "properties": {
@@ -879,6 +924,14 @@
         },
         "packet_author": {
           "$ref": "#/definitions/RawrAutoCompactionPacketAuthor"
+        },
+        "policy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RawrAutoCompactionPolicyToml"
+            }
+          ],
+          "description": "New, preferred policy configuration (per-tier thresholds + boundaries + optional judgement prompt)."
         },
         "scratch_write_enabled": {
           "description": "When enabled, the watcher may ask the in-session agent to write a scratchpad file before compaction so verbatim research notes/drafts survive history rewrite.",

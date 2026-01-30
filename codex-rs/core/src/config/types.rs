@@ -694,6 +694,44 @@ pub enum RawrAutoCompactionBoundary {
     TurnComplete,
 }
 
+/// Per-tier auto-compaction policy configuration.
+///
+/// This is the primary (preferred) way to configure RAWR auto-compaction. The legacy
+/// `rawr_auto_compaction.trigger.*` fields are still supported as a fallback.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionPolicyToml {
+    pub early: Option<RawrAutoCompactionPolicyTierToml>,
+    pub ready: Option<RawrAutoCompactionPolicyTierToml>,
+    pub asap: Option<RawrAutoCompactionPolicyTierToml>,
+    pub emergency: Option<RawrAutoCompactionPolicyTierToml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionPolicyTierToml {
+    /// Trigger threshold for this tier. When `percent_remaining < percent_remaining_lt`,
+    /// this tier is eligible.
+    pub percent_remaining_lt: Option<i64>,
+
+    /// Boundaries that may trigger compaction for this tier (commit/pr/plan/etc).
+    ///
+    /// If unset, defaults are used.
+    pub requires_any_boundary: Option<Vec<RawrAutoCompactionBoundary>>,
+
+    /// When enabled, plan-based boundaries (`plan_update`, `plan_checkpoint`) only count
+    /// when there is a semantic break in the conversation (agent_done/topic_shift/concluding),
+    /// unless a non-plan boundary (commit/pr) is also present.
+    pub plan_boundaries_require_semantic_break: Option<bool>,
+
+    /// Optional prompt file used to make a judgement call before compaction triggers
+    /// in this tier.
+    ///
+    /// This prompt should instruct the watcher to output a structured decision (e.g.
+    /// JSON) indicating whether to compact now vs. defer.
+    pub decision_prompt_path: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct RawrAutoCompactionTriggerToml {
@@ -727,6 +765,8 @@ pub struct RawrAutoCompactionToml {
     pub compaction_reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
     /// Optional verbosity override used for watcher-triggered compactions.
     pub compaction_verbosity: Option<codex_protocol::config_types::Verbosity>,
+    /// New, preferred policy configuration (per-tier thresholds + boundaries + optional judgement prompt).
+    pub policy: Option<RawrAutoCompactionPolicyToml>,
     #[serde(default)]
     pub trigger: Option<RawrAutoCompactionTriggerToml>,
     #[serde(default)]

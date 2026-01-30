@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::config::types::RawrAutoCompactionBoundary;
+use crate::config::types::RawrAutoCompactionPolicyTierToml;
 use crate::features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::plan_tool::StepStatus;
@@ -37,6 +38,32 @@ impl RawrAutoCompactionThresholds {
         let Some(rawr) = config.rawr_auto_compaction.as_ref() else {
             return defaults;
         };
+
+        if let Some(policy) = rawr.policy.as_ref() {
+            return Self {
+                early_percent_remaining_lt: policy
+                    .early
+                    .as_ref()
+                    .and_then(|tier| tier.percent_remaining_lt)
+                    .unwrap_or(defaults.early_percent_remaining_lt),
+                ready_percent_remaining_lt: policy
+                    .ready
+                    .as_ref()
+                    .and_then(|tier| tier.percent_remaining_lt)
+                    .unwrap_or(defaults.ready_percent_remaining_lt),
+                asap_percent_remaining_lt: policy
+                    .asap
+                    .as_ref()
+                    .and_then(|tier| tier.percent_remaining_lt)
+                    .unwrap_or(defaults.asap_percent_remaining_lt),
+                emergency_percent_remaining_lt: policy
+                    .emergency
+                    .as_ref()
+                    .and_then(|tier| tier.percent_remaining_lt)
+                    .unwrap_or(defaults.emergency_percent_remaining_lt),
+            };
+        }
+
         let Some(trigger) = rawr.trigger.as_ref() else {
             return defaults;
         };
@@ -455,7 +482,7 @@ pub(crate) fn rawr_should_compact_mid_turn(
         return true;
     }
 
-    let allowed = match tier {
+    let default_allowed = match tier {
         RawrAutoCompactionTier::Early => &[
             RawrAutoCompactionBoundary::PlanCheckpoint,
             RawrAutoCompactionBoundary::PlanUpdate,
@@ -481,18 +508,29 @@ pub(crate) fn rawr_should_compact_mid_turn(
         RawrAutoCompactionTier::Emergency => unreachable!(),
     };
 
-    let required = if boundaries_required.is_empty() {
+    let policy_tier = rawr_policy_tier(config, tier);
+    let policy_boundaries = policy_tier.and_then(|tier| tier.requires_any_boundary.as_deref());
+
+    let allowed = policy_boundaries.unwrap_or(default_allowed);
+
+    let required = if policy_boundaries.is_some() {
         allowed
     } else {
-        boundaries_required
+        if boundaries_required.is_empty() {
+            allowed
+        } else {
+            boundaries_required
+        }
     };
 
     let has_semantic_boundary =
         signals.saw_agent_done || signals.saw_topic_shift || signals.saw_concluding_thought;
-    let requires_semantic_boundary_for_plan = matches!(
-        tier,
-        RawrAutoCompactionTier::Early | RawrAutoCompactionTier::Ready
-    );
+    let requires_semantic_boundary_for_plan = policy_tier
+        .and_then(|tier| tier.plan_boundaries_require_semantic_break)
+        .unwrap_or(matches!(
+            tier,
+            RawrAutoCompactionTier::Early | RawrAutoCompactionTier::Ready
+        ));
     let mut satisfied_any_required_boundary = false;
     let mut satisfied_plan_boundary = false;
     let mut satisfied_non_plan_boundary = false;
@@ -543,4 +581,116 @@ pub(crate) fn rawr_should_compact_mid_turn(
     }
 
     true
+}
+
+fn rawr_policy_tier(
+    config: &Config,
+    tier: RawrAutoCompactionTier,
+) -> Option<&RawrAutoCompactionPolicyTierToml> {
+    let policy = config
+        .rawr_auto_compaction
+        .as_ref()
+        .and_then(|rawr| rawr.policy.as_ref())?;
+
+    match tier {
+        RawrAutoCompactionTier::Early => policy.early.as_ref(),
+        RawrAutoCompactionTier::Ready => policy.ready.as_ref(),
+        RawrAutoCompactionTier::Asap => policy.asap.as_ref(),
+        RawrAutoCompactionTier::Emergency => policy.emergency.as_ref(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::RawrAutoCompactionPolicyToml;
+    use crate::config::types::RawrAutoCompactionToml;
+    use crate::config::types::RawrAutoCompactionTriggerToml;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn rawr_policy_boundaries_override_boundaries_required() {
+        let mut config = crate::config::test_config();
+        config.features.enable(Feature::RawrAutoCompaction);
+        config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
+            policy: Some(RawrAutoCompactionPolicyToml {
+                early: Some(RawrAutoCompactionPolicyTierToml {
+                    requires_any_boundary: Some(vec![RawrAutoCompactionBoundary::PlanUpdate]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let mut signals = RawrAutoCompactionSignals::default();
+        signals.saw_commit = true;
+
+        assert_eq!(
+            rawr_should_compact_mid_turn(
+                &config,
+                80,
+                &signals,
+                &[RawrAutoCompactionBoundary::Commit]
+            ),
+            false
+        );
+    }
+
+    #[test]
+    fn rawr_policy_can_disable_plan_semantic_break_gating() {
+        let mut config = crate::config::test_config();
+        config.features.enable(Feature::RawrAutoCompaction);
+        config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
+            policy: Some(RawrAutoCompactionPolicyToml {
+                early: Some(RawrAutoCompactionPolicyTierToml {
+                    requires_any_boundary: Some(vec![RawrAutoCompactionBoundary::PlanUpdate]),
+                    plan_boundaries_require_semantic_break: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let mut signals = RawrAutoCompactionSignals::default();
+        signals.saw_plan_update = true;
+
+        assert_eq!(
+            rawr_should_compact_mid_turn(&config, 80, &signals, &[]),
+            true
+        );
+    }
+
+    #[test]
+    fn rawr_policy_thresholds_override_trigger_thresholds() {
+        let mut config = crate::config::test_config();
+        config.features.enable(Feature::RawrAutoCompaction);
+        config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
+            trigger: Some(RawrAutoCompactionTriggerToml {
+                early_percent_remaining_lt: Some(80),
+                ready_percent_remaining_lt: Some(60),
+                asap_percent_remaining_lt: Some(40),
+                emergency_percent_remaining_lt: Some(20),
+                ..Default::default()
+            }),
+            policy: Some(RawrAutoCompactionPolicyToml {
+                early: Some(RawrAutoCompactionPolicyTierToml {
+                    percent_remaining_lt: Some(90),
+                    requires_any_boundary: Some(vec![RawrAutoCompactionBoundary::Commit]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let mut signals = RawrAutoCompactionSignals::default();
+        signals.saw_commit = true;
+
+        assert_eq!(
+            rawr_should_compact_mid_turn(&config, 85, &signals, &[]),
+            true
+        );
+    }
 }

@@ -41,6 +41,8 @@ use codex_core::config::types::Notifications;
 use codex_core::config::types::RawrAutoCompactionBoundary;
 use codex_core::config::types::RawrAutoCompactionMode;
 use codex_core::config::types::RawrAutoCompactionPacketAuthor;
+use codex_core::config::types::RawrAutoCompactionPolicyTierToml;
+use codex_core::config::types::RawrAutoCompactionPolicyToml;
 use codex_core::features::FEATURES;
 use codex_core::features::Feature;
 use codex_core::git_info::current_branch_name;
@@ -660,7 +662,7 @@ impl RawrAutoCompactionThresholds {
         };
         let trigger = &settings.prompt_frontmatter.trigger;
 
-        Self {
+        let mut thresholds = Self {
             early_percent_remaining_lt: trigger
                 .early_percent_remaining_lt
                 .unwrap_or(defaults.early_percent_remaining_lt),
@@ -671,7 +673,32 @@ impl RawrAutoCompactionThresholds {
                 .asap_percent_remaining_lt
                 .unwrap_or(defaults.asap_percent_remaining_lt),
             emergency_percent_remaining_lt: trigger.emergency_percent_remaining_lt,
+        };
+
+        if let Some(policy) = settings.policy.as_ref() {
+            thresholds.early_percent_remaining_lt = policy
+                .early
+                .as_ref()
+                .and_then(|tier| tier.percent_remaining_lt)
+                .unwrap_or(thresholds.early_percent_remaining_lt);
+            thresholds.ready_percent_remaining_lt = policy
+                .ready
+                .as_ref()
+                .and_then(|tier| tier.percent_remaining_lt)
+                .unwrap_or(thresholds.ready_percent_remaining_lt);
+            thresholds.asap_percent_remaining_lt = policy
+                .asap
+                .as_ref()
+                .and_then(|tier| tier.percent_remaining_lt)
+                .unwrap_or(thresholds.asap_percent_remaining_lt);
+            thresholds.emergency_percent_remaining_lt = policy
+                .emergency
+                .as_ref()
+                .and_then(|tier| tier.percent_remaining_lt)
+                .unwrap_or(thresholds.emergency_percent_remaining_lt);
         }
+
+        thresholds
     }
 }
 
@@ -724,6 +751,19 @@ fn rawr_allowed_boundaries_for_tier(
     }
 }
 
+fn rawr_policy_tier<'a>(
+    policy: Option<&'a RawrAutoCompactionPolicyToml>,
+    tier: RawrAutoCompactionTier,
+) -> Option<&'a RawrAutoCompactionPolicyTierToml> {
+    let policy = policy?;
+    match tier {
+        RawrAutoCompactionTier::Early => policy.early.as_ref(),
+        RawrAutoCompactionTier::Ready => policy.ready.as_ref(),
+        RawrAutoCompactionTier::Asap => policy.asap.as_ref(),
+        RawrAutoCompactionTier::Emergency => policy.emergency.as_ref(),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RawrAutoCompactionBoundaryCheck {
     has_any_required_boundary: bool,
@@ -732,7 +772,7 @@ struct RawrAutoCompactionBoundaryCheck {
 }
 
 fn rawr_check_boundaries(
-    allowed_boundaries: &'static [RawrAutoCompactionBoundary],
+    allowed_boundaries: &[RawrAutoCompactionBoundary],
     required_boundaries: &[RawrAutoCompactionBoundary],
     boundary_values: &std::collections::HashMap<RawrAutoCompactionBoundary, bool>,
 ) -> RawrAutoCompactionBoundaryCheck {
@@ -779,6 +819,7 @@ struct RawrAutoCompactionSettings {
     mode: RawrAutoCompactionMode,
     packet_author: RawrAutoCompactionPacketAuthor,
     scratch_write_enabled: bool,
+    policy: Option<RawrAutoCompactionPolicyToml>,
     prompt_frontmatter: RawrAutoCompactionPromptFrontmatter,
     agent_packet_prompt: String,
     scratch_write_prompt: String,
@@ -794,6 +835,7 @@ impl RawrAutoCompactionSettings {
             mode,
             packet_author,
             scratch_write_enabled: false,
+            policy: None,
             prompt_frontmatter,
             agent_packet_prompt: default_rawr_agent_packet_prompt(),
             scratch_write_prompt: default_rawr_scratch_write_prompt(),
@@ -1551,12 +1593,17 @@ impl ChatWidget {
             return;
         };
 
-        let allowed_boundaries = rawr_allowed_boundaries_for_tier(tier);
+        let policy_tier = rawr_policy_tier(settings.policy.as_ref(), tier);
+        let policy_boundaries = policy_tier.and_then(|tier| tier.requires_any_boundary.as_deref());
+        let allowed_boundaries =
+            policy_boundaries.unwrap_or_else(|| rawr_allowed_boundaries_for_tier(tier));
         let agent_done = last_agent_message.is_some_and(rawr_agent_message_looks_done);
         let has_semantic_boundary = agent_done
             || last_agent_message.is_some_and(rawr_agent_message_looks_like_topic_shift)
             || last_agent_message.is_some_and(rawr_agent_message_looks_like_concluding_thought);
-        let required_boundaries = if settings
+        let required_boundaries = if policy_boundaries.is_some() {
+            allowed_boundaries
+        } else if settings
             .prompt_frontmatter
             .trigger
             .auto_requires_any_boundary
@@ -1572,10 +1619,12 @@ impl ChatWidget {
         };
 
         let is_emergency = tier == RawrAutoCompactionTier::Emergency;
-        let requires_semantic_boundary_for_plan = matches!(
-            tier,
-            RawrAutoCompactionTier::Early | RawrAutoCompactionTier::Ready
-        );
+        let requires_semantic_boundary_for_plan = policy_tier
+            .and_then(|tier| tier.plan_boundaries_require_semantic_break)
+            .unwrap_or(matches!(
+                tier,
+                RawrAutoCompactionTier::Early | RawrAutoCompactionTier::Ready
+            ));
 
         let mut boundary_values = std::collections::HashMap::new();
         boundary_values.insert(
@@ -1675,11 +1724,8 @@ impl ChatWidget {
                             return;
                         }
 
-                        let should_defer_to_next_user_turn = settings
-                            .prompt_frontmatter
-                            .trigger
-                            .auto_requires_any_boundary
-                            .contains(&RawrAutoCompactionBoundary::TurnComplete);
+                        let should_defer_to_next_user_turn =
+                            required_boundaries.contains(&RawrAutoCompactionBoundary::TurnComplete);
                         if should_defer_to_next_user_turn
                             && self.rawr_preflight_compaction_pending.is_none()
                         {
@@ -2183,6 +2229,9 @@ impl ChatWidget {
             }
             if let Some(enabled) = config.scratch_write_enabled {
                 settings.scratch_write_enabled = enabled;
+            }
+            if let Some(policy) = config.policy.as_ref() {
+                settings.policy = Some(policy.clone());
             }
             if let Some(trigger) = config.trigger.as_ref() {
                 if let Some(early_percent_remaining_lt) = trigger.early_percent_remaining_lt {

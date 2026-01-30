@@ -58,9 +58,9 @@
 - **Rationale:** Preserves tier intent while still allowing config to narrow which boundaries count.
 - **Risk:** If configs relied on plan updates triggering in the Early tier, they will no longer do so.
 
-### Remove PlanUpdate from Early tier
-- **Context:** Early-tier compaction should only happen on major boundaries, but PlanUpdate can be a minor edit with no task shift.
-- **Options:** Keep PlanUpdate in Early; move it to Ready+ tiers only; require TopicShift alongside PlanUpdate.
-- **Choice:** Move PlanUpdate out of Early so it only triggers from Ready and later tiers.
-- **Rationale:** Prevents “too early” compactions after minor plan tweaks while keeping later tiers permissive.
-- **Risk:** Users who expected plan updates to trigger early compaction will see fewer early compacts.
+### Require semantic break for plan-based boundaries in Early/Ready tiers
+- **Context:** Plan tool activity (PlanUpdate/PlanCheckpoint) can happen mid-thought; using it as a direct “natural boundary” causes premature compaction.
+- **Options:** Treat plan signals as always-safe boundaries; remove plan signals from early tiers; require a semantic break (agent-done/topic-shift/concluding) before plan-based boundaries can trigger compaction in early tiers.
+- **Choice:** Keep plan signals available (including in Early), but require a semantic break for plan-based boundaries in Early/Ready tiers (Emergency still bypasses).
+- **Rationale:** Preserves the intended “tiered permissiveness” while making plan activity a *candidate* boundary, not an unconditional compaction trigger.
+- **Risk:** If the agent never emits a clear semantic break signal, plan-based boundaries may defer compaction until later tiers (Asap/Emergency) or until another boundary occurs.

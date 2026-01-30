@@ -2,8 +2,11 @@
 version: 0
 trigger:
   # Early threshold: compact only on major boundaries (plan checkpoint, PR checkpoint, topic shift).
+  # Note: plan-based boundaries still require a semantic break (agent-done/topic-shift/concluding)
+  # in Early/Ready tiers so we don't compact mid-thought just because the plan tool ran.
   early_percent_remaining_lt: 85
-  # Ready threshold: compact on common boundaries like commits or plan updates.
+  # Ready threshold: compact on common boundaries like commits or plan checkpoints, but still
+  # require a semantic break for plan-based boundaries.
   ready_percent_remaining_lt: 75
   # ASAP threshold: compact on smaller boundaries like agent-done or concluding thoughts.
   asap_percent_remaining_lt: 65

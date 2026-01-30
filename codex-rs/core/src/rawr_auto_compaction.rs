@@ -458,6 +458,7 @@ pub(crate) fn rawr_should_compact_mid_turn(
     let allowed = match tier {
         RawrAutoCompactionTier::Early => &[
             RawrAutoCompactionBoundary::PlanCheckpoint,
+            RawrAutoCompactionBoundary::PlanUpdate,
             RawrAutoCompactionBoundary::PrCheckpoint,
             RawrAutoCompactionBoundary::TopicShift,
         ][..],
@@ -486,11 +487,21 @@ pub(crate) fn rawr_should_compact_mid_turn(
         boundaries_required
     };
 
-    required.iter().any(|boundary| {
+    let has_semantic_boundary =
+        signals.saw_agent_done || signals.saw_topic_shift || signals.saw_concluding_thought;
+    let requires_semantic_boundary_for_plan = matches!(
+        tier,
+        RawrAutoCompactionTier::Early | RawrAutoCompactionTier::Ready
+    );
+    let mut satisfied_any_required_boundary = false;
+    let mut satisfied_plan_boundary = false;
+    let mut satisfied_non_plan_boundary = false;
+
+    for boundary in required {
         if !allowed.contains(boundary) {
-            return false;
+            continue;
         }
-        match boundary {
+        let satisfied = match boundary {
             RawrAutoCompactionBoundary::Commit => signals.saw_commit,
             RawrAutoCompactionBoundary::PlanCheckpoint => signals.saw_plan_checkpoint,
             RawrAutoCompactionBoundary::PlanUpdate => signals.saw_plan_update,
@@ -499,6 +510,37 @@ pub(crate) fn rawr_should_compact_mid_turn(
             RawrAutoCompactionBoundary::TopicShift => signals.saw_topic_shift,
             RawrAutoCompactionBoundary::ConcludingThought => signals.saw_concluding_thought,
             RawrAutoCompactionBoundary::TurnComplete => false,
+        };
+        if !satisfied {
+            continue;
         }
-    })
+
+        satisfied_any_required_boundary = true;
+        match boundary {
+            RawrAutoCompactionBoundary::PlanCheckpoint | RawrAutoCompactionBoundary::PlanUpdate => {
+                satisfied_plan_boundary = true;
+            }
+            RawrAutoCompactionBoundary::Commit | RawrAutoCompactionBoundary::PrCheckpoint => {
+                satisfied_non_plan_boundary = true;
+            }
+            RawrAutoCompactionBoundary::AgentDone
+            | RawrAutoCompactionBoundary::TopicShift
+            | RawrAutoCompactionBoundary::ConcludingThought
+            | RawrAutoCompactionBoundary::TurnComplete => {}
+        }
+    }
+
+    if !satisfied_any_required_boundary {
+        return false;
+    }
+
+    if requires_semantic_boundary_for_plan
+        && satisfied_plan_boundary
+        && !satisfied_non_plan_boundary
+        && !has_semantic_boundary
+    {
+        return false;
+    }
+
+    true
 }

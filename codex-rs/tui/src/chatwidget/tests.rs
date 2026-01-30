@@ -1056,20 +1056,36 @@ async fn rawr_auto_compaction_respects_tiered_boundaries() {
     chat.maybe_rawr_auto_compact_with_settings(Some("continuing"), settings.clone());
     assert_eq!(drain_for_compact(&mut rx), false);
 
+    // Early tier: plan update should compact if there's a semantic break.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(14_400, 20_000))); // 70% remaining
+    chat.saw_plan_update_this_turn = true;
+    chat.maybe_rawr_auto_compact_with_settings(Some("done"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+
     // Early tier: plan checkpoint should compact.
     let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
     chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
     chat.set_token_info(Some(make_token_info(14_400, 20_000))); // 70% remaining
     chat.rawr_saw_plan_checkpoint_this_turn = true;
-    chat.maybe_rawr_auto_compact_with_settings(Some("checkpoint"), settings.clone());
+    chat.maybe_rawr_auto_compact_with_settings(Some("done"), settings.clone());
     assert_eq!(drain_for_compact(&mut rx), true);
 
-    // Ready tier: plan update should compact.
+    // Ready tier: plan update alone should not compact without a semantic break.
     let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
     chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
     chat.set_token_info(Some(make_token_info(15_600, 20_000))); // 55% remaining
     chat.saw_plan_update_this_turn = true;
     chat.maybe_rawr_auto_compact_with_settings(Some("plan update"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), false);
+
+    // Ready tier: plan update should compact if there's a semantic break.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(15_600, 20_000))); // 55% remaining
+    chat.saw_plan_update_this_turn = true;
+    chat.maybe_rawr_auto_compact_with_settings(Some("done"), settings.clone());
     assert_eq!(drain_for_compact(&mut rx), true);
 
     // ASAP tier: agent-done should compact.

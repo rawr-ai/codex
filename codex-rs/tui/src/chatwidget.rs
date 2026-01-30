@@ -700,6 +700,7 @@ fn rawr_allowed_boundaries_for_tier(
     match tier {
         RawrAutoCompactionTier::Early => &[
             RawrAutoCompactionBoundary::PlanCheckpoint,
+            RawrAutoCompactionBoundary::PlanUpdate,
             RawrAutoCompactionBoundary::PrCheckpoint,
             RawrAutoCompactionBoundary::TopicShift,
         ],
@@ -721,6 +722,56 @@ fn rawr_allowed_boundaries_for_tier(
         ],
         RawrAutoCompactionTier::Emergency => &[],
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawrAutoCompactionBoundaryCheck {
+    has_any_required_boundary: bool,
+    satisfied_plan_boundary: bool,
+    satisfied_non_plan_boundary: bool,
+}
+
+fn rawr_check_boundaries(
+    allowed_boundaries: &'static [RawrAutoCompactionBoundary],
+    required_boundaries: &[RawrAutoCompactionBoundary],
+    boundary_values: &std::collections::HashMap<RawrAutoCompactionBoundary, bool>,
+) -> RawrAutoCompactionBoundaryCheck {
+    let mut result = RawrAutoCompactionBoundaryCheck {
+        has_any_required_boundary: false,
+        satisfied_plan_boundary: false,
+        satisfied_non_plan_boundary: false,
+    };
+
+    for boundary in required_boundaries {
+        if *boundary == RawrAutoCompactionBoundary::TurnComplete {
+            result.has_any_required_boundary = true;
+            continue;
+        }
+        if !allowed_boundaries.is_empty() && !allowed_boundaries.contains(boundary) {
+            continue;
+        }
+        let Some(value) = boundary_values.get(boundary) else {
+            continue;
+        };
+        if !*value {
+            continue;
+        }
+        result.has_any_required_boundary = true;
+        match boundary {
+            RawrAutoCompactionBoundary::PlanCheckpoint | RawrAutoCompactionBoundary::PlanUpdate => {
+                result.satisfied_plan_boundary = true;
+            }
+            RawrAutoCompactionBoundary::Commit | RawrAutoCompactionBoundary::PrCheckpoint => {
+                result.satisfied_non_plan_boundary = true;
+            }
+            RawrAutoCompactionBoundary::AgentDone
+            | RawrAutoCompactionBoundary::TopicShift
+            | RawrAutoCompactionBoundary::ConcludingThought
+            | RawrAutoCompactionBoundary::TurnComplete => {}
+        }
+    }
+
+    result
 }
 
 #[derive(Debug, Clone)]
@@ -1502,6 +1553,9 @@ impl ChatWidget {
 
         let allowed_boundaries = rawr_allowed_boundaries_for_tier(tier);
         let agent_done = last_agent_message.is_some_and(rawr_agent_message_looks_done);
+        let has_semantic_boundary = agent_done
+            || last_agent_message.is_some_and(rawr_agent_message_looks_like_topic_shift)
+            || last_agent_message.is_some_and(rawr_agent_message_looks_like_concluding_thought);
         let required_boundaries = if settings
             .prompt_frontmatter
             .trigger
@@ -1516,32 +1570,57 @@ impl ChatWidget {
                 .auto_requires_any_boundary
                 .as_slice()
         };
-        let has_any_required_boundary = required_boundaries.iter().any(|boundary| {
-            if *boundary == RawrAutoCompactionBoundary::TurnComplete {
-                return true;
-            }
-            if !allowed_boundaries.is_empty() && !allowed_boundaries.contains(boundary) {
-                return false;
-            }
-            match boundary {
-                RawrAutoCompactionBoundary::Commit => self.rawr_saw_commit_this_turn,
-                RawrAutoCompactionBoundary::PrCheckpoint => self.rawr_saw_pr_checkpoint_this_turn,
-                RawrAutoCompactionBoundary::PlanCheckpoint => {
-                    self.rawr_saw_plan_checkpoint_this_turn
-                }
-                RawrAutoCompactionBoundary::PlanUpdate => self.saw_plan_update_this_turn,
-                RawrAutoCompactionBoundary::AgentDone => agent_done,
-                RawrAutoCompactionBoundary::TopicShift => {
-                    last_agent_message.is_some_and(rawr_agent_message_looks_like_topic_shift)
-                }
-                RawrAutoCompactionBoundary::ConcludingThought => {
-                    last_agent_message.is_some_and(rawr_agent_message_looks_like_concluding_thought)
-                }
-                RawrAutoCompactionBoundary::TurnComplete => true,
-            }
-        });
 
         let is_emergency = tier == RawrAutoCompactionTier::Emergency;
+        let requires_semantic_boundary_for_plan = matches!(
+            tier,
+            RawrAutoCompactionTier::Early | RawrAutoCompactionTier::Ready
+        );
+
+        let mut boundary_values = std::collections::HashMap::new();
+        boundary_values.insert(
+            RawrAutoCompactionBoundary::Commit,
+            self.rawr_saw_commit_this_turn,
+        );
+        boundary_values.insert(
+            RawrAutoCompactionBoundary::PrCheckpoint,
+            self.rawr_saw_pr_checkpoint_this_turn,
+        );
+        boundary_values.insert(
+            RawrAutoCompactionBoundary::PlanCheckpoint,
+            self.rawr_saw_plan_checkpoint_this_turn,
+        );
+        boundary_values.insert(
+            RawrAutoCompactionBoundary::PlanUpdate,
+            self.saw_plan_update_this_turn,
+        );
+        boundary_values.insert(RawrAutoCompactionBoundary::AgentDone, agent_done);
+        boundary_values.insert(
+            RawrAutoCompactionBoundary::TopicShift,
+            last_agent_message.is_some_and(rawr_agent_message_looks_like_topic_shift),
+        );
+        boundary_values.insert(
+            RawrAutoCompactionBoundary::ConcludingThought,
+            last_agent_message.is_some_and(rawr_agent_message_looks_like_concluding_thought),
+        );
+
+        let boundary_check =
+            rawr_check_boundaries(allowed_boundaries, required_boundaries, &boundary_values);
+        let has_any_required_boundary = boundary_check.has_any_required_boundary;
+
+        let should_compact_due_to_boundaries = if is_emergency {
+            true
+        } else if !has_any_required_boundary {
+            false
+        } else if requires_semantic_boundary_for_plan
+            && boundary_check.satisfied_plan_boundary
+            && !boundary_check.satisfied_non_plan_boundary
+            && !has_semantic_boundary
+        {
+            false
+        } else {
+            true
+        };
 
         match settings.mode {
             RawrAutoCompactionMode::Tag => {
@@ -1561,10 +1640,10 @@ impl ChatWidget {
                 );
             }
             RawrAutoCompactionMode::Auto => {
-                if !is_emergency && !has_any_required_boundary {
+                if !should_compact_due_to_boundaries {
                     self.add_info_message(
                         format!(
-                            "[rawr] auto-compaction watcher: skipping auto compact (no natural boundary). Context window: {percent_remaining}% left. Run `/compact` or edit prompts to adjust boundary gating."
+                            "[rawr] auto-compaction watcher: skipping auto compact (no natural boundary / semantic break). Context window: {percent_remaining}% left. Run `/compact` or edit prompts to adjust boundary gating."
                         ),
                         None,
                     );

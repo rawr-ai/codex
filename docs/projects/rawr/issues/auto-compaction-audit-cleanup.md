@@ -50,3 +50,17 @@
 - **Choice:** After a remote compact, if usage still exceeds the auto-compact limit, run a local compact prompt once as a fallback.
 - **Rationale:** Provides a reliable escape hatch without removing upstream behavior.
 - **Risk:** Two back-to-back compactions can occur; local summary may be more aggressive than remote output.
+
+### Enforce tiered boundary gating (filter configured boundaries by tier)
+- **Context:** The intended policy is “early tiers only on major boundaries,” but watcher and core could accept smaller boundaries early when `auto_requires_any_boundary` is configured.
+- **Options:** Let configured boundaries override tiers; intersect configured boundaries with each tier’s allowed set; remove tiering entirely.
+- **Choice:** Keep tiers and intersect configured boundaries with each tier’s allowed boundaries in both watcher and core.
+- **Rationale:** Preserves tier intent while still allowing config to narrow which boundaries count.
+- **Risk:** If configs relied on plan updates triggering in the Early tier, they will no longer do so.
+
+### Remove PlanUpdate from Early tier
+- **Context:** Early-tier compaction should only happen on major boundaries, but PlanUpdate can be a minor edit with no task shift.
+- **Options:** Keep PlanUpdate in Early; move it to Ready+ tiers only; require TopicShift alongside PlanUpdate.
+- **Choice:** Move PlanUpdate out of Early so it only triggers from Ready and later tiers.
+- **Rationale:** Prevents “too early” compactions after minor plan tweaks while keeping later tiers permissive.
+- **Risk:** Users who expected plan updates to trigger early compaction will see fewer early compacts.

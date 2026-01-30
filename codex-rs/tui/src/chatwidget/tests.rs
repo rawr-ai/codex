@@ -958,7 +958,15 @@ fn make_rawr_settings_for_test(
     settings
         .prompt_frontmatter
         .trigger
+        .early_percent_remaining_lt = Some(85);
+    settings
+        .prompt_frontmatter
+        .trigger
         .ready_percent_remaining_lt = Some(75);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .asap_percent_remaining_lt = Some(65);
     settings
         .prompt_frontmatter
         .trigger
@@ -1002,6 +1010,73 @@ async fn rawr_auto_compaction_auto_mode_requires_boundary_unless_emergency() {
     // ~10% remaining: (20k window, 12k baseline, 8k effective, 7.2k used => 10% left).
     chat.set_token_info(Some(make_token_info(19_200, 20_000)));
     chat.maybe_rawr_auto_compact_with_settings(None, settings);
+    assert_eq!(drain_for_compact(&mut rx), true);
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_respects_tiered_boundaries() {
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .early_percent_remaining_lt = Some(80);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .ready_percent_remaining_lt = Some(60);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .asap_percent_remaining_lt = Some(40);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .emergency_percent_remaining_lt = 20;
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![
+        RawrAutoCompactionBoundary::Commit,
+        RawrAutoCompactionBoundary::PlanCheckpoint,
+        RawrAutoCompactionBoundary::PlanUpdate,
+        RawrAutoCompactionBoundary::PrCheckpoint,
+        RawrAutoCompactionBoundary::AgentDone,
+        RawrAutoCompactionBoundary::TopicShift,
+        RawrAutoCompactionBoundary::ConcludingThought,
+    ];
+
+    // Early tier: plan update alone should not compact.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(14_400, 20_000))); // 70% remaining
+    chat.saw_plan_update_this_turn = true;
+    chat.maybe_rawr_auto_compact_with_settings(Some("continuing"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), false);
+
+    // Early tier: plan checkpoint should compact.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(14_400, 20_000))); // 70% remaining
+    chat.rawr_saw_plan_checkpoint_this_turn = true;
+    chat.maybe_rawr_auto_compact_with_settings(Some("checkpoint"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // Ready tier: plan update should compact.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(15_600, 20_000))); // 55% remaining
+    chat.saw_plan_update_this_turn = true;
+    chat.maybe_rawr_auto_compact_with_settings(Some("plan update"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // ASAP tier: agent-done should compact.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(17_200, 20_000))); // 35% remaining
+    chat.maybe_rawr_auto_compact_with_settings(Some("done"), settings);
     assert_eq!(drain_for_compact(&mut rx), true);
 }
 

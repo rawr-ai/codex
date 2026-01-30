@@ -596,7 +596,9 @@ struct RawrAutoCompactionPromptFrontmatter {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawrAutoCompactionTriggerRules {
+    early_percent_remaining_lt: Option<i64>,
     ready_percent_remaining_lt: Option<i64>,
+    asap_percent_remaining_lt: Option<i64>,
     emergency_percent_remaining_lt: i64,
     auto_requires_any_boundary: Vec<RawrAutoCompactionBoundary>,
 }
@@ -604,7 +606,9 @@ struct RawrAutoCompactionTriggerRules {
 impl Default for RawrAutoCompactionTriggerRules {
     fn default() -> Self {
         Self {
+            early_percent_remaining_lt: Some(85),
             ready_percent_remaining_lt: Some(75),
+            asap_percent_remaining_lt: Some(65),
             emergency_percent_remaining_lt: 15,
             auto_requires_any_boundary: vec![
                 RawrAutoCompactionBoundary::Commit,
@@ -627,6 +631,95 @@ impl Default for RawrAutoCompactionPacketRules {
         Self {
             max_tail_chars: 1200,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawrAutoCompactionTier {
+    Early,
+    Ready,
+    Asap,
+    Emergency,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawrAutoCompactionThresholds {
+    early_percent_remaining_lt: i64,
+    ready_percent_remaining_lt: i64,
+    asap_percent_remaining_lt: i64,
+    emergency_percent_remaining_lt: i64,
+}
+
+impl RawrAutoCompactionThresholds {
+    fn from_settings(settings: &RawrAutoCompactionSettings) -> Self {
+        let defaults = Self {
+            early_percent_remaining_lt: 85,
+            ready_percent_remaining_lt: 75,
+            asap_percent_remaining_lt: 65,
+            emergency_percent_remaining_lt: 15,
+        };
+        let trigger = &settings.prompt_frontmatter.trigger;
+
+        Self {
+            early_percent_remaining_lt: trigger
+                .early_percent_remaining_lt
+                .unwrap_or(defaults.early_percent_remaining_lt),
+            ready_percent_remaining_lt: trigger
+                .ready_percent_remaining_lt
+                .unwrap_or(defaults.ready_percent_remaining_lt),
+            asap_percent_remaining_lt: trigger
+                .asap_percent_remaining_lt
+                .unwrap_or(defaults.asap_percent_remaining_lt),
+            emergency_percent_remaining_lt: trigger.emergency_percent_remaining_lt,
+        }
+    }
+}
+
+fn rawr_pick_tier(
+    thresholds: RawrAutoCompactionThresholds,
+    percent_remaining: i64,
+) -> Option<RawrAutoCompactionTier> {
+    if percent_remaining < thresholds.emergency_percent_remaining_lt {
+        return Some(RawrAutoCompactionTier::Emergency);
+    }
+    if percent_remaining < thresholds.asap_percent_remaining_lt {
+        return Some(RawrAutoCompactionTier::Asap);
+    }
+    if percent_remaining < thresholds.ready_percent_remaining_lt {
+        return Some(RawrAutoCompactionTier::Ready);
+    }
+    if percent_remaining < thresholds.early_percent_remaining_lt {
+        return Some(RawrAutoCompactionTier::Early);
+    }
+    None
+}
+
+fn rawr_allowed_boundaries_for_tier(
+    tier: RawrAutoCompactionTier,
+) -> &'static [RawrAutoCompactionBoundary] {
+    match tier {
+        RawrAutoCompactionTier::Early => &[
+            RawrAutoCompactionBoundary::PlanCheckpoint,
+            RawrAutoCompactionBoundary::PrCheckpoint,
+            RawrAutoCompactionBoundary::TopicShift,
+        ],
+        RawrAutoCompactionTier::Ready => &[
+            RawrAutoCompactionBoundary::Commit,
+            RawrAutoCompactionBoundary::PlanCheckpoint,
+            RawrAutoCompactionBoundary::PlanUpdate,
+            RawrAutoCompactionBoundary::PrCheckpoint,
+            RawrAutoCompactionBoundary::TopicShift,
+        ],
+        RawrAutoCompactionTier::Asap => &[
+            RawrAutoCompactionBoundary::Commit,
+            RawrAutoCompactionBoundary::PlanCheckpoint,
+            RawrAutoCompactionBoundary::PlanUpdate,
+            RawrAutoCompactionBoundary::PrCheckpoint,
+            RawrAutoCompactionBoundary::AgentDone,
+            RawrAutoCompactionBoundary::TopicShift,
+            RawrAutoCompactionBoundary::ConcludingThought,
+        ],
+        RawrAutoCompactionTier::Emergency => &[],
     }
 }
 
@@ -1402,49 +1495,53 @@ impl ChatWidget {
             return;
         };
 
-        let trigger_percent_remaining = settings
-            .prompt_frontmatter
-            .trigger
-            .ready_percent_remaining_lt
-            .unwrap_or(75);
-        if percent_remaining >= trigger_percent_remaining {
+        let thresholds = RawrAutoCompactionThresholds::from_settings(&settings);
+        let Some(tier) = rawr_pick_tier(thresholds, percent_remaining) else {
             return;
-        }
+        };
 
+        let allowed_boundaries = rawr_allowed_boundaries_for_tier(tier);
         let agent_done = last_agent_message.is_some_and(rawr_agent_message_looks_done);
-        let has_any_required_boundary = settings
+        let required_boundaries = if settings
             .prompt_frontmatter
             .trigger
             .auto_requires_any_boundary
             .is_empty()
-            || settings
+        {
+            allowed_boundaries
+        } else {
+            settings
                 .prompt_frontmatter
                 .trigger
                 .auto_requires_any_boundary
-                .iter()
-                .any(|boundary| match boundary {
-                    RawrAutoCompactionBoundary::Commit => self.rawr_saw_commit_this_turn,
-                    RawrAutoCompactionBoundary::PrCheckpoint => {
-                        self.rawr_saw_pr_checkpoint_this_turn
-                    }
-                    RawrAutoCompactionBoundary::PlanCheckpoint => {
-                        self.rawr_saw_plan_checkpoint_this_turn
-                    }
-                    RawrAutoCompactionBoundary::PlanUpdate => self.saw_plan_update_this_turn,
-                    RawrAutoCompactionBoundary::AgentDone => agent_done,
-                    RawrAutoCompactionBoundary::TopicShift => {
-                        last_agent_message.is_some_and(rawr_agent_message_looks_like_topic_shift)
-                    }
-                    RawrAutoCompactionBoundary::ConcludingThought => last_agent_message
-                        .is_some_and(rawr_agent_message_looks_like_concluding_thought),
-                    RawrAutoCompactionBoundary::TurnComplete => true,
-                });
+                .as_slice()
+        };
+        let has_any_required_boundary = required_boundaries.iter().any(|boundary| {
+            if *boundary == RawrAutoCompactionBoundary::TurnComplete {
+                return true;
+            }
+            if !allowed_boundaries.is_empty() && !allowed_boundaries.contains(boundary) {
+                return false;
+            }
+            match boundary {
+                RawrAutoCompactionBoundary::Commit => self.rawr_saw_commit_this_turn,
+                RawrAutoCompactionBoundary::PrCheckpoint => self.rawr_saw_pr_checkpoint_this_turn,
+                RawrAutoCompactionBoundary::PlanCheckpoint => {
+                    self.rawr_saw_plan_checkpoint_this_turn
+                }
+                RawrAutoCompactionBoundary::PlanUpdate => self.saw_plan_update_this_turn,
+                RawrAutoCompactionBoundary::AgentDone => agent_done,
+                RawrAutoCompactionBoundary::TopicShift => {
+                    last_agent_message.is_some_and(rawr_agent_message_looks_like_topic_shift)
+                }
+                RawrAutoCompactionBoundary::ConcludingThought => {
+                    last_agent_message.is_some_and(rawr_agent_message_looks_like_concluding_thought)
+                }
+                RawrAutoCompactionBoundary::TurnComplete => true,
+            }
+        });
 
-        let emergency_percent_remaining = settings
-            .prompt_frontmatter
-            .trigger
-            .emergency_percent_remaining_lt;
-        let is_emergency = percent_remaining < emergency_percent_remaining;
+        let is_emergency = tier == RawrAutoCompactionTier::Emergency;
 
         match settings.mode {
             RawrAutoCompactionMode::Tag => {
@@ -1735,12 +1832,12 @@ impl ChatWidget {
 
     fn rawr_capture_auto_compaction_trigger(
         &self,
-        trigger_percent_remaining: i64,
+        percent_remaining: i64,
         last_agent_message: Option<&str>,
         agent_done: bool,
     ) -> RawrAutoCompactionTriggerContext {
         RawrAutoCompactionTriggerContext {
-            trigger_percent_remaining,
+            trigger_percent_remaining: percent_remaining,
             saw_commit: self.rawr_saw_commit_this_turn,
             saw_plan_checkpoint: self.rawr_saw_plan_checkpoint_this_turn,
             saw_plan_update: self.saw_plan_update_this_turn,
@@ -2009,11 +2106,23 @@ impl ChatWidget {
                 settings.scratch_write_enabled = enabled;
             }
             if let Some(trigger) = config.trigger.as_ref() {
+                if let Some(early_percent_remaining_lt) = trigger.early_percent_remaining_lt {
+                    settings
+                        .prompt_frontmatter
+                        .trigger
+                        .early_percent_remaining_lt = Some(early_percent_remaining_lt);
+                }
                 if let Some(ready_percent_remaining_lt) = trigger.ready_percent_remaining_lt {
                     settings
                         .prompt_frontmatter
                         .trigger
                         .ready_percent_remaining_lt = Some(ready_percent_remaining_lt);
+                }
+                if let Some(asap_percent_remaining_lt) = trigger.asap_percent_remaining_lt {
+                    settings
+                        .prompt_frontmatter
+                        .trigger
+                        .asap_percent_remaining_lt = Some(asap_percent_remaining_lt);
                 }
                 if let Some(emergency_percent_remaining_lt) = trigger.emergency_percent_remaining_lt
                 {

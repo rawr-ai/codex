@@ -458,7 +458,6 @@ pub(crate) fn rawr_should_compact_mid_turn(
     let allowed = match tier {
         RawrAutoCompactionTier::Early => &[
             RawrAutoCompactionBoundary::PlanCheckpoint,
-            RawrAutoCompactionBoundary::PlanUpdate,
             RawrAutoCompactionBoundary::PrCheckpoint,
             RawrAutoCompactionBoundary::TopicShift,
         ][..],
@@ -487,14 +486,19 @@ pub(crate) fn rawr_should_compact_mid_turn(
         boundaries_required
     };
 
-    required.iter().any(|boundary| match boundary {
-        RawrAutoCompactionBoundary::Commit => signals.saw_commit,
-        RawrAutoCompactionBoundary::PlanCheckpoint => signals.saw_plan_checkpoint,
-        RawrAutoCompactionBoundary::PlanUpdate => signals.saw_plan_update,
-        RawrAutoCompactionBoundary::PrCheckpoint => signals.saw_pr_checkpoint,
-        RawrAutoCompactionBoundary::AgentDone => signals.saw_agent_done,
-        RawrAutoCompactionBoundary::TopicShift => signals.saw_topic_shift,
-        RawrAutoCompactionBoundary::ConcludingThought => signals.saw_concluding_thought,
-        RawrAutoCompactionBoundary::TurnComplete => false,
+    required.iter().any(|boundary| {
+        if !allowed.contains(boundary) {
+            return false;
+        }
+        match boundary {
+            RawrAutoCompactionBoundary::Commit => signals.saw_commit,
+            RawrAutoCompactionBoundary::PlanCheckpoint => signals.saw_plan_checkpoint,
+            RawrAutoCompactionBoundary::PlanUpdate => signals.saw_plan_update,
+            RawrAutoCompactionBoundary::PrCheckpoint => signals.saw_pr_checkpoint,
+            RawrAutoCompactionBoundary::AgentDone => signals.saw_agent_done,
+            RawrAutoCompactionBoundary::TopicShift => signals.saw_topic_shift,
+            RawrAutoCompactionBoundary::ConcludingThought => signals.saw_concluding_thought,
+            RawrAutoCompactionBoundary::TurnComplete => false,
+        }
     })
 }

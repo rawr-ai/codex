@@ -1992,6 +1992,20 @@ impl Session {
         self.send_token_count_event(turn_context).await;
     }
 
+    pub(crate) async fn update_token_usage_info_quiet(
+        &self,
+        turn_context: &TurnContext,
+        token_usage: Option<&TokenUsage>,
+    ) {
+        let mut state = self.state.lock().await;
+        if let Some(token_usage) = token_usage {
+            state.update_token_info_from_usage(
+                token_usage,
+                turn_context.client.get_model_context_window(),
+            );
+        }
+    }
+
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
         let Some(estimated_total_tokens) = self
             .clone_history()
@@ -2035,6 +2049,11 @@ impl Session {
             state.set_rate_limits(new_rate_limits);
         }
         self.send_token_count_event(turn_context).await;
+    }
+
+    pub(crate) async fn update_rate_limits_quiet(&self, new_rate_limits: RateLimitSnapshot) {
+        let mut state = self.state.lock().await;
+        state.set_rate_limits(new_rate_limits);
     }
 
     pub(crate) async fn mcp_dependency_prompted(&self) -> HashSet<String> {
@@ -2493,6 +2512,24 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::Compact => {
                 handlers::compact(&sess, sub.id.clone()).await;
             }
+            Op::RawrAutoCompactionJudgment {
+                tier,
+                percent_remaining,
+                boundaries_present,
+                last_agent_message,
+                decision_prompt_path,
+            } => {
+                handlers::rawr_auto_compaction_judgment(
+                    &sess,
+                    sub.id.clone(),
+                    tier,
+                    percent_remaining,
+                    boundaries_present,
+                    last_agent_message,
+                    decision_prompt_path,
+                )
+                .await;
+            }
             Op::ThreadRollback { num_turns } => {
                 handlers::thread_rollback(&sess, sub.id.clone(), num_turns).await;
             }
@@ -2552,6 +2589,7 @@ mod handlers {
     use codex_protocol::protocol::ListSkillsResponseEvent;
     use codex_protocol::protocol::McpServerRefreshConfig;
     use codex_protocol::protocol::Op;
+    use codex_protocol::protocol::RawrAutoCompactionJudgmentResultEvent;
     use codex_protocol::protocol::ReviewDecision;
     use codex_protocol::protocol::ReviewRequest;
     use codex_protocol::protocol::SkillsListEntry;
@@ -2573,6 +2611,8 @@ mod handlers {
     use std::sync::Arc;
     use tracing::info;
     use tracing::warn;
+
+    use crate::rawr_auto_compaction_judgment::request_rawr_auto_compaction_judgment;
 
     pub async fn interrupt(sess: &Arc<Session>) {
         sess.interrupt_task().await;
@@ -2807,6 +2847,47 @@ mod handlers {
             }
             other => sess.notify_approval(&id, other).await,
         }
+    }
+
+    pub async fn rawr_auto_compaction_judgment(
+        sess: &Arc<Session>,
+        sub_id: String,
+        tier: String,
+        percent_remaining: i64,
+        boundaries_present: Vec<String>,
+        last_agent_message: String,
+        decision_prompt_path: String,
+    ) {
+        let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
+        let result = match request_rawr_auto_compaction_judgment(
+            sess,
+            &turn_context,
+            &decision_prompt_path,
+            &tier,
+            percent_remaining,
+            &boundaries_present,
+            &last_agent_message,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => crate::rawr_auto_compaction_judgment::RawrAutoCompactionJudgment {
+                should_compact: true,
+                reason: format!("Failed to run RAWR judgment: {err}"),
+            },
+        };
+
+        sess.send_event_raw(Event {
+            id: sub_id,
+            msg: EventMsg::RawrAutoCompactionJudgmentResult(
+                RawrAutoCompactionJudgmentResultEvent {
+                    tier,
+                    should_compact: result.should_compact,
+                    reason: result.reason,
+                },
+            ),
+        })
+        .await;
     }
 
     pub async fn request_user_input_response(
@@ -3641,6 +3722,80 @@ pub(crate) async fn run_turn(
                                 == Some(
                                     crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency,
                                 );
+                            if let Some(tier) = tier {
+                                if tier
+                                    != crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency
+                                {
+                                    if let Some(decision_prompt_path) =
+                                        crate::rawr_auto_compaction::rawr_policy_decision_prompt_path(
+                                            config.as_ref(),
+                                            tier,
+                                        )
+                                    {
+                                        let tier_name = match tier {
+                                            crate::rawr_auto_compaction::RawrAutoCompactionTier::Early => {
+                                                "early"
+                                            }
+                                            crate::rawr_auto_compaction::RawrAutoCompactionTier::Ready => {
+                                                "ready"
+                                            }
+                                            crate::rawr_auto_compaction::RawrAutoCompactionTier::Asap => {
+                                                "asap"
+                                            }
+                                            crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency => {
+                                                unreachable!()
+                                            }
+                                        };
+
+                                        let mut boundaries_present: Vec<String> = Vec::new();
+                                        if signals.saw_commit {
+                                            boundaries_present.push("commit".to_string());
+                                        }
+                                        if signals.saw_plan_checkpoint {
+                                            boundaries_present.push("plan_checkpoint".to_string());
+                                        }
+                                        if signals.saw_plan_update {
+                                            boundaries_present.push("plan_update".to_string());
+                                        }
+                                        if signals.saw_pr_checkpoint {
+                                            boundaries_present.push("pr_checkpoint".to_string());
+                                        }
+                                        if signals.saw_agent_done {
+                                            boundaries_present.push("agent_done".to_string());
+                                        }
+                                        if signals.saw_topic_shift {
+                                            boundaries_present.push("topic_shift".to_string());
+                                        }
+                                        if signals.saw_concluding_thought {
+                                            boundaries_present.push("concluding".to_string());
+                                        }
+
+                                        let last_agent_message_for_judgment =
+                                            sampling_request_last_agent_message
+                                                .as_deref()
+                                                .unwrap_or("");
+                                        let judgment =
+                                            crate::rawr_auto_compaction_judgment::request_rawr_auto_compaction_judgment(
+                                                sess.as_ref(),
+                                                turn_context.as_ref(),
+                                                decision_prompt_path,
+                                                tier_name,
+                                                percent_remaining,
+                                                &boundaries_present,
+                                                last_agent_message_for_judgment,
+                                            )
+                                            .await;
+                                        let should_compact = judgment
+                                            .as_ref()
+                                            .map(|j| j.should_compact)
+                                            .unwrap_or(true);
+                                        if !should_compact {
+                                            rawr_mid_turn_state.record_compaction(total_usage_tokens);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
                             let scratch_write_enabled = config
                                 .rawr_auto_compaction
                                 .as_ref()

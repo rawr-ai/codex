@@ -51,6 +51,7 @@ mod permissions_messages;
 mod personality;
 mod prompt_caching;
 mod quota_exceeded;
+mod rawr_auto_compaction_judgment;
 mod read_file;
 mod remote_models;
 mod request_compression;

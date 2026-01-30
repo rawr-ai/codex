@@ -40,26 +40,31 @@ impl RawrAutoCompactionThresholds {
         };
 
         if let Some(policy) = rawr.policy.as_ref() {
+            let trigger = rawr.trigger.as_ref();
             return Self {
                 early_percent_remaining_lt: policy
                     .early
                     .as_ref()
                     .and_then(|tier| tier.percent_remaining_lt)
+                    .or_else(|| trigger.and_then(|trigger| trigger.early_percent_remaining_lt))
                     .unwrap_or(defaults.early_percent_remaining_lt),
                 ready_percent_remaining_lt: policy
                     .ready
                     .as_ref()
                     .and_then(|tier| tier.percent_remaining_lt)
+                    .or_else(|| trigger.and_then(|trigger| trigger.ready_percent_remaining_lt))
                     .unwrap_or(defaults.ready_percent_remaining_lt),
                 asap_percent_remaining_lt: policy
                     .asap
                     .as_ref()
                     .and_then(|tier| tier.percent_remaining_lt)
+                    .or_else(|| trigger.and_then(|trigger| trigger.asap_percent_remaining_lt))
                     .unwrap_or(defaults.asap_percent_remaining_lt),
                 emergency_percent_remaining_lt: policy
                     .emergency
                     .as_ref()
                     .and_then(|tier| tier.percent_remaining_lt)
+                    .or_else(|| trigger.and_then(|trigger| trigger.emergency_percent_remaining_lt))
                     .unwrap_or(defaults.emergency_percent_remaining_lt),
             };
         }
@@ -583,7 +588,7 @@ pub(crate) fn rawr_should_compact_mid_turn(
     true
 }
 
-fn rawr_policy_tier(
+pub(crate) fn rawr_policy_tier(
     config: &Config,
     tier: RawrAutoCompactionTier,
 ) -> Option<&RawrAutoCompactionPolicyTierToml> {
@@ -598,6 +603,13 @@ fn rawr_policy_tier(
         RawrAutoCompactionTier::Asap => policy.asap.as_ref(),
         RawrAutoCompactionTier::Emergency => policy.emergency.as_ref(),
     }
+}
+
+pub(crate) fn rawr_policy_decision_prompt_path(
+    config: &Config,
+    tier: RawrAutoCompactionTier,
+) -> Option<&str> {
+    rawr_policy_tier(config, tier).and_then(|tier| tier.decision_prompt_path.as_deref())
 }
 
 #[cfg(test)]

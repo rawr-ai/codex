@@ -79,6 +79,7 @@ use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::RateLimitSnapshot;
+use codex_core::protocol::RawrAutoCompactionJudgmentResultEvent;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::SkillMetadata as ProtocolSkillMetadata;
@@ -565,12 +566,17 @@ struct RawrAutoCompactionTriggerContext {
     scratch_file: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum RawrAutoCompactionState {
     Idle,
     AwaitingScratchWrite {
         trigger: RawrAutoCompactionTriggerContext,
         packet_author: RawrAutoCompactionPacketAuthor,
+    },
+    AwaitingJudgment {
+        trigger: RawrAutoCompactionTriggerContext,
+        settings: RawrAutoCompactionSettings,
+        should_defer_to_next_user_turn: bool,
     },
     AwaitingPacket {
         trigger: RawrAutoCompactionTriggerContext,
@@ -1496,6 +1502,19 @@ impl ChatWidget {
             RawrAutoCompactionState::Idle => {
                 self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
             }
+            RawrAutoCompactionState::AwaitingJudgment {
+                trigger,
+                settings,
+                should_defer_to_next_user_turn,
+            } => {
+                // Waiting on an internal judgment result event; do not re-evaluate until it arrives.
+                self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingJudgment {
+                    trigger,
+                    settings,
+                    should_defer_to_next_user_turn,
+                };
+                return;
+            }
             RawrAutoCompactionState::AwaitingScratchWrite {
                 trigger,
                 packet_author,
@@ -1699,6 +1718,74 @@ impl ChatWidget {
                     return;
                 }
 
+                if !is_emergency {
+                    let decision_prompt_path = policy_tier
+                        .and_then(|tier| tier.decision_prompt_path.as_deref())
+                        .map(str::to_string);
+                    if let Some(decision_prompt_path) = decision_prompt_path {
+                        let tier_name = match tier {
+                            RawrAutoCompactionTier::Early => "early",
+                            RawrAutoCompactionTier::Ready => "ready",
+                            RawrAutoCompactionTier::Asap => "asap",
+                            RawrAutoCompactionTier::Emergency => unreachable!(),
+                        };
+
+                        let should_defer_to_next_user_turn = settings.packet_author
+                            == RawrAutoCompactionPacketAuthor::Watcher
+                            && required_boundaries
+                                .contains(&RawrAutoCompactionBoundary::TurnComplete);
+
+                        let mut boundaries_present: Vec<String> = Vec::new();
+                        if self.rawr_saw_commit_this_turn {
+                            boundaries_present.push("commit".to_string());
+                        }
+                        if self.rawr_saw_pr_checkpoint_this_turn {
+                            boundaries_present.push("pr_checkpoint".to_string());
+                        }
+                        if self.rawr_saw_plan_checkpoint_this_turn {
+                            boundaries_present.push("plan_checkpoint".to_string());
+                        }
+                        if self.saw_plan_update_this_turn {
+                            boundaries_present.push("plan_update".to_string());
+                        }
+                        if agent_done {
+                            boundaries_present.push("agent_done".to_string());
+                        }
+                        if last_agent_message.is_some_and(rawr_agent_message_looks_like_topic_shift)
+                        {
+                            boundaries_present.push("topic_shift".to_string());
+                        }
+                        if last_agent_message
+                            .is_some_and(rawr_agent_message_looks_like_concluding_thought)
+                        {
+                            boundaries_present.push("concluding".to_string());
+                        }
+                        boundaries_present.push("turn_complete".to_string());
+
+                        let trigger = self.rawr_capture_auto_compaction_trigger(
+                            percent_remaining,
+                            last_agent_message,
+                            agent_done,
+                        );
+
+                        self.rawr_auto_compaction_state =
+                            RawrAutoCompactionState::AwaitingJudgment {
+                                trigger,
+                                settings: settings.clone(),
+                                should_defer_to_next_user_turn,
+                            };
+
+                        self.submit_op(Op::RawrAutoCompactionJudgment {
+                            tier: tier_name.to_string(),
+                            percent_remaining,
+                            boundaries_present,
+                            last_agent_message: last_agent_message.unwrap_or("").to_string(),
+                            decision_prompt_path,
+                        });
+                        return;
+                    }
+                }
+
                 match settings.packet_author {
                     RawrAutoCompactionPacketAuthor::Watcher => {
                         let mut trigger = self.rawr_capture_auto_compaction_trigger(
@@ -1814,6 +1901,43 @@ impl ChatWidget {
         }
         self.clear_token_usage();
         self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
+    }
+
+    fn rawr_on_auto_compaction_judgment_result(
+        &mut self,
+        ev: RawrAutoCompactionJudgmentResultEvent,
+    ) {
+        if !self.config.features.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+
+        let state = std::mem::replace(
+            &mut self.rawr_auto_compaction_state,
+            RawrAutoCompactionState::Idle,
+        );
+
+        let RawrAutoCompactionState::AwaitingJudgment {
+            trigger,
+            settings,
+            should_defer_to_next_user_turn,
+        } = state
+        else {
+            self.rawr_auto_compaction_state = state;
+            return;
+        };
+
+        if !ev.should_compact {
+            self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+            return;
+        }
+
+        if should_defer_to_next_user_turn && self.rawr_preflight_compaction_pending.is_none() {
+            self.rawr_preflight_compaction_pending = Some(trigger);
+            self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+            return;
+        }
+
+        self.rawr_begin_auto_compaction_from_trigger(trigger, settings);
     }
 
     fn rawr_on_context_compacted(&mut self) {
@@ -4556,6 +4680,9 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request, from_replay)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
+            EventMsg::RawrAutoCompactionJudgmentResult(ev) => {
+                self.rawr_on_auto_compaction_judgment_result(ev);
+            }
             EventMsg::ContextCompacted(_) => {
                 self.rawr_on_context_compacted();
                 self.on_agent_message("Context compacted".to_owned());
@@ -4706,6 +4833,7 @@ impl ChatWidget {
         if matches!(
             self.rawr_auto_compaction_state,
             RawrAutoCompactionState::AwaitingScratchWrite { .. }
+                | RawrAutoCompactionState::AwaitingJudgment { .. }
                 | RawrAutoCompactionState::AwaitingPacket { .. }
                 | RawrAutoCompactionState::Compacting {
                     saw_context_compacted: false,

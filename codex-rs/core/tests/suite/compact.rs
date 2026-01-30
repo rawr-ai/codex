@@ -7,6 +7,8 @@ use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::compaction_audit;
 use codex_core::config::Config;
 use codex_core::config::types::RawrAutoCompactionPacketAuthor;
+use codex_core::config::types::RawrAutoCompactionPolicyTierToml;
+use codex_core::config::types::RawrAutoCompactionPolicyToml;
 use codex_core::config::types::RawrAutoCompactionToml;
 use codex_core::config::types::RawrAutoCompactionTriggerToml;
 use codex_core::features::Feature;
@@ -2622,6 +2624,198 @@ async fn rawr_mid_turn_compaction_includes_scratch_prompt_and_handoff() {
         request_bodies[2].contains("Scratchpad: `.scratch/agent-")
             && request_bodies[2].contains("PACKET CONTENTS"),
         "expected scratch handoff prefix and packet contents"
+    );
+    assert_eq!(compact_mock.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rawr_mid_turn_compaction_judgment_veto_skips_packet_injection() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let sse1 = sse(vec![
+        ev_assistant_message("m1", "done"),
+        ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r1", 95),
+    ]);
+    let sse2 = sse(vec![
+        ev_assistant_message(
+            "m2",
+            r#"{"should_compact":false,"reason":"keep context together"}"#,
+        ),
+        ev_completed_with_tokens("r2", 5),
+    ]);
+    let sse3 = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_tokens("r3", 10),
+    ]);
+
+    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
+
+    let model_provider = openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(100);
+            config.model_auto_compact_token_limit = Some(10_000);
+            config.features.enable(Feature::RawrAutoCompaction);
+            config.features.enable(Feature::RemoteCompaction);
+            config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
+                packet_author: Some(RawrAutoCompactionPacketAuthor::Agent),
+                scratch_write_enabled: Some(false),
+                policy: Some(RawrAutoCompactionPolicyToml {
+                    asap: Some(RawrAutoCompactionPolicyTierToml {
+                        decision_prompt_path: Some("rawr/prompts/judgment.md".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                trigger: Some(RawrAutoCompactionTriggerToml {
+                    asap_percent_remaining_lt: Some(10),
+                    emergency_percent_remaining_lt: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        });
+    let test = builder.build(&server).await.unwrap();
+
+    let prompt_path = test.workspace_path("rawr/prompts/judgment.md");
+    std::fs::create_dir_all(prompt_path.parent().unwrap()).unwrap();
+    std::fs::write(&prompt_path, "Return only JSON.").unwrap();
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "rawr mid-turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&test.codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+
+    let request_bodies: Vec<String> = request_log
+        .requests()
+        .into_iter()
+        .map(|request| request.body_json().to_string())
+        .collect();
+    assert_eq!(request_bodies.len(), 3);
+    assert!(
+        body_contains_text(
+            &request_bodies[1],
+            "You are deciding whether to trigger RAWR auto-compaction right now."
+        ),
+        "expected internal judgment request after would-compact gating"
+    );
+    assert!(
+        !body_contains_text(&request_bodies[2], RAWR_PACKET_PROMPT_SNIPPET),
+        "did not expect packet prompt injection when judgment vetoes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rawr_mid_turn_compaction_judgment_approval_injects_packet() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let sse1 = sse(vec![
+        ev_assistant_message("m1", "done"),
+        ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r1", 95),
+    ]);
+    let sse2 = sse(vec![
+        ev_assistant_message("m2", r#"{"should_compact":true,"reason":"phase boundary"}"#),
+        ev_completed_with_tokens("r2", 5),
+    ]);
+    let sse3 = sse(vec![
+        ev_assistant_message("m3", "PACKET CONTENTS"),
+        ev_completed_with_tokens("r3", 10),
+    ]);
+    let sse4 = sse(vec![
+        ev_assistant_message("m4", FINAL_REPLY),
+        ev_completed_with_tokens("r4", 10),
+    ]);
+
+    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+
+    let compacted_history = vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "RAWr mid-turn compacted".to_string(),
+        }],
+        end_turn: None,
+    }];
+    let compact_mock =
+        mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
+
+    let model_provider = openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(100);
+            config.model_auto_compact_token_limit = Some(10_000);
+            config.features.enable(Feature::RawrAutoCompaction);
+            config.features.enable(Feature::RemoteCompaction);
+            config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
+                packet_author: Some(RawrAutoCompactionPacketAuthor::Agent),
+                scratch_write_enabled: Some(false),
+                policy: Some(RawrAutoCompactionPolicyToml {
+                    asap: Some(RawrAutoCompactionPolicyTierToml {
+                        decision_prompt_path: Some("rawr/prompts/judgment.md".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                trigger: Some(RawrAutoCompactionTriggerToml {
+                    asap_percent_remaining_lt: Some(10),
+                    emergency_percent_remaining_lt: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        });
+    let test = builder.build(&server).await.unwrap();
+
+    let prompt_path = test.workspace_path("rawr/prompts/judgment.md");
+    std::fs::create_dir_all(prompt_path.parent().unwrap()).unwrap();
+    std::fs::write(&prompt_path, "Return only JSON.").unwrap();
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "rawr mid-turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&test.codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+
+    let request_bodies: Vec<String> = request_log
+        .requests()
+        .into_iter()
+        .map(|request| request.body_json().to_string())
+        .collect();
+    assert_eq!(request_bodies.len(), 4);
+    assert!(
+        body_contains_text(&request_bodies[2], RAWR_PACKET_PROMPT_SNIPPET),
+        "expected mid-turn packet prompt injection after judgment approves"
+    );
+    assert!(
+        request_bodies[3].contains("PACKET CONTENTS"),
+        "expected post-compact handoff injection"
     );
     assert_eq!(compact_mock.requests().len(), 1);
 }

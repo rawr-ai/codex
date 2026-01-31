@@ -645,4 +645,56 @@ mod tests {
 
         assert_eq!(rawr_should_compact_mid_turn(&config, 85, &signals), true);
     }
+
+    #[test]
+    fn rawr_build_scratch_write_prompt_replaces_placeholder() {
+        let prompt = "Target file: {scratch_file}\nWrite stuff.";
+        assert_eq!(
+            rawr_build_scratch_write_prompt(prompt, ".scratch/agent-orion.scratch.md"),
+            "Target file: .scratch/agent-orion.scratch.md\nWrite stuff."
+        );
+    }
+
+    #[test]
+    fn rawr_build_scratch_write_prompt_appends_target_file_when_missing_placeholder() {
+        let prompt = "Write stuff.\n";
+        assert_eq!(
+            rawr_build_scratch_write_prompt(prompt, ".scratch/agent-orion.scratch.md"),
+            "Write stuff.\n\nTarget file: `.scratch/agent-orion.scratch.md`"
+        );
+    }
+
+    #[test]
+    fn rawr_build_agent_continuation_packet_prompt_includes_scratch_write_and_separator() {
+        let scratch_prompt = "Scratch write prompt.\nTarget: {scratch_file}";
+        let packet_prompt = "Continuation packet prompt.";
+        assert_eq!(
+            rawr_build_agent_continuation_packet_prompt(
+                packet_prompt,
+                scratch_prompt,
+                true,
+                Some(".scratch/agent-orion.scratch.md"),
+            ),
+            "Scratch write prompt.\nTarget: .scratch/agent-orion.scratch.md\n\n---\n\nContinuation packet prompt."
+        );
+    }
+
+    #[test]
+    fn rawr_should_schedule_scratch_write_requires_enabled_and_non_emergency() {
+        let mut signals = RawrAutoCompactionSignals::default();
+        signals.saw_commit = true;
+
+        assert_eq!(
+            rawr_should_schedule_scratch_write(true, false, &signals),
+            true
+        );
+        assert_eq!(
+            rawr_should_schedule_scratch_write(false, false, &signals),
+            false
+        );
+        assert_eq!(
+            rawr_should_schedule_scratch_write(true, true, &signals),
+            false
+        );
+    }
 }

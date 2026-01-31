@@ -832,17 +832,6 @@
       ],
       "type": "string"
     },
-    "RawrAutoCompactionPacketToml": {
-      "additionalProperties": false,
-      "properties": {
-        "max_tail_chars": {
-          "format": "uint",
-          "minimum": 0.0,
-          "type": "integer"
-        }
-      },
-      "type": "object"
-    },
     "RawrAutoCompactionPolicyTierToml": {
       "additionalProperties": false,
       "properties": {
@@ -871,7 +860,7 @@
     },
     "RawrAutoCompactionPolicyToml": {
       "additionalProperties": false,
-      "description": "Per-tier auto-compaction policy configuration.\n\nThis is the primary (preferred) way to configure RAWR auto-compaction. The legacy `rawr_auto_compaction.trigger.*` fields are still supported as a fallback.",
+      "description": "Per-tier auto-compaction policy configuration.\n\nThis is the primary way to configure RAWR auto-compaction.",
       "properties": {
         "asap": {
           "$ref": "#/definitions/RawrAutoCompactionPolicyTierToml"
@@ -914,16 +903,14 @@
         "mode": {
           "$ref": "#/definitions/RawrAutoCompactionMode"
         },
-        "packet": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/RawrAutoCompactionPacketToml"
-            }
-          ],
-          "default": null
-        },
         "packet_author": {
           "$ref": "#/definitions/RawrAutoCompactionPacketAuthor"
+        },
+        "packet_max_tail_chars": {
+          "description": "Max chars of tail context included in watcher-side packet prompts.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
         },
         "policy": {
           "allOf": [
@@ -944,45 +931,6 @@
         "scratch_write_enabled": {
           "description": "When enabled, the watcher may ask the in-session agent to write a scratchpad file before compaction so verbatim research notes/drafts survive history rewrite.",
           "type": "boolean"
-        },
-        "trigger": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/RawrAutoCompactionTriggerToml"
-            }
-          ],
-          "default": null
-        }
-      },
-      "type": "object"
-    },
-    "RawrAutoCompactionTriggerToml": {
-      "additionalProperties": false,
-      "properties": {
-        "asap_percent_remaining_lt": {
-          "description": "Asap threshold: compact at the next natural pause boundary.",
-          "format": "int64",
-          "type": "integer"
-        },
-        "auto_requires_any_boundary": {
-          "items": {
-            "$ref": "#/definitions/RawrAutoCompactionBoundary"
-          },
-          "type": "array"
-        },
-        "early_percent_remaining_lt": {
-          "description": "Early (opportunistic) threshold: only compact on big-ish step boundaries.",
-          "format": "int64",
-          "type": "integer"
-        },
-        "emergency_percent_remaining_lt": {
-          "format": "int64",
-          "type": "integer"
-        },
-        "ready_percent_remaining_lt": {
-          "description": "Ready threshold (default behavior).",
-          "format": "int64",
-          "type": "integer"
         }
       },
       "type": "object"

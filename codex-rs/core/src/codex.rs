@@ -3955,12 +3955,6 @@ pub(crate) async fn run_turn(
                                 }
                             })
                             .unwrap_or(i64::MAX);
-                        let boundaries_required = config
-                            .rawr_auto_compaction
-                            .as_ref()
-                            .and_then(|rawr| rawr.trigger.as_ref())
-                            .and_then(|trigger| trigger.auto_requires_any_boundary.as_deref())
-                            .unwrap_or(&[]);
                         let signals = sess
                             .rawr_auto_compaction_signals(turn_context.sub_id.as_str())
                             .await;
@@ -3987,7 +3981,6 @@ pub(crate) async fn run_turn(
                                 config.as_ref(),
                                 percent_remaining,
                                 &signals,
-                                boundaries_required,
                             )
                         {
                             let is_emergency = tier

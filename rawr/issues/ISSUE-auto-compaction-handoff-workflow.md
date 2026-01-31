@@ -122,12 +122,10 @@ These workflows are independent and can both fire over the lifetime of a thread.
    - `rawr_agent_message_looks_like_topic_shift`
    - `rawr_agent_message_looks_like_concluding_thought`
 4. If `needs_follow_up == true`, core computes `percent_remaining` based on context window vs total usage.
-5. Core reads `boundaries_required` from **config only**:
-   - `rawr_auto_compaction.trigger.auto_requires_any_boundary` (defaults to `[]`).
-6. Core reads the current per-turn boundary signals from the session (commit/plan/pr/etc).
-7. Core decides whether to compact mid-turn via `rawr_should_compact_mid_turn(config, percent_remaining, signals, boundaries_required)`:
-   - Uses **tiered thresholds** (Early/Ready/Asap/Emergency) from config.
-   - Uses tier-allowed boundary sets unless `auto_requires_any_boundary` is set; emergency bypasses boundary gating.
+5. Core reads the current per-turn boundary signals from the session (commit/plan/pr/etc).
+6. Core decides whether to compact mid-turn via `rawr_should_compact_mid_turn(config, percent_remaining, signals)`:
+   - Uses **tiered thresholds** (Early/Ready/Asap/Emergency) from `rawr_auto_compaction.policy.*` (or built-in defaults).
+   - Uses tier default boundary sets, overridden by `rawr_auto_compaction.policy.<tier>.requires_any_boundary` when set; emergency bypasses boundary gating.
 8. If it returns `true`:
    - Core sets a “next compaction trigger” audit marker (`CompactionTrigger::AutoWatcher{...}`).
    - Core runs compaction immediately and then continues the same user-turn sampling loop (`continue;`).
@@ -331,7 +329,7 @@ graph TD
    - `trigger_percent_remaining = ready_percent_remaining_lt OR 75`
 4. If `percent_remaining >= trigger_percent_remaining`, returns (no action).
 5. Computes “boundary present”:
-   - Uses `auto_requires_any_boundary` from prompt YAML frontmatter, overridden by config if set.
+   - Uses `auto_requires_any_boundary` from prompt YAML frontmatter, overridden by `rawr_auto_compaction.policy.<tier>.requires_any_boundary` when set.
    - Maps each boundary to a boolean (commit/pr_checkpoint/plan_checkpoint/plan_update/agent_done/topic_shift/concluding/turn_complete).
 6. Computes emergency:
    - `is_emergency = percent_remaining < emergency_percent_remaining_lt`

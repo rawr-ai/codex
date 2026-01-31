@@ -74,6 +74,7 @@ Config settings (explicit, recommended):
 mode = "auto" # tag | suggest | auto
 packet_author = "agent" # watcher | agent
 scratch_write_enabled = true
+packet_max_tail_chars = 1200
 # Defaults to "GPT-5.2 (high)" for watcher-triggered compactions:
 # gpt-5.2 + ReasoningEffort::High.
 # compaction_model = "gpt-5.2"
@@ -104,17 +105,6 @@ requires_any_boundary = ["commit", "plan_checkpoint", "plan_update", "pr_checkpo
 [rawr_auto_compaction.policy.emergency]
 percent_remaining_lt = 15
 # Emergency tier is a hard bypass; boundaries/judgment are ignored.
-
-# Legacy (still supported): trigger thresholds + packet settings.
-[rawr_auto_compaction.trigger]
-early_percent_remaining_lt = 85
-ready_percent_remaining_lt = 75
-asap_percent_remaining_lt = 65
-emergency_percent_remaining_lt = 15
-auto_requires_any_boundary = ["commit", "pr_checkpoint", "plan_checkpoint", "agent_done"]
-
-[rawr_auto_compaction.packet]
-max_tail_chars = 1200
 ```
 
 ## Packet prompt + defaults (auditable/editable)

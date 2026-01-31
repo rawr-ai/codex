@@ -39,54 +39,30 @@ impl RawrAutoCompactionThresholds {
             return defaults;
         };
 
-        if let Some(policy) = rawr.policy.as_ref() {
-            let trigger = rawr.trigger.as_ref();
-            return Self {
-                early_percent_remaining_lt: policy
-                    .early
-                    .as_ref()
-                    .and_then(|tier| tier.percent_remaining_lt)
-                    .or_else(|| trigger.and_then(|trigger| trigger.early_percent_remaining_lt))
-                    .unwrap_or(defaults.early_percent_remaining_lt),
-                ready_percent_remaining_lt: policy
-                    .ready
-                    .as_ref()
-                    .and_then(|tier| tier.percent_remaining_lt)
-                    .or_else(|| trigger.and_then(|trigger| trigger.ready_percent_remaining_lt))
-                    .unwrap_or(defaults.ready_percent_remaining_lt),
-                asap_percent_remaining_lt: policy
-                    .asap
-                    .as_ref()
-                    .and_then(|tier| tier.percent_remaining_lt)
-                    .or_else(|| trigger.and_then(|trigger| trigger.asap_percent_remaining_lt))
-                    .unwrap_or(defaults.asap_percent_remaining_lt),
-                emergency_percent_remaining_lt: policy
-                    .emergency
-                    .as_ref()
-                    .and_then(|tier| tier.percent_remaining_lt)
-                    .or_else(|| trigger.and_then(|trigger| trigger.emergency_percent_remaining_lt))
-                    .unwrap_or(defaults.emergency_percent_remaining_lt),
-            };
-        }
-
-        let Some(trigger) = rawr.trigger.as_ref() else {
+        let Some(policy) = rawr.policy.as_ref() else {
             return defaults;
         };
 
-        let ready = trigger
-            .ready_percent_remaining_lt
-            .unwrap_or(defaults.ready_percent_remaining_lt);
-
         Self {
-            early_percent_remaining_lt: trigger
-                .early_percent_remaining_lt
+            early_percent_remaining_lt: policy
+                .early
+                .as_ref()
+                .and_then(|tier| tier.percent_remaining_lt)
                 .unwrap_or(defaults.early_percent_remaining_lt),
-            ready_percent_remaining_lt: ready,
-            asap_percent_remaining_lt: trigger
-                .asap_percent_remaining_lt
+            ready_percent_remaining_lt: policy
+                .ready
+                .as_ref()
+                .and_then(|tier| tier.percent_remaining_lt)
+                .unwrap_or(defaults.ready_percent_remaining_lt),
+            asap_percent_remaining_lt: policy
+                .asap
+                .as_ref()
+                .and_then(|tier| tier.percent_remaining_lt)
                 .unwrap_or(defaults.asap_percent_remaining_lt),
-            emergency_percent_remaining_lt: trigger
-                .emergency_percent_remaining_lt
+            emergency_percent_remaining_lt: policy
+                .emergency
+                .as_ref()
+                .and_then(|tier| tier.percent_remaining_lt)
                 .unwrap_or(defaults.emergency_percent_remaining_lt),
         }
     }
@@ -468,7 +444,6 @@ pub(crate) fn rawr_should_compact_mid_turn(
     config: &Config,
     percent_remaining: i64,
     signals: &RawrAutoCompactionSignals,
-    boundaries_required: &[RawrAutoCompactionBoundary],
 ) -> bool {
     if !config.features.enabled(Feature::RawrAutoCompaction) {
         return false;
@@ -516,15 +491,7 @@ pub(crate) fn rawr_should_compact_mid_turn(
     let policy_tier = rawr_policy_tier(config, tier);
     let policy_boundaries = policy_tier.and_then(|tier| tier.requires_any_boundary.as_deref());
 
-    let allowed = policy_boundaries.unwrap_or(default_allowed);
-
-    let required = if policy_boundaries.is_some() {
-        allowed
-    } else if boundaries_required.is_empty() {
-        allowed
-    } else {
-        boundaries_required
-    };
+    let required = policy_boundaries.unwrap_or(default_allowed);
 
     let has_semantic_boundary =
         signals.saw_agent_done || signals.saw_topic_shift || signals.saw_concluding_thought;
@@ -539,9 +506,6 @@ pub(crate) fn rawr_should_compact_mid_turn(
     let mut satisfied_non_plan_boundary = false;
 
     for boundary in required {
-        if !allowed.contains(boundary) {
-            continue;
-        }
         let satisfied = match boundary {
             RawrAutoCompactionBoundary::Commit => signals.saw_commit,
             RawrAutoCompactionBoundary::PlanCheckpoint => signals.saw_plan_checkpoint,
@@ -615,7 +579,6 @@ mod tests {
     use super::*;
     use crate::config::types::RawrAutoCompactionPolicyToml;
     use crate::config::types::RawrAutoCompactionToml;
-    use crate::config::types::RawrAutoCompactionTriggerToml;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -636,15 +599,7 @@ mod tests {
         let mut signals = RawrAutoCompactionSignals::default();
         signals.saw_commit = true;
 
-        assert_eq!(
-            rawr_should_compact_mid_turn(
-                &config,
-                80,
-                &signals,
-                &[RawrAutoCompactionBoundary::Commit]
-            ),
-            false
-        );
+        assert_eq!(rawr_should_compact_mid_turn(&config, 80, &signals,), false);
     }
 
     #[test]
@@ -666,24 +621,14 @@ mod tests {
         let mut signals = RawrAutoCompactionSignals::default();
         signals.saw_plan_update = true;
 
-        assert_eq!(
-            rawr_should_compact_mid_turn(&config, 80, &signals, &[]),
-            true
-        );
+        assert_eq!(rawr_should_compact_mid_turn(&config, 80, &signals), true);
     }
 
     #[test]
-    fn rawr_policy_thresholds_override_trigger_thresholds() {
+    fn rawr_policy_thresholds_override_defaults() {
         let mut config = crate::config::test_config();
         config.features.enable(Feature::RawrAutoCompaction);
         config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
-            trigger: Some(RawrAutoCompactionTriggerToml {
-                early_percent_remaining_lt: Some(80),
-                ready_percent_remaining_lt: Some(60),
-                asap_percent_remaining_lt: Some(40),
-                emergency_percent_remaining_lt: Some(20),
-                ..Default::default()
-            }),
             policy: Some(RawrAutoCompactionPolicyToml {
                 early: Some(RawrAutoCompactionPolicyTierToml {
                     percent_remaining_lt: Some(90),
@@ -698,9 +643,6 @@ mod tests {
         let mut signals = RawrAutoCompactionSignals::default();
         signals.saw_commit = true;
 
-        assert_eq!(
-            rawr_should_compact_mid_turn(&config, 85, &signals, &[]),
-            true
-        );
+        assert_eq!(rawr_should_compact_mid_turn(&config, 85, &signals), true);
     }
 }

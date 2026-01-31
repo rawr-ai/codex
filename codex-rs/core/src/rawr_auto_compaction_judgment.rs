@@ -1,0 +1,258 @@
+use crate::client_common::Prompt;
+use crate::codex::Session;
+use crate::codex::TurnContext;
+use crate::error::CodexErr;
+use crate::error::Result;
+use crate::stream_events_utils::last_assistant_message_from_item;
+use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
+use futures::StreamExt;
+use serde::Deserialize;
+use serde_json::json;
+use std::path::Path;
+use std::path::PathBuf;
+use tokio::fs;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct RawrAutoCompactionJudgment {
+    pub should_compact: bool,
+    pub reason: String,
+}
+
+pub(crate) async fn request_rawr_auto_compaction_judgment(
+    sess: &Session,
+    turn_context: &TurnContext,
+    decision_prompt_path: &str,
+    tier: &str,
+    percent_remaining: i64,
+    boundaries_present: &[String],
+    last_agent_message: &str,
+) -> Result<RawrAutoCompactionJudgment> {
+    let prompt_path = resolve_prompt_path(&turn_context.cwd, decision_prompt_path);
+    let prompt_contents = fs::read_to_string(&prompt_path)
+        .await
+        .map_err(CodexErr::from)?;
+    let instructions = strip_yaml_frontmatter(&prompt_contents).trim().to_string();
+
+    let excerpt = build_recent_transcript_excerpt(sess, 12, 800).await;
+    let decision_ctx = build_decision_context(
+        tier,
+        percent_remaining,
+        boundaries_present,
+        last_agent_message,
+        &excerpt,
+    );
+
+    let prompt = Prompt {
+        input: vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText { text: decision_ctx }],
+            end_turn: None,
+        }],
+        tools: Vec::new(),
+        parallel_tool_calls: false,
+        base_instructions: BaseInstructions { text: instructions },
+        personality: None,
+        output_schema: Some(judgment_output_schema()),
+    };
+
+    drain_judgment_stream(sess, turn_context, &prompt).await
+}
+
+async fn drain_judgment_stream(
+    sess: &Session,
+    turn_context: &TurnContext,
+    prompt: &Prompt,
+) -> Result<RawrAutoCompactionJudgment> {
+    let mut client_session = turn_context.client.new_session();
+    let mut stream = client_session.stream(prompt).await?;
+
+    let mut last_message: Option<String> = None;
+
+    loop {
+        let Some(event) = stream.next().await else {
+            return Err(CodexErr::Stream(
+                "stream closed before response.completed".into(),
+                None,
+            ));
+        };
+        match event {
+            Ok(codex_api::common::ResponseEvent::OutputItemDone(item)) => {
+                if let Some(text) = last_assistant_message_from_item(&item) {
+                    last_message = Some(text);
+                }
+            }
+            Ok(codex_api::common::ResponseEvent::ServerReasoningIncluded(included)) => {
+                sess.set_server_reasoning_included(included).await;
+            }
+            Ok(codex_api::common::ResponseEvent::RateLimits(snapshot)) => {
+                sess.update_rate_limits_quiet(snapshot).await;
+            }
+            Ok(codex_api::common::ResponseEvent::Completed { token_usage, .. }) => {
+                sess.update_token_usage_info_quiet(turn_context, token_usage.as_ref())
+                    .await;
+                break;
+            }
+            Ok(_) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    let raw =
+        last_message.ok_or_else(|| CodexErr::Stream("missing assistant output".into(), None))?;
+    parse_judgment_from_text(&raw)
+}
+
+fn parse_judgment_from_text(text: &str) -> Result<RawrAutoCompactionJudgment> {
+    if let Ok(parsed) = serde_json::from_str::<RawrAutoCompactionJudgment>(text) {
+        return Ok(parsed);
+    }
+
+    let trimmed = text.trim();
+    let trimmed = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix("```").unwrap_or(trimmed).trim();
+    if let Ok(parsed) = serde_json::from_str::<RawrAutoCompactionJudgment>(trimmed) {
+        return Ok(parsed);
+    }
+
+    let Some(start) = trimmed.find('{') else {
+        return Err(CodexErr::Stream(
+            "judgment output was not JSON".into(),
+            None,
+        ));
+    };
+    let Some(end) = trimmed.rfind('}') else {
+        return Err(CodexErr::Stream(
+            "judgment output was not JSON".into(),
+            None,
+        ));
+    };
+    let candidate = &trimmed[start..=end];
+    serde_json::from_str::<RawrAutoCompactionJudgment>(candidate)
+        .map_err(|e| CodexErr::Stream(format!("failed to parse judgment JSON: {e}"), None))
+}
+
+fn judgment_output_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "should_compact": { "type": "boolean" },
+            "reason": { "type": "string" }
+        },
+        "required": ["should_compact", "reason"]
+    })
+}
+
+fn resolve_prompt_path(cwd: &Path, raw: &str) -> PathBuf {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    cwd.join(path)
+}
+
+fn strip_yaml_frontmatter(contents: &str) -> &str {
+    let mut iter = contents.split_inclusive('\n');
+    let Some(first_line) = iter.next() else {
+        return contents;
+    };
+    if first_line.trim_end_matches(['\r', '\n']) != "---" {
+        return contents;
+    }
+
+    let mut cursor = first_line.len();
+    for piece in iter {
+        let piece_start = cursor;
+        let line = piece.trim_end_matches(['\r', '\n']);
+        if line == "---" {
+            let body_start = piece_start.saturating_add(piece.len());
+            return contents.get(body_start..).unwrap_or("");
+        }
+        cursor = cursor.saturating_add(piece.len());
+    }
+
+    contents
+}
+
+fn build_decision_context(
+    tier: &str,
+    percent_remaining: i64,
+    boundaries_present: &[String],
+    last_agent_message: &str,
+    transcript_excerpt: &str,
+) -> String {
+    let boundaries_json = serde_json::to_string(boundaries_present).unwrap_or_else(|_| "[]".into());
+    let last_agent_message = last_agent_message.trim();
+    let transcript_excerpt = transcript_excerpt.trim();
+
+    format!(
+        concat!(
+            "You are deciding whether to trigger RAWR auto-compaction right now.\n",
+            "\n",
+            "Return JSON matching the schema.\n",
+            "\n",
+            "Context:\n",
+            "- tier: {tier}\n",
+            "- percent_remaining: {percent_remaining}\n",
+            "- boundaries_present: {boundaries_json}\n",
+            "\n",
+            "Last agent message (most recent):\n",
+            "{last_agent_message}\n",
+            "\n",
+            "Recent transcript excerpt (newest last):\n",
+            "{transcript_excerpt}\n",
+        ),
+        tier = tier,
+        percent_remaining = percent_remaining,
+        boundaries_json = boundaries_json,
+        last_agent_message = last_agent_message,
+        transcript_excerpt = transcript_excerpt,
+    )
+}
+
+async fn build_recent_transcript_excerpt(
+    sess: &Session,
+    max_messages: usize,
+    max_chars_per_message: usize,
+) -> String {
+    let history = sess.clone_history().await;
+    let mut out: Vec<String> = Vec::new();
+
+    for item in history.raw_items().iter().rev() {
+        if out.len() >= max_messages {
+            break;
+        }
+        let ResponseItem::Message { role, content, .. } = item else {
+            continue;
+        };
+
+        let Some(text) = content.iter().rev().find_map(|ci| match ci {
+            ContentItem::InputText { text } => Some(text.as_str()),
+            ContentItem::OutputText { text } => Some(text.as_str()),
+            _ => None,
+        }) else {
+            continue;
+        };
+
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        let mut snippet = text.to_string();
+        if snippet.len() > max_chars_per_message {
+            snippet.truncate(max_chars_per_message);
+            snippet.push('…');
+        }
+        out.push(format!("{role}: {snippet}"));
+    }
+
+    out.reverse();
+    out.join("\n")
+}

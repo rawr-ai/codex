@@ -241,6 +241,25 @@ pub enum Op {
         text: String,
     },
 
+    /// Internal RAWR auto-compaction judgment request.
+    ///
+    /// This is a fork-specific operation used by the TUI watcher to ask the core to run an
+    /// internal, non-transcript model call that returns a structured decision.
+    RawrAutoCompactionJudgment {
+        /// Correlates this request with its eventual result event.
+        request_id: String,
+        /// Tier name (`early`/`ready`/`asap`/`emergency`).
+        tier: String,
+        /// Percent of context window remaining (0..=100).
+        percent_remaining: i64,
+        /// Boundaries currently present (e.g., `plan_update`, `commit`).
+        boundaries_present: Vec<String>,
+        /// Most recent assistant message text (may be empty).
+        last_agent_message: String,
+        /// Path to the decision prompt file.
+        decision_prompt_path: String,
+    },
+
     /// Request a single history entry identified by `log_id` + `offset`.
     GetHistoryEntryRequest { offset: usize, log_id: u64 },
 
@@ -691,6 +710,9 @@ pub enum EventMsg {
     /// Conversation history was compacted (either automatically or manually).
     ContextCompacted(ContextCompactedEvent),
 
+    /// Result of an internal RAWR auto-compaction judgment request.
+    RawrAutoCompactionJudgmentResult(RawrAutoCompactionJudgmentResultEvent),
+
     /// Conversation history was rolled back by dropping the last N user turns.
     ThreadRolledBack(ThreadRolledBackEvent),
 
@@ -1084,6 +1106,16 @@ pub struct WarningEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ContextCompactedEvent;
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct RawrAutoCompactionJudgmentResultEvent {
+    /// Correlates this result event with the originating request.
+    pub request_id: String,
+    /// Tier name (`early`/`ready`/`asap`/`emergency`).
+    pub tier: String,
+    pub should_compact: bool,
+    pub reason: String,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TurnCompleteEvent {

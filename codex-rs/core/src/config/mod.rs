@@ -1999,6 +1999,70 @@ persistence = "none"
     }
 
     #[test]
+    fn test_rawr_auto_compaction_config_parses_packet_max_tail_chars_and_repo_observation() {
+        let cfg = r#"
+[features]
+rawr_auto_compaction = true
+
+[rawr_auto_compaction]
+mode = "auto"
+packet_author = "agent"
+scratch_write_enabled = true
+packet_max_tail_chars = 3200
+
+[rawr_auto_compaction.repo_observation]
+graphite_enabled = true
+graphite_max_chars = 4096
+"#;
+
+        let parsed: ConfigToml = toml::from_str(cfg).expect("TOML deserialization should succeed");
+        let rawr = parsed
+            .rawr_auto_compaction
+            .expect("rawr_auto_compaction should be present");
+
+        assert_eq!(rawr.scratch_write_enabled, Some(true));
+        assert_eq!(rawr.packet_max_tail_chars, Some(3200));
+
+        let repo_observation = rawr
+            .repo_observation
+            .expect("repo_observation should be present");
+        assert_eq!(repo_observation.graphite_enabled, Some(true));
+        assert_eq!(repo_observation.graphite_max_chars, Some(4096));
+    }
+
+    #[test]
+    fn test_rawr_auto_compaction_config_rejects_legacy_packet_table() {
+        let cfg = r#"
+[features]
+rawr_auto_compaction = true
+
+[rawr_auto_compaction]
+mode = "auto"
+
+[rawr_auto_compaction.packet]
+max_tail_tokens = 1200
+"#;
+
+        assert!(toml::from_str::<ConfigToml>(cfg).is_err());
+    }
+
+    #[test]
+    fn test_rawr_auto_compaction_config_rejects_legacy_trigger_table() {
+        let cfg = r#"
+[features]
+rawr_auto_compaction = true
+
+[rawr_auto_compaction]
+mode = "auto"
+
+[rawr_auto_compaction.trigger]
+percent_remaining_lt = 75
+"#;
+
+        assert!(toml::from_str::<ConfigToml>(cfg).is_err());
+    }
+
+    #[test]
     fn tui_config_missing_notifications_field_defaults_to_enabled() {
         let cfg = r#"
 [tui]

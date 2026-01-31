@@ -1,5 +1,4 @@
 use crate::config::Config;
-use crate::config::types::RawrAutoCompactionBoundary;
 use crate::rawr_auto_compaction::RawrAutoCompactionSignals;
 use crate::rawr_auto_compaction::RawrAutoCompactionThresholds;
 use crate::rawr_auto_compaction::rawr_pick_tier;
@@ -81,14 +80,7 @@ impl RawrArbiter {
             signals.saw_concluding_thought = turn_signals.saw_concluding_thought;
         }
 
-        let boundaries_required: &[RawrAutoCompactionBoundary] = config
-            .rawr_auto_compaction
-            .as_ref()
-            .and_then(|rawr| rawr.trigger.as_ref())
-            .and_then(|trigger| trigger.auto_requires_any_boundary.as_deref())
-            .unwrap_or(&[]);
-
-        if rawr_should_compact_mid_turn(config, percent_remaining, &signals, boundaries_required) {
+        if rawr_should_compact_mid_turn(config, percent_remaining, &signals) {
             decision.action = RawrDecisionAction::ConsiderCompaction;
             decision.reasons.push(RawrDecisionReason::EligibleByPolicy);
         } else {
@@ -148,14 +140,7 @@ impl RawrArbiter {
             .to_string(),
         );
 
-        let boundaries_required: &[RawrAutoCompactionBoundary] = config
-            .rawr_auto_compaction
-            .as_ref()
-            .and_then(|rawr| rawr.trigger.as_ref())
-            .and_then(|trigger| trigger.auto_requires_any_boundary.as_deref())
-            .unwrap_or(&[]);
-
-        if rawr_should_compact_mid_turn(config, percent_remaining, signals, boundaries_required) {
+        if rawr_should_compact_mid_turn(config, percent_remaining, signals) {
             decision.action = RawrDecisionAction::ConsiderCompaction;
             decision.reasons.push(RawrDecisionReason::EligibleByPolicy);
         } else {

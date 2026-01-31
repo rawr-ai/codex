@@ -698,6 +698,7 @@ pub enum RawrAutoCompactionBoundary {
 ///
 /// This is the primary way to configure RAWR auto-compaction.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct RawrAutoCompactionPolicyToml {
     pub early: Option<RawrAutoCompactionPolicyTierToml>,
@@ -707,6 +708,7 @@ pub struct RawrAutoCompactionPolicyToml {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct RawrAutoCompactionPolicyTierToml {
     /// Trigger threshold for this tier. When `percent_remaining < percent_remaining_lt`,
@@ -732,6 +734,7 @@ pub struct RawrAutoCompactionPolicyTierToml {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct RawrRepoObservationToml {
     /// When enabled, Codex will attempt to collect lightweight Graphite ("gt") context
@@ -742,6 +745,7 @@ pub struct RawrRepoObservationToml {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct RawrAutoCompactionToml {
     pub mode: Option<RawrAutoCompactionMode>,

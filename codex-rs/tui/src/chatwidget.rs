@@ -2516,42 +2516,7 @@ impl ChatWidget {
             if let Some(policy) = config.policy.as_ref() {
                 settings.policy = Some(policy.clone());
             }
-            if let Some(trigger) = config.trigger.as_ref() {
-                if let Some(early_percent_remaining_lt) = trigger.early_percent_remaining_lt {
-                    settings
-                        .prompt_frontmatter
-                        .trigger
-                        .early_percent_remaining_lt = Some(early_percent_remaining_lt);
-                }
-                if let Some(ready_percent_remaining_lt) = trigger.ready_percent_remaining_lt {
-                    settings
-                        .prompt_frontmatter
-                        .trigger
-                        .ready_percent_remaining_lt = Some(ready_percent_remaining_lt);
-                }
-                if let Some(asap_percent_remaining_lt) = trigger.asap_percent_remaining_lt {
-                    settings
-                        .prompt_frontmatter
-                        .trigger
-                        .asap_percent_remaining_lt = Some(asap_percent_remaining_lt);
-                }
-                if let Some(emergency_percent_remaining_lt) = trigger.emergency_percent_remaining_lt
-                {
-                    settings
-                        .prompt_frontmatter
-                        .trigger
-                        .emergency_percent_remaining_lt = emergency_percent_remaining_lt;
-                }
-                if let Some(boundaries) = trigger.auto_requires_any_boundary.as_ref() {
-                    settings
-                        .prompt_frontmatter
-                        .trigger
-                        .auto_requires_any_boundary = boundaries.clone();
-                }
-            }
-            if let Some(packet) = config.packet.as_ref()
-                && let Some(max_tail_chars) = packet.max_tail_chars
-            {
+            if let Some(max_tail_chars) = config.packet_max_tail_chars {
                 settings.prompt_frontmatter.packet.max_tail_chars = max_tail_chars;
             }
         }

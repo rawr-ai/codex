@@ -10,7 +10,6 @@ use codex_core::config::types::RawrAutoCompactionPacketAuthor;
 use codex_core::config::types::RawrAutoCompactionPolicyTierToml;
 use codex_core::config::types::RawrAutoCompactionPolicyToml;
 use codex_core::config::types::RawrAutoCompactionToml;
-use codex_core::config::types::RawrAutoCompactionTriggerToml;
 use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::CompactionPacketAuthor;
@@ -2399,8 +2398,11 @@ async fn rawr_mid_turn_compaction_injects_packet_and_handoff() {
             config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
                 packet_author: Some(RawrAutoCompactionPacketAuthor::Agent),
                 scratch_write_enabled: Some(false),
-                trigger: Some(RawrAutoCompactionTriggerToml {
-                    emergency_percent_remaining_lt: Some(100),
+                policy: Some(RawrAutoCompactionPolicyToml {
+                    emergency: Some(RawrAutoCompactionPolicyTierToml {
+                        percent_remaining_lt: Some(100),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2500,8 +2502,11 @@ async fn rawr_mid_turn_compaction_rearms_after_token_growth() {
         config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
             packet_author: Some(RawrAutoCompactionPacketAuthor::Agent),
             scratch_write_enabled: Some(false),
-            trigger: Some(RawrAutoCompactionTriggerToml {
-                emergency_percent_remaining_lt: Some(90),
+            policy: Some(RawrAutoCompactionPolicyToml {
+                emergency: Some(RawrAutoCompactionPolicyTierToml {
+                    percent_remaining_lt: Some(90),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2583,9 +2588,19 @@ async fn rawr_mid_turn_compaction_includes_scratch_prompt_and_handoff() {
             config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
                 packet_author: Some(RawrAutoCompactionPacketAuthor::Agent),
                 scratch_write_enabled: Some(true),
-                trigger: Some(RawrAutoCompactionTriggerToml {
-                    ready_percent_remaining_lt: Some(80),
-                    emergency_percent_remaining_lt: Some(5),
+                policy: Some(RawrAutoCompactionPolicyToml {
+                    ready: Some(RawrAutoCompactionPolicyTierToml {
+                        percent_remaining_lt: Some(80),
+                        ..Default::default()
+                    }),
+                    asap: Some(RawrAutoCompactionPolicyTierToml {
+                        percent_remaining_lt: Some(0),
+                        ..Default::default()
+                    }),
+                    emergency: Some(RawrAutoCompactionPolicyTierToml {
+                        percent_remaining_lt: Some(5),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2669,13 +2684,13 @@ async fn rawr_mid_turn_compaction_judgment_veto_skips_packet_injection() {
                 policy: Some(RawrAutoCompactionPolicyToml {
                     asap: Some(RawrAutoCompactionPolicyTierToml {
                         decision_prompt_path: Some("rawr/prompts/judgment.md".to_string()),
+                        percent_remaining_lt: Some(10),
                         ..Default::default()
                     }),
-                    ..Default::default()
-                }),
-                trigger: Some(RawrAutoCompactionTriggerToml {
-                    asap_percent_remaining_lt: Some(10),
-                    emergency_percent_remaining_lt: Some(0),
+                    emergency: Some(RawrAutoCompactionPolicyTierToml {
+                        percent_remaining_lt: Some(0),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2772,13 +2787,13 @@ async fn rawr_mid_turn_compaction_judgment_approval_injects_packet() {
                 policy: Some(RawrAutoCompactionPolicyToml {
                     asap: Some(RawrAutoCompactionPolicyTierToml {
                         decision_prompt_path: Some("rawr/prompts/judgment.md".to_string()),
+                        percent_remaining_lt: Some(10),
                         ..Default::default()
                     }),
-                    ..Default::default()
-                }),
-                trigger: Some(RawrAutoCompactionTriggerToml {
-                    asap_percent_remaining_lt: Some(10),
-                    emergency_percent_remaining_lt: Some(0),
+                    emergency: Some(RawrAutoCompactionPolicyTierToml {
+                        percent_remaining_lt: Some(0),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()

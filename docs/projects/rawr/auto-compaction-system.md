@@ -170,7 +170,7 @@ Both TUI watcher and core mid-turn use the same precedence:
    - it overrides that tier’s `percent_remaining_lt`, `requires_any_boundary`,
      `plan_boundaries_require_semantic_break`, and `decision_prompt_path`.
 2. If policy for a tier is not set:
-   - fallback to legacy trigger defaults (`rawr_auto_compaction.trigger.*`) and/or prompt frontmatter defaults.
+   - fallback to defaults (prompt frontmatter defaults in TUI, and built-in defaults in core).
 
 This lets you control “fires too often” primarily by adjusting config rather than code.
 
@@ -185,24 +185,6 @@ This lets you control “fires too often” primarily by adjusting config rather
 Core mid-turn RAWR compaction **does not consult `mode`**; it is gated by the feature flag and the
 mid-turn decision policy (tiers/boundaries/judgment). This is intentional: mid-turn exists to prevent
 context exhaustion while the agent still needs follow-up inside the sampling loop.
-
-### Legacy config blocks (still supported, but should be treated as legacy)
-
-These exist as fallback:
-
-```toml
-[rawr_auto_compaction.trigger]
-early_percent_remaining_lt = 85
-ready_percent_remaining_lt = 75
-asap_percent_remaining_lt = 65
-emergency_percent_remaining_lt = 15
-auto_requires_any_boundary = ["commit", "pr_checkpoint", "plan_checkpoint", "agent_done"]
-
-[rawr_auto_compaction.packet]
-max_tail_chars = 1200
-```
-
-They are still present in code to avoid breaking older configs/examples, but if you want “one truth”, use the `policy.*` blocks.
 
 ---
 

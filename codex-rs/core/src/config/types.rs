@@ -696,9 +696,9 @@ pub enum RawrAutoCompactionBoundary {
 
 /// Per-tier auto-compaction policy configuration.
 ///
-/// This is the primary (preferred) way to configure RAWR auto-compaction. The legacy
-/// `rawr_auto_compaction.trigger.*` fields are still supported as a fallback.
+/// This is the primary way to configure RAWR auto-compaction.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct RawrAutoCompactionPolicyToml {
     pub early: Option<RawrAutoCompactionPolicyTierToml>,
@@ -708,6 +708,7 @@ pub struct RawrAutoCompactionPolicyToml {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct RawrAutoCompactionPolicyTierToml {
     /// Trigger threshold for this tier. When `percent_remaining < percent_remaining_lt`,
@@ -733,25 +734,7 @@ pub struct RawrAutoCompactionPolicyTierToml {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct RawrAutoCompactionTriggerToml {
-    /// Early (opportunistic) threshold: only compact on big-ish step boundaries.
-    pub early_percent_remaining_lt: Option<i64>,
-    /// Ready threshold (default behavior).
-    pub ready_percent_remaining_lt: Option<i64>,
-    /// Asap threshold: compact at the next natural pause boundary.
-    pub asap_percent_remaining_lt: Option<i64>,
-    pub emergency_percent_remaining_lt: Option<i64>,
-    pub auto_requires_any_boundary: Option<Vec<RawrAutoCompactionBoundary>>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct RawrAutoCompactionPacketToml {
-    pub max_tail_chars: Option<usize>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct RawrRepoObservationToml {
     /// When enabled, Codex will attempt to collect lightweight Graphite ("gt") context
@@ -762,6 +745,7 @@ pub struct RawrRepoObservationToml {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct RawrAutoCompactionToml {
     pub mode: Option<RawrAutoCompactionMode>,
@@ -769,6 +753,8 @@ pub struct RawrAutoCompactionToml {
     /// When enabled, the watcher may ask the in-session agent to write a scratchpad file before
     /// compaction so verbatim research notes/drafts survive history rewrite.
     pub scratch_write_enabled: Option<bool>,
+    /// Max chars of tail context included in watcher-side packet prompts.
+    pub packet_max_tail_chars: Option<usize>,
     /// Optional model override used for compaction requests triggered by the watcher.
     pub compaction_model: Option<String>,
     /// Optional reasoning effort override used for watcher-triggered compactions.
@@ -777,10 +763,6 @@ pub struct RawrAutoCompactionToml {
     pub compaction_verbosity: Option<codex_protocol::config_types::Verbosity>,
     /// New, preferred policy configuration (per-tier thresholds + boundaries + optional judgement prompt).
     pub policy: Option<RawrAutoCompactionPolicyToml>,
-    #[serde(default)]
-    pub trigger: Option<RawrAutoCompactionTriggerToml>,
-    #[serde(default)]
-    pub packet: Option<RawrAutoCompactionPacketToml>,
     #[serde(default)]
     pub repo_observation: Option<RawrRepoObservationToml>,
 }

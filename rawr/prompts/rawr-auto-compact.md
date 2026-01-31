@@ -1,11 +1,20 @@
 ---
 version: 0
 trigger:
-  # Ready threshold: compact on common boundaries like commits.
+  # Early threshold: compact only on major boundaries (plan checkpoint, PR checkpoint, topic shift).
+  # Note: plan-based boundaries still require a semantic break (agent-done/topic-shift/concluding)
+  # in Early/Ready tiers so we don't compact mid-thought just because the plan tool ran.
+  early_percent_remaining_lt: 85
+  # Ready threshold: compact on common boundaries like commits or plan checkpoints, but still
+  # require a semantic break for plan-based boundaries.
   ready_percent_remaining_lt: 75
+  # ASAP threshold: compact on smaller boundaries like agent-done or concluding thoughts.
+  asap_percent_remaining_lt: 65
   # Safety valve: compact even without a “natural boundary” when remaining context drops below this.
   emergency_percent_remaining_lt: 15
-  # In `auto` mode, compact only when at least one boundary signal is present (unless emergency threshold triggers).
+  # In `auto` mode, compact only when at least one boundary signal is present
+  # (unless emergency threshold triggers). This list is intersected with the
+  # tier’s allowed boundaries.
   auto_requires_any_boundary:
     - commit
     - pr_checkpoint

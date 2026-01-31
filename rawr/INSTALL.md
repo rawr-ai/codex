@@ -79,7 +79,9 @@ packet_author = "agent" # watcher | agent
 # compaction_verbosity = "high"
 
 [rawr_auto_compaction.trigger]
+early_percent_remaining_lt = 85
 ready_percent_remaining_lt = 75
+asap_percent_remaining_lt = 65
 emergency_percent_remaining_lt = 15
 auto_requires_any_boundary = ["commit", "pr_checkpoint", "plan_checkpoint", "agent_done"]
 
@@ -87,8 +89,12 @@ auto_requires_any_boundary = ["commit", "pr_checkpoint", "plan_checkpoint", "age
 max_tail_chars = 1200
 ```
 
-## Heuristics prompt (auditable/editable)
-The prompt lives in-repo at `rawr/prompts/rawr-auto-compact.md` and is embedded into the binary at build time. The YAML frontmatter provides default thresholds/boundaries; the Markdown body is used as the prompt when `packet_author = "agent"`. Config overrides take precedence over frontmatter defaults.
+## Packet prompt + defaults (auditable/editable)
+The prompt lives in-repo at `rawr/prompts/rawr-auto-compact.md` and is embedded into the binary at build time.
+
+- YAML frontmatter: default thresholds/boundaries (config overrides win).
+- Markdown body: continuation packet prompt when `packet_author = "agent"`.
+- Compaction decision: code-driven tier policy + boundary gating; plan-based boundaries additionally require a semantic break (agent-done/topic-shift/concluding) in Early/Ready tiers so we don’t compact mid-thought just because the plan tool ran.
 
 ## Using with Happy Coder
 Happy Coder’s CLI supports `happy codex` (Codex mode). If your `PATH` resolves `codex` to this fork (e.g. via the symlink above), `happy codex` will launch the fork.

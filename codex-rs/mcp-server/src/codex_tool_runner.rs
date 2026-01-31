@@ -364,6 +364,7 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::CollabWaitingEnd(_)
                     | EventMsg::CollabCloseBegin(_)
                     | EventMsg::CollabCloseEnd(_)
+                    | EventMsg::RawrAutoCompactionJudgmentResult(_)
                     | EventMsg::DeprecationNotice(_) => {
                         // For now, we do not do anything extra for these
                         // events. Note that

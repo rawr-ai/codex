@@ -56,6 +56,7 @@ mcp-types = { workspace = true }
 pathdiff = { workspace = true }
 pulldown-cmark = { workspace = true }
 rand = { workspace = true }
+uuid = { workspace = true }
 ratatui = { workspace = true, features = [
     "scrolling-regions",
     "unstable-backend-writer",
@@ -127,4 +128,3 @@ pretty_assertions = { workspace = true }
 rand = { workspace = true }
 serial_test = { workspace = true }
 vt100 = { workspace = true }
-uuid = { workspace = true }

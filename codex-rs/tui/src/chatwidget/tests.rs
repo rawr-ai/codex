@@ -1311,7 +1311,10 @@ async fn rawr_auto_compaction_judgment_veto_prevents_compaction() {
     );
 
     let op = next_rawr_judgment_op(&mut op_rx);
-    let Op::RawrAutoCompactionJudgment { tier, .. } = op else {
+    let Op::RawrAutoCompactionJudgment {
+        request_id, tier, ..
+    } = op
+    else {
         panic!("expected Op::RawrAutoCompactionJudgment");
     };
     assert_eq!(tier, "early");
@@ -1320,6 +1323,7 @@ async fn rawr_auto_compaction_judgment_veto_prevents_compaction() {
         id: "rawr-judge".into(),
         msg: EventMsg::RawrAutoCompactionJudgmentResult(
             codex_core::protocol::RawrAutoCompactionJudgmentResultEvent {
+                request_id,
                 tier: "early".to_string(),
                 should_compact: false,
                 reason: "keep context together".to_string(),
@@ -1378,12 +1382,99 @@ async fn rawr_auto_compaction_judgment_approval_triggers_compaction() {
         chat.rawr_auto_compaction_state,
         RawrAutoCompactionState::AwaitingJudgment { .. }
     );
-    let _op = next_rawr_judgment_op(&mut op_rx);
+    let request_id = match next_rawr_judgment_op(&mut op_rx) {
+        Op::RawrAutoCompactionJudgment { request_id, .. } => request_id,
+        other => panic!("expected Op::RawrAutoCompactionJudgment, got {other:?}"),
+    };
 
     chat.handle_codex_event(Event {
         id: "rawr-judge".into(),
         msg: EventMsg::RawrAutoCompactionJudgmentResult(
             codex_core::protocol::RawrAutoCompactionJudgmentResultEvent {
+                request_id,
+                tier: "early".to_string(),
+                should_compact: true,
+                reason: "phase boundary".to_string(),
+            },
+        ),
+    });
+    assert_eq!(drain_for_compact(&mut rx), true);
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_judgment_ignores_mismatched_request_id() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.rawr_saw_pr_checkpoint_this_turn = true;
+    chat.set_token_info(Some(make_token_info(14_400, 20_000))); // 70% remaining
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .early_percent_remaining_lt = Some(80);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .ready_percent_remaining_lt = Some(60);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .asap_percent_remaining_lt = Some(40);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .emergency_percent_remaining_lt = 20;
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::PrCheckpoint];
+    settings.policy = Some(RawrAutoCompactionPolicyToml {
+        early: Some(RawrAutoCompactionPolicyTierToml {
+            decision_prompt_path: Some("rawr/prompts/rawr-auto-compaction-judgment.md".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings);
+    assert_eq!(drain_for_compact(&mut rx), false);
+    assert_matches!(
+        chat.rawr_auto_compaction_state,
+        RawrAutoCompactionState::AwaitingJudgment { .. }
+    );
+
+    let request_id = match next_rawr_judgment_op(&mut op_rx) {
+        Op::RawrAutoCompactionJudgment { request_id, .. } => request_id,
+        other => panic!("expected Op::RawrAutoCompactionJudgment, got {other:?}"),
+    };
+
+    chat.handle_codex_event(Event {
+        id: "rawr-judge-wrong".into(),
+        msg: EventMsg::RawrAutoCompactionJudgmentResult(
+            codex_core::protocol::RawrAutoCompactionJudgmentResultEvent {
+                request_id: "wrong".to_string(),
+                tier: "early".to_string(),
+                should_compact: true,
+                reason: "phase boundary".to_string(),
+            },
+        ),
+    });
+
+    assert_eq!(drain_for_compact(&mut rx), false);
+    assert_matches!(
+        chat.rawr_auto_compaction_state,
+        RawrAutoCompactionState::AwaitingJudgment { .. }
+    );
+
+    chat.handle_codex_event(Event {
+        id: "rawr-judge-right".into(),
+        msg: EventMsg::RawrAutoCompactionJudgmentResult(
+            codex_core::protocol::RawrAutoCompactionJudgmentResultEvent {
+                request_id,
                 tier: "early".to_string(),
                 should_compact: true,
                 reason: "phase boundary".to_string(),

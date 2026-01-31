@@ -246,6 +246,8 @@ pub enum Op {
     /// This is a fork-specific operation used by the TUI watcher to ask the core to run an
     /// internal, non-transcript model call that returns a structured decision.
     RawrAutoCompactionJudgment {
+        /// Correlates this request with its eventual result event.
+        request_id: String,
         /// Tier name (`early`/`ready`/`asap`/`emergency`).
         tier: String,
         /// Percent of context window remaining (0..=100).
@@ -1107,6 +1109,8 @@ pub struct ContextCompactedEvent;
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct RawrAutoCompactionJudgmentResultEvent {
+    /// Correlates this result event with the originating request.
+    pub request_id: String,
     /// Tier name (`early`/`ready`/`asap`/`emergency`).
     pub tier: String,
     pub should_compact: bool,

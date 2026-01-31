@@ -35,6 +35,7 @@ async fn rawr_auto_compaction_judgment_op_emits_result_without_transcript_events
 
     test.codex
         .submit(Op::RawrAutoCompactionJudgment {
+            request_id: "req-1".to_string(),
             tier: "asap".to_string(),
             percent_remaining: 12,
             boundaries_present: vec!["plan_update".to_string()],
@@ -53,6 +54,7 @@ async fn rawr_auto_compaction_judgment_op_emits_result_without_transcript_events
 
         match ev {
             EventMsg::RawrAutoCompactionJudgmentResult(result) => {
+                assert_eq!(result.request_id, "req-1");
                 assert_eq!(result.tier, "asap");
                 assert_eq!(result.should_compact, false);
                 assert_eq!(result.reason, "keep context together");

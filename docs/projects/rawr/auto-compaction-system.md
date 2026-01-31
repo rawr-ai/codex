@@ -143,6 +143,25 @@ percent_remaining_lt = 15
 # Emergency tier is a hard bypass; boundaries/judgment are ignored
 ```
 
+### Optional: structured state store + repo observation (fork-only, best-effort)
+
+When `Feature::RawrAutoCompaction` is enabled, core also writes a **side-channel** structured state store
+under `codex_home/rawr/auto_compaction/threads/<thread_id>/`:
+
+- `events.jsonl`: structured boundary events (turn start, plan update/checkpoint, commit, PR checkpoint, semantic boundaries, compaction completed), optionally including repo snapshots.
+- `decisions.jsonl`: shadow arbiter decisions derived from policy + state (record-only; not enforced yet). To avoid noise, decisions are only persisted when the system is under token-pressure (tier eligible) or after compaction completes.
+- `state.json`: latest snapshot (turn signals, last repo snapshot, last compaction, last decision).
+
+Note: token-pressure (mid-turn) shadow decisions are further deduped in-memory and only emitted when the tier escalates (e.g. `early` → `ready` → `asap` → `emergency`).
+
+Repo observation is lightweight and best-effort:
+
+```toml
+[rawr_auto_compaction.repo_observation]
+graphite_enabled = true
+graphite_max_chars = 4096
+```
+
 #### Policy precedence rules (critical)
 
 Both TUI watcher and core mid-turn use the same precedence:
@@ -583,8 +602,8 @@ before calling `run_rawr_auto_compact(...)` in the sampling loop.
 
 Defined in `codex-rs/protocol/src/protocol.rs`:
 
-- `Op::RawrAutoCompactionJudgment { tier, percent_remaining, boundaries_present, last_agent_message, decision_prompt_path }`
-- `EventMsg::RawrAutoCompactionJudgmentResult(RawrAutoCompactionJudgmentResultEvent { tier, should_compact, reason })`
+- `Op::RawrAutoCompactionJudgment { request_id, tier, percent_remaining, boundaries_present, last_agent_message, decision_prompt_path }`
+- `EventMsg::RawrAutoCompactionJudgmentResult(RawrAutoCompactionJudgmentResultEvent { request_id, tier, should_compact, reason })`
 
 ### Core implementation
 

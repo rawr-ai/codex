@@ -933,6 +933,14 @@
           ],
           "description": "New, preferred policy configuration (per-tier thresholds + boundaries + optional judgement prompt)."
         },
+        "repo_observation": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RawrRepoObservationToml"
+            }
+          ],
+          "default": null
+        },
         "scratch_write_enabled": {
           "description": "When enabled, the watcher may ask the in-session agent to write a scratchpad file before compaction so verbatim research notes/drafts survive history rewrite.",
           "type": "boolean"
@@ -974,6 +982,22 @@
         "ready_percent_remaining_lt": {
           "description": "Ready threshold (default behavior).",
           "format": "int64",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "RawrRepoObservationToml": {
+      "additionalProperties": false,
+      "properties": {
+        "graphite_enabled": {
+          "description": "When enabled, Codex will attempt to collect lightweight Graphite (\"gt\") context for RAWR structured state (best-effort; failures are ignored).",
+          "type": "boolean"
+        },
+        "graphite_max_chars": {
+          "description": "Max chars of `gt` output to persist per observation (to cap store growth).",
+          "format": "uint",
+          "minimum": 0.0,
           "type": "integer"
         }
       },

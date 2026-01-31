@@ -453,6 +453,9 @@ pub(crate) struct Session {
     pub(crate) services: SessionServices,
     next_internal_sub_id: AtomicU64,
     rawr_auto_compaction_signals: Mutex<RawrAutoCompactionSignals>,
+    rawr_boundary_event_seq: AtomicU64,
+    rawr_decision_seq: AtomicU64,
+    rawr_boundary_store_lock: Mutex<()>,
     auto_compaction_rearm: Mutex<AutoCompactionRearmState>,
 }
 
@@ -880,6 +883,9 @@ impl Session {
             services,
             next_internal_sub_id: AtomicU64::new(0),
             rawr_auto_compaction_signals: Mutex::new(RawrAutoCompactionSignals::default()),
+            rawr_boundary_event_seq: AtomicU64::new(0),
+            rawr_decision_seq: AtomicU64::new(0),
+            rawr_boundary_store_lock: Mutex::new(()),
             auto_compaction_rearm: Mutex::new(AutoCompactionRearmState::default()),
         });
 
@@ -965,7 +971,7 @@ impl Session {
         format!("auto-compact-{id}")
     }
 
-    async fn get_total_token_usage(&self) -> i64 {
+    pub(crate) async fn get_total_token_usage(&self) -> i64 {
         let state = self.state.lock().await;
         state.get_total_token_usage(state.server_reasoning_included())
     }
@@ -1800,8 +1806,151 @@ impl Session {
         if !self.enabled(Feature::RawrAutoCompaction) {
             return;
         }
-        let mut guard = self.rawr_auto_compaction_signals.lock().await;
-        guard.reset_for_turn(turn_id);
+        let turn_id_for_store = turn_id.clone();
+        {
+            let mut guard = self.rawr_auto_compaction_signals.lock().await;
+            guard.reset_for_turn(turn_id);
+        }
+        self.rawr_append_boundary_event(
+            turn_id_for_store.as_str(),
+            crate::rawr_structured_state::RawrBoundarySource::Core,
+            crate::rawr_structured_state::RawrBoundaryKind::TurnStarted,
+        )
+        .await;
+    }
+
+    async fn rawr_append_boundary_event(
+        &self,
+        turn_id: &str,
+        source: crate::rawr_structured_state::RawrBoundarySource,
+        kind: crate::rawr_structured_state::RawrBoundaryKind,
+    ) {
+        if !self.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+
+        let (codex_home, cwd, repo_observation_cfg, config) = {
+            let state = self.state.lock().await;
+            let config = &state.session_configuration.original_config_do_not_use;
+            let repo_observation_cfg = config
+                .rawr_auto_compaction
+                .as_ref()
+                .and_then(|rawr| rawr.repo_observation.as_ref())
+                .map(
+                    |obs| crate::rawr_structured_state::RawrRepoObservationConfig {
+                        graphite_enabled: obs.graphite_enabled.unwrap_or(false),
+                        graphite_max_chars: obs.graphite_max_chars.unwrap_or(4_096),
+                    },
+                )
+                .unwrap_or_default();
+            (
+                config.codex_home.clone(),
+                state.session_configuration.cwd.clone(),
+                repo_observation_cfg,
+                config.clone(),
+            )
+        };
+
+        let total_usage_tokens = self.get_total_token_usage().await;
+        let decision_seq = self.rawr_decision_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let seq = self.rawr_boundary_event_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let repo =
+            crate::rawr_structured_state::observe_repo_snapshot(&cwd, repo_observation_cfg, &kind)
+                .await;
+        let mut event = crate::rawr_structured_state::new_boundary_event(
+            self.conversation_id,
+            turn_id,
+            seq,
+            source,
+            kind,
+        );
+        event.repo = repo;
+
+        let _guard = self.rawr_boundary_store_lock.lock().await;
+        match crate::rawr_structured_state::append_boundary_event(&codex_home, &event).await {
+            Ok(mut state) => {
+                let decision = crate::rawr_arbiter::RawrArbiter::evaluate_boundary_event(
+                    &config,
+                    &state,
+                    &event,
+                    decision_seq,
+                    crate::rawr_arbiter::RawrTokenContext {
+                        total_usage_tokens,
+                        model_context_window: config.model_context_window,
+                    },
+                );
+                if crate::rawr_arbiter::should_persist_shadow_decision(&event.kind, &decision)
+                    && let Err(err) = crate::rawr_structured_state::append_compaction_decision(
+                        &codex_home,
+                        &decision,
+                        &mut state,
+                    )
+                    .await
+                {
+                    tracing::warn!("rawr decision store write failed: {err}");
+                }
+            }
+            Err(err) => {
+                tracing::warn!("rawr boundary store write failed: {err}");
+            }
+        }
+    }
+
+    pub(crate) async fn rawr_note_token_pressure_decision(
+        &self,
+        config: &crate::config::Config,
+        turn_id: &str,
+        percent_remaining: i64,
+        signals: &RawrAutoCompactionSignals,
+        total_usage_tokens: i64,
+        model_context_window: Option<i64>,
+    ) {
+        if !self.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+
+        let thresholds =
+            crate::rawr_auto_compaction::RawrAutoCompactionThresholds::from_config(config);
+        if crate::rawr_auto_compaction::rawr_pick_tier(thresholds, percent_remaining).is_none() {
+            return;
+        }
+
+        let codex_home = config.codex_home.clone();
+        let decision_seq = self.rawr_decision_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let decision = crate::rawr_arbiter::RawrArbiter::evaluate_token_pressure_mid_turn(
+            config,
+            self.conversation_id,
+            turn_id,
+            signals,
+            decision_seq,
+            crate::rawr_arbiter::RawrTokenContext {
+                total_usage_tokens,
+                model_context_window,
+            },
+        );
+
+        let _guard = self.rawr_boundary_store_lock.lock().await;
+        let mut state = match crate::rawr_structured_state::load_thread_state(
+            &codex_home,
+            self.conversation_id,
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::warn!("rawr decision store load failed: {err}");
+                return;
+            }
+        };
+        if let Err(err) = crate::rawr_structured_state::append_compaction_decision(
+            &codex_home,
+            &decision,
+            &mut state,
+        )
+        .await
+        {
+            tracing::warn!("rawr decision store write failed: {err}");
+        }
     }
 
     pub(crate) async fn rawr_note_exec_boundary(
@@ -1813,17 +1962,44 @@ impl Session {
         if !self.enabled(Feature::RawrAutoCompaction) {
             return;
         }
-        let mut guard = self.rawr_auto_compaction_signals.lock().await;
-        if !guard.is_active_turn(turn_id) {
-            return;
+        let mut saw_commit = false;
+        let mut saw_pr_checkpoint = false;
+        {
+            let mut guard = self.rawr_auto_compaction_signals.lock().await;
+            if !guard.is_active_turn(turn_id) {
+                return;
+            }
+            if exit_code == 0 {
+                if crate::rawr_auto_compaction::rawr_command_looks_like_git_commit(command)
+                    && !guard.saw_commit
+                {
+                    guard.saw_commit = true;
+                    saw_commit = true;
+                }
+                if crate::rawr_auto_compaction::rawr_command_looks_like_pr_checkpoint(command)
+                    && !guard.saw_pr_checkpoint
+                {
+                    guard.saw_pr_checkpoint = true;
+                    saw_pr_checkpoint = true;
+                }
+            }
         }
-        if exit_code == 0 {
-            if crate::rawr_auto_compaction::rawr_command_looks_like_git_commit(command) {
-                guard.saw_commit = true;
-            }
-            if crate::rawr_auto_compaction::rawr_command_looks_like_pr_checkpoint(command) {
-                guard.saw_pr_checkpoint = true;
-            }
+
+        if saw_commit {
+            self.rawr_append_boundary_event(
+                turn_id,
+                crate::rawr_structured_state::RawrBoundarySource::Tool,
+                crate::rawr_structured_state::RawrBoundaryKind::Commit,
+            )
+            .await;
+        }
+        if saw_pr_checkpoint {
+            self.rawr_append_boundary_event(
+                turn_id,
+                crate::rawr_structured_state::RawrBoundarySource::Tool,
+                crate::rawr_structured_state::RawrBoundaryKind::PrCheckpoint,
+            )
+            .await;
         }
     }
 
@@ -1835,14 +2011,24 @@ impl Session {
         if !self.enabled(Feature::RawrAutoCompaction) {
             return;
         }
-        let mut guard = self.rawr_auto_compaction_signals.lock().await;
-        if !guard.is_active_turn(turn_id) {
-            return;
+        let checkpoint = crate::rawr_auto_compaction::rawr_plan_update_is_checkpoint(update);
+        {
+            let mut guard = self.rawr_auto_compaction_signals.lock().await;
+            if !guard.is_active_turn(turn_id) {
+                return;
+            }
+            guard.saw_plan_update = true;
+            if checkpoint {
+                guard.saw_plan_checkpoint = true;
+            }
         }
-        guard.saw_plan_update = true;
-        if crate::rawr_auto_compaction::rawr_plan_update_is_checkpoint(update) {
-            guard.saw_plan_checkpoint = true;
-        }
+
+        self.rawr_append_boundary_event(
+            turn_id,
+            crate::rawr_structured_state::RawrBoundarySource::Tool,
+            crate::rawr_structured_state::RawrBoundaryKind::PlanUpdated { checkpoint },
+        )
+        .await;
     }
 
     pub(crate) async fn rawr_note_semantic_boundary(
@@ -1853,22 +2039,41 @@ impl Session {
         if !self.enabled(Feature::RawrAutoCompaction) {
             return;
         }
-        let mut guard = self.rawr_auto_compaction_signals.lock().await;
-        if !guard.is_active_turn(turn_id) {
-            return;
+        let mut events: Vec<crate::rawr_structured_state::RawrBoundaryKind> = Vec::new();
+        {
+            let mut guard = self.rawr_auto_compaction_signals.lock().await;
+            if !guard.is_active_turn(turn_id) {
+                return;
+            }
+            if crate::rawr_auto_compaction::rawr_agent_message_looks_done(last_agent_message)
+                && !guard.saw_agent_done
+            {
+                guard.saw_agent_done = true;
+                events.push(crate::rawr_structured_state::RawrBoundaryKind::AgentDone);
+            }
+            if crate::rawr_auto_compaction::rawr_agent_message_looks_like_topic_shift(
+                last_agent_message,
+            ) && !guard.saw_topic_shift
+            {
+                guard.saw_topic_shift = true;
+                events.push(crate::rawr_structured_state::RawrBoundaryKind::TopicShift);
+            }
+            if crate::rawr_auto_compaction::rawr_agent_message_looks_like_concluding_thought(
+                last_agent_message,
+            ) && !guard.saw_concluding_thought
+            {
+                guard.saw_concluding_thought = true;
+                events.push(crate::rawr_structured_state::RawrBoundaryKind::ConcludingThought);
+            }
         }
-        if crate::rawr_auto_compaction::rawr_agent_message_looks_done(last_agent_message) {
-            guard.saw_agent_done = true;
-        }
-        if crate::rawr_auto_compaction::rawr_agent_message_looks_like_topic_shift(
-            last_agent_message,
-        ) {
-            guard.saw_topic_shift = true;
-        }
-        if crate::rawr_auto_compaction::rawr_agent_message_looks_like_concluding_thought(
-            last_agent_message,
-        ) {
-            guard.saw_concluding_thought = true;
+
+        for event in events {
+            self.rawr_append_boundary_event(
+                turn_id,
+                crate::rawr_structured_state::RawrBoundarySource::Core,
+                event,
+            )
+            .await;
         }
     }
 
@@ -1882,6 +2087,25 @@ impl Session {
         } else {
             RawrAutoCompactionSignals::default()
         }
+    }
+
+    pub(crate) async fn rawr_note_compaction_completed(
+        &self,
+        turn_id: &str,
+        trigger: Option<codex_protocol::protocol::CompactionTrigger>,
+        total_tokens_before: i64,
+        total_tokens_after: i64,
+    ) {
+        self.rawr_append_boundary_event(
+            turn_id,
+            crate::rawr_structured_state::RawrBoundarySource::Compaction,
+            crate::rawr_structured_state::RawrBoundaryKind::CompactionCompleted {
+                trigger,
+                total_tokens_before,
+                total_tokens_after,
+            },
+        )
+        .await;
     }
 
     pub(crate) async fn auto_compaction_can_rearm(
@@ -2513,6 +2737,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 handlers::compact(&sess, sub.id.clone()).await;
             }
             Op::RawrAutoCompactionJudgment {
+                request_id,
                 tier,
                 percent_remaining,
                 boundaries_present,
@@ -2522,6 +2747,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 handlers::rawr_auto_compaction_judgment(
                     &sess,
                     sub.id.clone(),
+                    request_id,
                     tier,
                     percent_remaining,
                     boundaries_present,
@@ -2852,6 +3078,7 @@ mod handlers {
     pub async fn rawr_auto_compaction_judgment(
         sess: &Arc<Session>,
         sub_id: String,
+        request_id: String,
         tier: String,
         percent_remaining: i64,
         boundaries_present: Vec<String>,
@@ -2881,6 +3108,7 @@ mod handlers {
             id: sub_id,
             msg: EventMsg::RawrAutoCompactionJudgmentResult(
                 RawrAutoCompactionJudgmentResultEvent {
+                    request_id,
                     tier,
                     should_compact: result.should_compact,
                     reason: result.reason,
@@ -3352,6 +3580,7 @@ struct RawrMidTurnCompactionState {
     phase: RawrMidTurnCompactionPhase,
     pending_injection: Option<String>,
     last_compaction_total_tokens: Option<i64>,
+    last_shadow_token_pressure_tier: Option<crate::rawr_auto_compaction::RawrAutoCompactionTier>,
 }
 
 #[derive(Debug, Default)]
@@ -3377,6 +3606,7 @@ impl RawrMidTurnCompactionState {
             phase: RawrMidTurnCompactionPhase::Idle,
             pending_injection: None,
             last_compaction_total_tokens: None,
+            last_shadow_token_pressure_tier: None,
         }
     }
 
@@ -3423,6 +3653,37 @@ impl RawrMidTurnCompactionState {
         self.last_compaction_total_tokens
             .map(|last| total_usage_tokens.saturating_sub(last) >= min_tokens_since_compaction)
             .unwrap_or(true)
+    }
+
+    fn should_log_shadow_token_pressure(
+        &mut self,
+        tier: Option<crate::rawr_auto_compaction::RawrAutoCompactionTier>,
+    ) -> bool {
+        let Some(tier) = tier else {
+            return false;
+        };
+
+        let next_rank = rawr_tier_rank(tier);
+        let last_rank = self
+            .last_shadow_token_pressure_tier
+            .map(rawr_tier_rank)
+            .unwrap_or(0);
+
+        if self.last_shadow_token_pressure_tier.is_none() || next_rank > last_rank {
+            self.last_shadow_token_pressure_tier = Some(tier);
+            return true;
+        }
+
+        false
+    }
+}
+
+fn rawr_tier_rank(tier: crate::rawr_auto_compaction::RawrAutoCompactionTier) -> u8 {
+    match tier {
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Early => 1,
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Ready => 2,
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Asap => 3,
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency => 4,
     }
 }
 
@@ -3703,6 +3964,23 @@ pub(crate) async fn run_turn(
                         let signals = sess
                             .rawr_auto_compaction_signals(turn_context.sub_id.as_str())
                             .await;
+                        let tier = crate::rawr_auto_compaction::rawr_pick_tier(
+                            crate::rawr_auto_compaction::RawrAutoCompactionThresholds::from_config(
+                                config.as_ref(),
+                            ),
+                            percent_remaining,
+                        );
+                        if rawr_mid_turn_state.should_log_shadow_token_pressure(tier) {
+                            sess.rawr_note_token_pressure_decision(
+                                config.as_ref(),
+                                turn_context.sub_id.as_str(),
+                                percent_remaining,
+                                &signals,
+                                total_usage_tokens,
+                                turn_context.client.get_model_context_window(),
+                            )
+                            .await;
+                        }
                         if rawr_mid_turn_state
                             .can_rearm(total_usage_tokens, min_tokens_since_compaction)
                             && crate::rawr_auto_compaction::rawr_should_compact_mid_turn(
@@ -3712,21 +3990,14 @@ pub(crate) async fn run_turn(
                                 boundaries_required,
                             )
                         {
-                            let tier = crate::rawr_auto_compaction::rawr_pick_tier(
-                                crate::rawr_auto_compaction::RawrAutoCompactionThresholds::from_config(
-                                    config.as_ref(),
-                                ),
-                                percent_remaining,
-                            );
                             let is_emergency = tier
                                 == Some(
                                     crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency,
                                 );
-                            if let Some(tier) = tier {
-                                if tier
+                            if let Some(tier) = tier
+                                && tier
                                     != crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency
-                                {
-                                    if let Some(decision_prompt_path) =
+                                    && let Some(decision_prompt_path) =
                                         crate::rawr_auto_compaction::rawr_policy_decision_prompt_path(
                                             config.as_ref(),
                                             tier,
@@ -3794,8 +4065,6 @@ pub(crate) async fn run_turn(
                                             continue;
                                         }
                                     }
-                                }
-                            }
                             let scratch_write_enabled = config
                                 .rawr_auto_compaction
                                 .as_ref()
@@ -4579,6 +4848,56 @@ mod tests {
             }],
             end_turn: None,
         }
+    }
+
+    #[test]
+    fn rawr_mid_turn_shadow_token_pressure_dedupes_until_tier_escalates() {
+        let mut state = super::RawrMidTurnCompactionState::new();
+        use crate::rawr_auto_compaction::RawrAutoCompactionTier;
+
+        assert_eq!(state.should_log_shadow_token_pressure(None), false);
+
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Early)),
+            true
+        );
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Early)),
+            false
+        );
+
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Ready)),
+            true
+        );
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Ready)),
+            false
+        );
+
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Asap)),
+            true
+        );
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Asap)),
+            false
+        );
+
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Emergency)),
+            true
+        );
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Emergency)),
+            false
+        );
+
+        // De-escalation should not re-log.
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Asap)),
+            false
+        );
     }
 
     fn make_connector(id: &str, name: &str) -> AppInfo {
@@ -5411,6 +5730,9 @@ mod tests {
             services,
             next_internal_sub_id: AtomicU64::new(0),
             rawr_auto_compaction_signals: Mutex::new(RawrAutoCompactionSignals::default()),
+            rawr_boundary_event_seq: AtomicU64::new(0),
+            rawr_decision_seq: AtomicU64::new(0),
+            rawr_boundary_store_lock: Mutex::new(()),
             auto_compaction_rearm: Mutex::new(AutoCompactionRearmState::default()),
         };
 
@@ -5525,6 +5847,9 @@ mod tests {
             services,
             next_internal_sub_id: AtomicU64::new(0),
             rawr_auto_compaction_signals: Mutex::new(RawrAutoCompactionSignals::default()),
+            rawr_boundary_event_seq: AtomicU64::new(0),
+            rawr_decision_seq: AtomicU64::new(0),
+            rawr_boundary_store_lock: Mutex::new(()),
             auto_compaction_rearm: Mutex::new(AutoCompactionRearmState::default()),
         });
 

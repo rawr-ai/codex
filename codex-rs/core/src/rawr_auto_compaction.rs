@@ -364,12 +364,12 @@ pub(crate) fn rawr_scratch_file_rel_path(
 fn rawr_scratch_agent_name(session_source: &SessionSource, thread_id: &ThreadId) -> String {
     let name = rawr_agent_identity_from_session_source(session_source)
         .unwrap_or_else(|| rawr_random_agent_name(thread_id));
-    let name = if name.is_empty() {
+
+    if name.is_empty() {
         "codex".to_string()
     } else {
         name
-    };
-    name
+    }
 }
 
 fn rawr_agent_identity_from_session_source(source: &SessionSource) -> Option<String> {
@@ -520,12 +520,10 @@ pub(crate) fn rawr_should_compact_mid_turn(
 
     let required = if policy_boundaries.is_some() {
         allowed
+    } else if boundaries_required.is_empty() {
+        allowed
     } else {
-        if boundaries_required.is_empty() {
-            allowed
-        } else {
-            boundaries_required
-        }
+        boundaries_required
     };
 
     let has_semantic_boundary =

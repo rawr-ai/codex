@@ -219,6 +219,7 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use strum::IntoEnumIterator;
+use uuid::Uuid;
 
 const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it locally";
 const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
@@ -574,6 +575,7 @@ enum RawrAutoCompactionState {
         packet_author: RawrAutoCompactionPacketAuthor,
     },
     AwaitingJudgment {
+        request_id: String,
         trigger: RawrAutoCompactionTriggerContext,
         settings: RawrAutoCompactionSettings,
         should_defer_to_next_user_turn: bool,
@@ -757,10 +759,10 @@ fn rawr_allowed_boundaries_for_tier(
     }
 }
 
-fn rawr_policy_tier<'a>(
-    policy: Option<&'a RawrAutoCompactionPolicyToml>,
+fn rawr_policy_tier(
+    policy: Option<&RawrAutoCompactionPolicyToml>,
     tier: RawrAutoCompactionTier,
-) -> Option<&'a RawrAutoCompactionPolicyTierToml> {
+) -> Option<&RawrAutoCompactionPolicyTierToml> {
     let policy = policy?;
     match tier {
         RawrAutoCompactionTier::Early => policy.early.as_ref(),
@@ -1503,12 +1505,14 @@ impl ChatWidget {
                 self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
             }
             RawrAutoCompactionState::AwaitingJudgment {
+                request_id,
                 trigger,
                 settings,
                 should_defer_to_next_user_turn,
             } => {
                 // Waiting on an internal judgment result event; do not re-evaluate until it arrives.
                 self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingJudgment {
+                    request_id,
                     trigger,
                     settings,
                     should_defer_to_next_user_turn,
@@ -1680,14 +1684,11 @@ impl ChatWidget {
             true
         } else if !has_any_required_boundary {
             false
-        } else if requires_semantic_boundary_for_plan
-            && boundary_check.satisfied_plan_boundary
-            && !boundary_check.satisfied_non_plan_boundary
-            && !has_semantic_boundary
-        {
-            false
         } else {
-            true
+            !(requires_semantic_boundary_for_plan
+                && boundary_check.satisfied_plan_boundary
+                && !boundary_check.satisfied_non_plan_boundary
+                && !has_semantic_boundary)
         };
 
         match settings.mode {
@@ -1768,14 +1769,17 @@ impl ChatWidget {
                             agent_done,
                         );
 
+                        let request_id = Uuid::new_v4().to_string();
                         self.rawr_auto_compaction_state =
                             RawrAutoCompactionState::AwaitingJudgment {
+                                request_id: request_id.clone(),
                                 trigger,
                                 settings: settings.clone(),
                                 should_defer_to_next_user_turn,
                             };
 
                         self.submit_op(Op::RawrAutoCompactionJudgment {
+                            request_id,
                             tier: tier_name.to_string(),
                             percent_remaining,
                             boundaries_present,
@@ -1917,6 +1921,7 @@ impl ChatWidget {
         );
 
         let RawrAutoCompactionState::AwaitingJudgment {
+            request_id,
             trigger,
             settings,
             should_defer_to_next_user_turn,
@@ -1925,6 +1930,16 @@ impl ChatWidget {
             self.rawr_auto_compaction_state = state;
             return;
         };
+
+        if ev.request_id != request_id {
+            self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingJudgment {
+                request_id,
+                trigger,
+                settings,
+                should_defer_to_next_user_turn,
+            };
+            return;
+        }
 
         if !ev.should_compact {
             self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
@@ -4402,14 +4417,13 @@ impl ChatWidget {
             .rawr_post_compact_handoff_pending
             .as_ref()
             .is_some_and(|_| !user_message.text.trim_start().starts_with('!'))
+            && let Some(handoff) = self.rawr_post_compact_handoff_pending.take()
         {
-            if let Some(handoff) = self.rawr_post_compact_handoff_pending.take() {
-                user_message.text = format!(
-                    "{handoff}\n\n---\n\n{original}",
-                    original = user_message.text
-                );
-                user_message.text_elements.clear();
-            }
+            user_message.text = format!(
+                "{handoff}\n\n---\n\n{original}",
+                original = user_message.text
+            );
+            user_message.text_elements.clear();
         }
 
         let UserMessage {

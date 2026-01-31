@@ -134,7 +134,7 @@ fn parse_judgment_from_text(text: &str) -> Result<RawrAutoCompactionJudgment> {
     };
     let candidate = &trimmed[start..=end];
     serde_json::from_str::<RawrAutoCompactionJudgment>(candidate)
-        .map_err(|e| CodexErr::Stream(format!("failed to parse judgment JSON: {e}").into(), None))
+        .map_err(|e| CodexErr::Stream(format!("failed to parse judgment JSON: {e}"), None))
 }
 
 fn judgment_output_schema() -> serde_json::Value {
@@ -248,7 +248,7 @@ async fn build_recent_transcript_excerpt(
         let mut snippet = text.to_string();
         if snippet.len() > max_chars_per_message {
             snippet.truncate(max_chars_per_message);
-            snippet.push_str("…");
+            snippet.push('…');
         }
         out.push(format!("{role}: {snippet}"));
     }

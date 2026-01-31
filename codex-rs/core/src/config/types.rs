@@ -753,6 +753,16 @@ pub struct RawrAutoCompactionPacketToml {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
+pub struct RawrRepoObservationToml {
+    /// When enabled, Codex will attempt to collect lightweight Graphite ("gt") context
+    /// for RAWR structured state (best-effort; failures are ignored).
+    pub graphite_enabled: Option<bool>,
+    /// Max chars of `gt` output to persist per observation (to cap store growth).
+    pub graphite_max_chars: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct RawrAutoCompactionToml {
     pub mode: Option<RawrAutoCompactionMode>,
     pub packet_author: Option<RawrAutoCompactionPacketAuthor>,
@@ -771,6 +781,8 @@ pub struct RawrAutoCompactionToml {
     pub trigger: Option<RawrAutoCompactionTriggerToml>,
     #[serde(default)]
     pub packet: Option<RawrAutoCompactionPacketToml>,
+    #[serde(default)]
+    pub repo_observation: Option<RawrRepoObservationToml>,
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::config::types::RawrAutoCompactionBoundary;
 use crate::config::types::RawrAutoCompactionPolicyTierToml;
 use crate::features::Feature;
+use crate::rawr_prompts;
 use codex_protocol::ThreadId;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
@@ -9,6 +10,7 @@ use codex_protocol::protocol::SessionSource;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawrAutoCompactionTier {
@@ -96,16 +98,6 @@ impl RawrAutoCompactionSignals {
         self.active_turn_id.as_deref() == Some(turn_id)
     }
 }
-
-const RAWR_AUTO_COMPACT_PROMPT_TEMPLATE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../rawr/prompts/rawr-auto-compact.md"
-));
-
-const RAWR_SCRATCH_WRITE_PROMPT_TEMPLATE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../rawr/prompts/rawr-scratch-write.md"
-));
 
 const RAWR_SCRATCH_FALLBACK_AGENT_NAMES: [&str; 24] = [
     "Aria", "Atlas", "Beau", "Cleo", "Ezra", "Jade", "Juno", "Luna", "Milo", "Nova", "Orion",
@@ -245,8 +237,10 @@ pub(crate) fn rawr_pick_tier(
     None
 }
 
-pub(crate) fn rawr_load_agent_packet_prompt() -> String {
-    let (frontmatter, body) = split_yaml_frontmatter(RAWR_AUTO_COMPACT_PROMPT_TEMPLATE);
+pub(crate) fn rawr_load_agent_packet_prompt(codex_home: &Path) -> String {
+    let prompt =
+        rawr_prompts::read_prompt_or_default(codex_home, rawr_prompts::RawrPromptKind::AutoCompact);
+    let (frontmatter, body) = split_yaml_frontmatter(&prompt);
     let prompt = body.trim();
     if !prompt.is_empty() {
         return prompt.to_string();
@@ -260,20 +254,29 @@ pub(crate) fn rawr_load_agent_packet_prompt() -> String {
     default_rawr_agent_packet_prompt()
 }
 
-pub(crate) fn rawr_load_scratch_write_prompt() -> String {
-    let prompt = RAWR_SCRATCH_WRITE_PROMPT_TEMPLATE.trim();
+pub(crate) fn rawr_load_scratch_write_prompt(codex_home: &Path) -> String {
+    let prompt = rawr_prompts::read_prompt_or_default(
+        codex_home,
+        rawr_prompts::RawrPromptKind::ScratchWrite,
+    );
+    let prompt = prompt.trim();
     if !prompt.is_empty() {
         return prompt.to_string();
     }
     default_rawr_scratch_write_prompt()
 }
 
-pub(crate) fn rawr_build_scratch_write_prompt(prompt: &str, scratch_file: &str) -> String {
-    if prompt.contains("{scratch_file}") {
-        prompt.replace("{scratch_file}", scratch_file)
+pub(crate) fn rawr_build_scratch_write_prompt(
+    prompt: &str,
+    scratch_file: &str,
+    thread_id: Option<ThreadId>,
+) -> String {
+    let expanded = rawr_expand_prompt_template(prompt, Some(scratch_file), thread_id);
+    if prompt.contains("{scratch_file}") || prompt.contains("{scratchFile}") {
+        expanded
     } else {
-        let prompt = prompt.trim_end();
-        format!("{prompt}\n\nTarget file: `{scratch_file}`")
+        let expanded = expanded.trim_end();
+        format!("{expanded}\n\nTarget file: `{scratch_file}`")
     }
 }
 
@@ -282,25 +285,25 @@ pub(crate) fn rawr_build_agent_continuation_packet_prompt(
     scratch_prompt: &str,
     do_scratch: bool,
     scratch_file: Option<&str>,
+    thread_id: Option<ThreadId>,
 ) -> String {
     if !do_scratch {
         if let Some(scratch_file) = scratch_file {
-            let packet_prompt = packet_prompt.trim();
+            let packet_prompt =
+                rawr_expand_prompt_template(packet_prompt, Some(scratch_file), thread_id);
             return format!("Scratchpad: `{scratch_file}`\n\n{packet_prompt}");
         }
-        return packet_prompt.trim().to_string();
+        return rawr_expand_prompt_template(packet_prompt, None, thread_id);
     }
 
     let scratch_prompt = if let Some(scratch_file) = scratch_file {
-        rawr_build_scratch_write_prompt(scratch_prompt, scratch_file)
+        rawr_build_scratch_write_prompt(scratch_prompt, scratch_file, thread_id)
     } else {
-        scratch_prompt.to_string()
+        rawr_expand_prompt_template(scratch_prompt, None, thread_id)
     };
 
-    format!(
-        "{scratch_prompt}\n\n---\n\n{packet_prompt}",
-        packet_prompt = packet_prompt.trim()
-    )
+    let packet_prompt = rawr_expand_prompt_template(packet_prompt, scratch_file, thread_id);
+    format!("{scratch_prompt}\n\n---\n\n{packet_prompt}",)
 }
 
 pub(crate) fn rawr_build_post_compact_handoff_message(
@@ -327,6 +330,23 @@ pub(crate) fn rawr_should_schedule_scratch_write(
         || signals.saw_plan_update
         || signals.saw_pr_checkpoint
         || signals.saw_agent_done
+}
+
+fn rawr_expand_prompt_template(
+    prompt: &str,
+    scratch_file: Option<&str>,
+    thread_id: Option<ThreadId>,
+) -> String {
+    let mut values = Vec::new();
+    if let Some(scratch_file) = scratch_file {
+        values.push(("scratchFile", scratch_file.to_string()));
+        values.push(("scratch_file", scratch_file.to_string()));
+    }
+    if let Some(thread_id) = thread_id {
+        values.push(("threadId", thread_id.to_string()));
+    }
+    let expanded = rawr_prompts::expand_placeholders(prompt, &values);
+    expanded.trim().to_string()
 }
 
 pub(crate) fn rawr_scratch_file_rel_path(
@@ -650,7 +670,16 @@ mod tests {
     fn rawr_build_scratch_write_prompt_replaces_placeholder() {
         let prompt = "Target file: {scratch_file}\nWrite stuff.";
         assert_eq!(
-            rawr_build_scratch_write_prompt(prompt, ".scratch/agent-orion.scratch.md"),
+            rawr_build_scratch_write_prompt(prompt, ".scratch/agent-orion.scratch.md", None),
+            "Target file: .scratch/agent-orion.scratch.md\nWrite stuff."
+        );
+    }
+
+    #[test]
+    fn rawr_build_scratch_write_prompt_replaces_camelcase_placeholder() {
+        let prompt = "Target file: {scratchFile}\nWrite stuff.";
+        assert_eq!(
+            rawr_build_scratch_write_prompt(prompt, ".scratch/agent-orion.scratch.md", None),
             "Target file: .scratch/agent-orion.scratch.md\nWrite stuff."
         );
     }
@@ -659,7 +688,7 @@ mod tests {
     fn rawr_build_scratch_write_prompt_appends_target_file_when_missing_placeholder() {
         let prompt = "Write stuff.\n";
         assert_eq!(
-            rawr_build_scratch_write_prompt(prompt, ".scratch/agent-orion.scratch.md"),
+            rawr_build_scratch_write_prompt(prompt, ".scratch/agent-orion.scratch.md", None),
             "Write stuff.\n\nTarget file: `.scratch/agent-orion.scratch.md`"
         );
     }
@@ -674,6 +703,7 @@ mod tests {
                 scratch_prompt,
                 true,
                 Some(".scratch/agent-orion.scratch.md"),
+                None,
             ),
             "Scratch write prompt.\nTarget: .scratch/agent-orion.scratch.md\n\n---\n\nContinuation packet prompt."
         );

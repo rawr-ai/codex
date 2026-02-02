@@ -2337,7 +2337,7 @@ impl ChatWidget {
                     settings.agent_packet_prompt.trim(),
                     Some(scratch_file),
                 );
-                return format!("Scratchpad: `{scratch_file}`\n\n{}", packet_prompt);
+                return format!("Scratchpad: `{scratch_file}`\n\n{packet_prompt}");
             }
             return self.rawr_expand_prompt_template(settings.agent_packet_prompt.trim(), None);
         }

@@ -744,4 +744,61 @@ mod tests {
             Some([RawrDecisionReason::EligibleByPolicy].as_slice())
         );
     }
+
+    #[tokio::test]
+    async fn observe_repo_snapshot_includes_graphite_when_enabled_and_gt_available() {
+        if std::process::Command::new("gt")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let tmp = TempDir::new().expect("tempdir");
+
+        fn run(dir: &std::path::Path, args: &[&str]) {
+            let status = std::process::Command::new(args[0])
+                .args(&args[1..])
+                .current_dir(dir)
+                .status()
+                .expect("spawn");
+            assert!(status.success(), "command failed: {args:?}");
+        }
+
+        tokio::fs::write(tmp.path().join("README.md"), "hello\n")
+            .await
+            .expect("write");
+
+        run(tmp.path(), &["git", "init"]);
+        run(tmp.path(), &["git", "add", "."]);
+        run(
+            tmp.path(),
+            &[
+                "git",
+                "-c",
+                "user.name=rawr",
+                "-c",
+                "user.email=rawr@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+
+        let snapshot = observe_repo_snapshot(
+            tmp.path(),
+            RawrRepoObservationConfig {
+                graphite_enabled: true,
+                graphite_max_chars: 1024,
+            },
+            &RawrBoundaryKind::TurnStarted,
+        )
+        .await
+        .expect("snapshot");
+
+        let graphite = snapshot.graphite.expect("graphite snapshot");
+        assert_eq!(graphite.enabled, true);
+        assert!(graphite.status.is_some() || graphite.error.is_some());
+    }
 }

@@ -3,6 +3,7 @@ use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::error::CodexErr;
 use crate::error::Result;
+use crate::rawr_prompts;
 use crate::stream_events_utils::last_assistant_message_from_item;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -29,19 +30,32 @@ pub(crate) async fn request_rawr_auto_compaction_judgment(
     boundaries_present: &[String],
     last_agent_message: &str,
 ) -> Result<RawrAutoCompactionJudgment> {
-    let prompt_path = resolve_prompt_path(&turn_context.cwd, decision_prompt_path);
+    let codex_home = turn_context.client.config().codex_home.clone();
+    if let Err(err) = rawr_prompts::ensure_rawr_prompt_files(&codex_home) {
+        tracing::warn!("failed to ensure rawr prompt directory: {err}");
+    }
+
+    let prompt_path = resolve_prompt_path(&turn_context.cwd, &codex_home, decision_prompt_path);
     let prompt_contents = fs::read_to_string(&prompt_path)
         .await
         .map_err(CodexErr::from)?;
     let instructions = strip_yaml_frontmatter(&prompt_contents).trim().to_string();
 
     let excerpt = build_recent_transcript_excerpt(sess, 12, 800).await;
-    let decision_ctx = build_decision_context(
+    let decision_ctx = build_decision_context_from_template(
+        &rawr_prompts::read_prompt_or_default(
+            &codex_home,
+            rawr_prompts::RawrPromptKind::JudgmentContext,
+        ),
         tier,
         percent_remaining,
         boundaries_present,
         last_agent_message,
         &excerpt,
+        sess.conversation_id,
+        &turn_context.sub_id,
+        sess.get_total_token_usage().await,
+        turn_context.client.get_model_context_window(),
     );
 
     let prompt = Prompt {
@@ -149,10 +163,15 @@ fn judgment_output_schema() -> serde_json::Value {
     })
 }
 
-fn resolve_prompt_path(cwd: &Path, raw: &str) -> PathBuf {
+fn resolve_prompt_path(cwd: &Path, codex_home: &Path, raw: &str) -> PathBuf {
     let path = Path::new(raw);
     if path.is_absolute() {
         return path.to_path_buf();
+    }
+    let prompt_dir = rawr_prompts::rawr_prompt_dir(codex_home);
+    let candidate = prompt_dir.join(path);
+    if candidate.exists() {
+        return candidate;
     }
     cwd.join(path)
 }
@@ -180,40 +199,37 @@ fn strip_yaml_frontmatter(contents: &str) -> &str {
     contents
 }
 
-fn build_decision_context(
+fn build_decision_context_from_template(
+    template: &str,
     tier: &str,
     percent_remaining: i64,
     boundaries_present: &[String],
     last_agent_message: &str,
     transcript_excerpt: &str,
+    thread_id: codex_protocol::ThreadId,
+    turn_id: &str,
+    total_usage_tokens: i64,
+    model_context_window: Option<i64>,
 ) -> String {
     let boundaries_json = serde_json::to_string(boundaries_present).unwrap_or_else(|_| "[]".into());
     let last_agent_message = last_agent_message.trim();
     let transcript_excerpt = transcript_excerpt.trim();
+    let model_context_window = model_context_window
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let values = [
+        ("tier", tier.to_string()),
+        ("percentRemaining", percent_remaining.to_string()),
+        ("boundariesJson", boundaries_json),
+        ("lastAgentMessage", last_agent_message.to_string()),
+        ("transcriptExcerpt", transcript_excerpt.to_string()),
+        ("threadId", thread_id.to_string()),
+        ("turnId", turn_id.to_string()),
+        ("totalUsageTokens", total_usage_tokens.to_string()),
+        ("modelContextWindow", model_context_window),
+    ];
 
-    format!(
-        concat!(
-            "You are deciding whether to trigger RAWR auto-compaction right now.\n",
-            "\n",
-            "Return JSON matching the schema.\n",
-            "\n",
-            "Context:\n",
-            "- tier: {tier}\n",
-            "- percent_remaining: {percent_remaining}\n",
-            "- boundaries_present: {boundaries_json}\n",
-            "\n",
-            "Last agent message (most recent):\n",
-            "{last_agent_message}\n",
-            "\n",
-            "Recent transcript excerpt (newest last):\n",
-            "{transcript_excerpt}\n",
-        ),
-        tier = tier,
-        percent_remaining = percent_remaining,
-        boundaries_json = boundaries_json,
-        last_agent_message = last_agent_message,
-        transcript_excerpt = transcript_excerpt,
-    )
+    rawr_prompts::expand_placeholders(template, &values)
 }
 
 async fn build_recent_transcript_excerpt(

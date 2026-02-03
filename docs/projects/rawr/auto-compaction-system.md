@@ -126,13 +126,13 @@ scratch_write_enabled = true
 percent_remaining_lt = 85
 requires_any_boundary = ["plan_checkpoint", "plan_update", "pr_checkpoint", "topic_shift"]
 plan_boundaries_require_semantic_break = true
-decision_prompt_path = "/Users/mateicanavra/.codex-rawr/prompts/rawr-auto-compaction-judgment.md"
+decision_prompt_path = "judgment.md" # resolved relative to codex_home/auto-compact
 
 [rawr_auto_compaction.policy.ready]
 percent_remaining_lt = 75
 requires_any_boundary = ["commit", "plan_checkpoint", "plan_update", "pr_checkpoint", "topic_shift"]
 plan_boundaries_require_semantic_break = true
-decision_prompt_path = "/Users/mateicanavra/.codex-rawr/prompts/rawr-auto-compaction-judgment.md"
+decision_prompt_path = "judgment.md" # resolved relative to codex_home/auto-compact
 
 [rawr_auto_compaction.policy.asap]
 percent_remaining_lt = 65
@@ -190,27 +190,42 @@ context exhaustion while the agent still needs follow-up inside the sampling loo
 
 ## 4) Prompt inventory (all prompts and “prompt-y” fallbacks)
 
-### Curated prompt files (in-repo)
+### Curated prompt files (codex_home/auto-compact)
+
+All RAWR auto-compaction prompts live under **codex_home/auto-compact/** at runtime. If the files
+do not exist, Codex seeds them from the in-repo defaults under `rawr/prompts/` so you can edit
+them without code changes.
 
 | Prompt file | Used by | When used | How used |
 |---|---|---|---|
-| `rawr/prompts/rawr-auto-compact.md` | Core + TUI | Pre-compact request: continuation packet | Core: embedded via `include_str!` template and loaded by `rawr_load_agent_packet_prompt()` in `codex-rs/core/src/rawr_auto_compaction.rs`.<br/>TUI: loaded into `RawrAutoCompactionSettings.agent_packet_prompt` and injected as a synthetic user turn when `packet_author="agent"`. |
-| `rawr/prompts/rawr-scratch-write.md` | Core + TUI | Pre-compact request: scratch write | Template with `{scratch_file}`. Injected as a synthetic user turn (TUI watcher) or prepended before packet prompt (core mid-turn, and TUI when `packet_author="agent"`). |
-| `rawr/prompts/rawr-auto-compaction-judgment.md` | Core (executed), TUI (requests) | Optional decision step before compaction | Core reads the file (absolute or relative to `cwd`) and uses it as **base instructions** for a schema-constrained internal model call. TUI triggers this via `Op::RawrAutoCompactionJudgment` and awaits `EventMsg::RawrAutoCompactionJudgmentResult`. |
+| `codex_home/auto-compact/auto-compact.md` | Core + TUI | Pre-compact request: continuation packet | YAML frontmatter drives thresholds + packet rules; body becomes the packet prompt (supports `{scratchFile}` / `{scratch_file}` and `{threadId}`). |
+| `codex_home/auto-compact/scratch-write.md` | Core + TUI | Pre-compact request: scratch write | Template with `{scratchFile}` / `{scratch_file}` and `{threadId}`. Injected as a synthetic user turn (TUI watcher) or prepended before packet prompt (core mid-turn, and TUI when `packet_author="agent"`). |
+| `codex_home/auto-compact/judgment.md` | Core (executed), TUI (requests) | Optional decision step before compaction | Base instructions for the schema-constrained internal judgment call. TUI triggers via `Op::RawrAutoCompactionJudgment`, core emits `EventMsg::RawrAutoCompactionJudgmentResult`. |
+| `codex_home/auto-compact/judgment-context.md` | Core | Decision context template | Human-editable template expanded with runtime placeholders (see below). |
 | `rawr/prompts/rawr-auto-compact-heads-up.md` | Currently unused (spec only) | Proposed UX: heads-up before packet/compact | Exists as an artifact for a future “heads-up banner” UX. Not referenced by current code paths. |
 
-### Inline “prompt-y” fallbacks (not curated, but important)
+### Inline fallbacks (only if prompt files cannot be read)
 
-These are used if prompt files are empty/missing or when we need minimum viable behavior:
+If the prompt directory is missing or unreadable, defaults embedded in the binary are used (and a
+warning is logged):
 
-- Core fallback packet prompt:
-  - `default_rawr_agent_packet_prompt()` in `codex-rs/core/src/rawr_auto_compaction.rs`
-- Core fallback scratch prompt:
-  - `default_rawr_scratch_write_prompt()` in `codex-rs/core/src/rawr_auto_compaction.rs`
-- Judgment “decision context” message:
-  - constructed in code: `build_decision_context(...)` in `codex-rs/core/src/rawr_auto_compaction_judgment.rs`
-- Watcher-authored packet (when `packet_author="watcher"`):
-  - built in code: `ChatWidget::rawr_build_post_compact_packet(...)` in `codex-rs/tui/src/chatwidget.rs`
+- Defaults are embedded from `rawr/prompts/*` via `codex_core::rawr_prompts`.
+- Watcher-authored packet (when `packet_author="watcher"`) is still built in code:
+  - `ChatWidget::rawr_build_post_compact_packet(...)` in `codex-rs/tui/src/chatwidget.rs`
+
+### Judgment context placeholders (judgment-context.md)
+
+Available placeholders (expanded at runtime):
+
+- `{tier}`
+- `{percentRemaining}`
+- `{boundariesJson}`
+- `{lastAgentMessage}`
+- `{transcriptExcerpt}`
+- `{threadId}`
+- `{turnId}`
+- `{totalUsageTokens}`
+- `{modelContextWindow}`
 
 ### Prompts used by compaction itself (upstream / Codex-native)
 

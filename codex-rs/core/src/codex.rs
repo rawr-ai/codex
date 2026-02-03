@@ -2090,6 +2090,15 @@ impl Session {
         .await;
     }
 
+    async fn rawr_emit_visibility_event(&self, turn_id: &str, message: String) {
+        let event = EventMsg::BackgroundEvent(BackgroundEventEvent { message });
+        self.send_event_raw(Event {
+            id: turn_id.to_string(),
+            msg: event,
+        })
+        .await;
+    }
+
     async fn rawr_append_boundary_event(
         &self,
         turn_id: &str,
@@ -2136,6 +2145,9 @@ impl Session {
             kind,
         );
         event.repo = repo;
+        let status_message = rawr_boundary_status_message(&event);
+        self.rawr_emit_visibility_event(turn_id, status_message)
+            .await;
 
         let _guard = self.rawr_boundary_store_lock.lock().await;
         match crate::rawr_structured_state::append_boundary_event(&codex_home, &event).await {
@@ -2199,6 +2211,9 @@ impl Session {
                 model_context_window,
             },
         );
+        let status_message = rawr_decision_status_message(&decision);
+        self.rawr_emit_visibility_event(turn_id, status_message)
+            .await;
 
         let _guard = self.rawr_boundary_store_lock.lock().await;
         let mut state = match crate::rawr_structured_state::load_thread_state(
@@ -3411,6 +3426,16 @@ mod handlers {
         last_agent_message: String,
         decision_prompt_path: String,
     ) {
+        let boundaries_json =
+            serde_json::to_string(&boundaries_present).unwrap_or_else(|_| "[]".to_string());
+        sess.rawr_emit_visibility_event(
+            sub_id.as_str(),
+            format!(
+                "RAWR judgment: start\nrequest_id={request_id}, tier={tier}, percent_remaining={percent_remaining}, boundaries={boundaries_json}"
+            ),
+        )
+        .await;
+
         let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
         let result = match request_rawr_auto_compaction_judgment(
             sess,
@@ -3429,6 +3454,15 @@ mod handlers {
                 reason: format!("Failed to run RAWR judgment: {err}"),
             },
         };
+
+        sess.rawr_emit_visibility_event(
+            sub_id.as_str(),
+            format!(
+                "RAWR judgment: result\nrequest_id={request_id}, should_compact={}, reason={}",
+                result.should_compact, result.reason
+            ),
+        )
+        .await;
 
         sess.send_event_raw(Event {
             id: sub_id,
@@ -4595,14 +4629,19 @@ pub(crate) async fn run_turn(
                                 None
                             };
                             let packet_prompt =
-                                crate::rawr_auto_compaction::rawr_load_agent_packet_prompt();
+                                crate::rawr_auto_compaction::rawr_load_agent_packet_prompt(
+                                    &config.codex_home,
+                                );
                             let scratch_prompt =
-                                crate::rawr_auto_compaction::rawr_load_scratch_write_prompt();
+                                crate::rawr_auto_compaction::rawr_load_scratch_write_prompt(
+                                    &config.codex_home,
+                                );
                             let prompt = crate::rawr_auto_compaction::rawr_build_agent_continuation_packet_prompt(
                                 packet_prompt.as_str(),
                                 scratch_prompt.as_str(),
                                 do_scratch,
                                 scratch_file.as_deref(),
+                                Some(sess.conversation_id),
                             );
                             let trigger = RawrMidTurnTriggerContext {
                                 trigger_percent_remaining: percent_remaining,
@@ -5723,6 +5762,150 @@ async fn try_run_sampling_request(
     }
 
     outcome
+}
+
+fn rawr_boundary_status_message(event: &crate::rawr_structured_state::RawrBoundaryEvent) -> String {
+    let header = format!("RAWR boundary: {}", rawr_boundary_kind_label(&event.kind));
+    let mut details = Vec::new();
+    details.push(format!(
+        "source={}",
+        rawr_boundary_source_label(event.source)
+    ));
+    details.push(format!("turn_id={}", event.turn_id));
+    details.push(format!("seq={}", event.seq));
+
+    match &event.kind {
+        crate::rawr_structured_state::RawrBoundaryKind::TurnStarted => {}
+        crate::rawr_structured_state::RawrBoundaryKind::PlanUpdated { checkpoint } => {
+            details.push(format!("checkpoint={checkpoint}"));
+        }
+        crate::rawr_structured_state::RawrBoundaryKind::Commit => {}
+        crate::rawr_structured_state::RawrBoundaryKind::PrCheckpoint => {}
+        crate::rawr_structured_state::RawrBoundaryKind::AgentDone => {}
+        crate::rawr_structured_state::RawrBoundaryKind::TopicShift => {}
+        crate::rawr_structured_state::RawrBoundaryKind::ConcludingThought => {}
+        crate::rawr_structured_state::RawrBoundaryKind::CompactionCompleted {
+            trigger,
+            total_tokens_before,
+            total_tokens_after,
+        } => {
+            details.push(format!("tokens_before={total_tokens_before}"));
+            details.push(format!("tokens_after={total_tokens_after}"));
+            if let Some(trigger) = trigger {
+                details.push(format!("trigger={trigger:?}"));
+            }
+        }
+    }
+
+    if let Some(repo) = event.repo.as_ref() {
+        if let Some(branch) = repo.git.branch.as_ref() {
+            details.push(format!("git_branch={branch}"));
+        }
+        if let Some(graphite) = repo.graphite.as_ref() {
+            details.push(rawr_graphite_status_detail(graphite));
+        }
+    }
+
+    if details.is_empty() {
+        header
+    } else {
+        format!("{header}\n{}", details.join(", "))
+    }
+}
+
+fn rawr_boundary_kind_label(kind: &crate::rawr_structured_state::RawrBoundaryKind) -> &'static str {
+    match kind {
+        crate::rawr_structured_state::RawrBoundaryKind::TurnStarted => "turn_started",
+        crate::rawr_structured_state::RawrBoundaryKind::PlanUpdated { .. } => "plan_updated",
+        crate::rawr_structured_state::RawrBoundaryKind::Commit => "commit",
+        crate::rawr_structured_state::RawrBoundaryKind::PrCheckpoint => "pr_checkpoint",
+        crate::rawr_structured_state::RawrBoundaryKind::AgentDone => "agent_done",
+        crate::rawr_structured_state::RawrBoundaryKind::TopicShift => "topic_shift",
+        crate::rawr_structured_state::RawrBoundaryKind::ConcludingThought => "concluding_thought",
+        crate::rawr_structured_state::RawrBoundaryKind::CompactionCompleted { .. } => {
+            "compaction_completed"
+        }
+    }
+}
+
+fn rawr_boundary_source_label(
+    source: crate::rawr_structured_state::RawrBoundarySource,
+) -> &'static str {
+    match source {
+        crate::rawr_structured_state::RawrBoundarySource::Core => "core",
+        crate::rawr_structured_state::RawrBoundarySource::Tool => "tool",
+        crate::rawr_structured_state::RawrBoundarySource::Compaction => "compaction",
+    }
+}
+
+fn rawr_graphite_status_detail(
+    snapshot: &crate::rawr_structured_state::RawrGraphiteSnapshot,
+) -> String {
+    let status = if let Some(status) = snapshot.status.as_ref() {
+        status.as_str()
+    } else if snapshot.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    if let Some(error) = snapshot.error.as_ref() {
+        format!("graphite={status} error={error}")
+    } else {
+        format!("graphite={status}")
+    }
+}
+
+fn rawr_decision_status_message(
+    decision: &crate::rawr_structured_state::RawrCompactionDecision,
+) -> String {
+    let header = "RAWR decision: token_pressure".to_string();
+    let mut details = Vec::new();
+    details.push(format!(
+        "action={}",
+        rawr_decision_action_label(decision.action)
+    ));
+    if let Some(tier) = decision.tier.as_ref() {
+        details.push(format!("tier={tier}"));
+    }
+    if let Some(percent_remaining) = decision.percent_remaining {
+        details.push(format!("percent_remaining={percent_remaining}"));
+    }
+    if !decision.reasons.is_empty() {
+        let reasons = decision
+            .reasons
+            .iter()
+            .map(rawr_decision_reason_label)
+            .collect::<Vec<_>>()
+            .join("|");
+        details.push(format!("reasons={reasons}"));
+    }
+    format!("{header}\n{}", details.join(", "))
+}
+
+fn rawr_decision_action_label(
+    action: crate::rawr_structured_state::RawrDecisionAction,
+) -> &'static str {
+    match action {
+        crate::rawr_structured_state::RawrDecisionAction::NoAction => "no_action",
+        crate::rawr_structured_state::RawrDecisionAction::ConsiderCompaction => {
+            "consider_compaction"
+        }
+    }
+}
+
+fn rawr_decision_reason_label(
+    reason: &crate::rawr_structured_state::RawrDecisionReason,
+) -> &'static str {
+    match reason {
+        crate::rawr_structured_state::RawrDecisionReason::MissingContextWindow => {
+            "missing_context_window"
+        }
+        crate::rawr_structured_state::RawrDecisionReason::AboveThreshold => "above_threshold",
+        crate::rawr_structured_state::RawrDecisionReason::BoundaryGatingNotSatisfied => {
+            "boundary_gating_not_satisfied"
+        }
+        crate::rawr_structured_state::RawrDecisionReason::EligibleByPolicy => "eligible_by_policy",
+    }
 }
 
 pub(super) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<String> {

@@ -98,6 +98,7 @@ use codex_core::protocol::ViewImageToolCallEvent;
 use codex_core::protocol::WarningEvent;
 use codex_core::protocol::WebSearchBeginEvent;
 use codex_core::protocol::WebSearchEndEvent;
+use codex_core::rawr_prompts;
 use codex_core::skills::model::SkillMetadata;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
@@ -898,16 +899,6 @@ impl RawrAutoCompactionSettings {
         }
     }
 }
-
-const RAWR_AUTO_COMPACT_PROMPT_TEMPLATE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../rawr/prompts/rawr-auto-compact.md"
-));
-
-const RAWR_SCRATCH_WRITE_PROMPT_TEMPLATE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../rawr/prompts/rawr-scratch-write.md"
-));
 
 const RAWR_SCRATCH_FALLBACK_AGENT_NAMES: [&str; 24] = [
     "Aria", "Atlas", "Beau", "Cleo", "Ezra", "Jade", "Juno", "Luna", "Milo", "Nova", "Orion",
@@ -1922,6 +1913,9 @@ impl ChatWidget {
                                 should_defer_to_next_user_turn,
                             };
 
+                        self.rawr_emit_visibility_info(format!(
+                            "auto-compaction: request judgment (tier={tier_name}, percent_remaining={percent_remaining})"
+                        ));
                         self.submit_op(Op::RawrAutoCompactionJudgment {
                             request_id,
                             tier: tier_name.to_string(),
@@ -1955,6 +1949,9 @@ impl ChatWidget {
                                 };
                             let prompt = self
                                 .rawr_build_scratch_write_prompt(&settings, scratch_file.as_str());
+                            self.rawr_emit_visibility_info(format!(
+                                "auto-compaction: requesting scratch write ({scratch_file})"
+                            ));
                             self.rawr_submit_injected_user_turn(prompt);
                             return;
                         }
@@ -1964,6 +1961,10 @@ impl ChatWidget {
                         if should_defer_to_next_user_turn
                             && self.rawr_preflight_compaction_pending.is_none()
                         {
+                            self.rawr_emit_visibility_info(
+                                "auto-compaction: deferring until next user turn (waiting on turn_complete boundary)"
+                                    .to_string(),
+                            );
                             self.rawr_preflight_compaction_pending = Some(trigger);
                             self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
                             return;
@@ -2047,6 +2048,9 @@ impl ChatWidget {
                 );
             }
         }
+        self.rawr_emit_visibility_info(
+            "auto-compaction: triggering compaction (Op::Compact)".to_string(),
+        );
         self.clear_token_usage();
         self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
     }
@@ -2086,11 +2090,23 @@ impl ChatWidget {
         }
 
         if !ev.should_compact {
+            self.rawr_emit_visibility_info(format!(
+                "auto-compaction judgment: veto (reason={})",
+                ev.reason
+            ));
             self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
             return;
         }
 
+        self.rawr_emit_visibility_info(format!(
+            "auto-compaction judgment: approve (reason={})",
+            ev.reason
+        ));
         if should_defer_to_next_user_turn && self.rawr_preflight_compaction_pending.is_none() {
+            self.rawr_emit_visibility_info(
+                "auto-compaction: deferring until next user turn (waiting on turn_complete boundary)"
+                    .to_string(),
+            );
             self.rawr_preflight_compaction_pending = Some(trigger);
             self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
             return;
@@ -2143,8 +2159,14 @@ impl ChatWidget {
         self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
         let text = self.rawr_build_post_compact_handoff_message(trigger, packet);
         if self.queued_user_messages.is_empty() {
+            self.rawr_emit_visibility_info(
+                "auto-compaction: injecting post-compact handoff".to_string(),
+            );
             self.rawr_submit_injected_user_turn(text);
         } else {
+            self.rawr_emit_visibility_info(
+                "auto-compaction: queued post-compact handoff for next user turn".to_string(),
+            );
             self.rawr_post_compact_handoff_pending = Some(text);
         }
     }
@@ -2286,10 +2308,16 @@ impl ChatWidget {
                         };
                     let prompt =
                         self.rawr_build_scratch_write_prompt(&settings, scratch_file.as_str());
+                    self.rawr_emit_visibility_info(format!(
+                        "auto-compaction: requesting scratch write ({scratch_file})"
+                    ));
                     self.rawr_submit_injected_user_turn(prompt);
                     return;
                 }
 
+                self.rawr_emit_visibility_info(
+                    "auto-compaction: watcher packet selected".to_string(),
+                );
                 let packet = self.rawr_build_post_compact_packet(
                     &trigger,
                     settings.prompt_frontmatter.packet.max_tail_chars,
@@ -2314,6 +2342,9 @@ impl ChatWidget {
                     &settings,
                     do_scratch,
                     scratch_file.as_deref(),
+                );
+                self.rawr_emit_visibility_info(
+                    "auto-compaction: requesting continuation packet from agent".to_string(),
                 );
                 self.rawr_request_packet_from_agent(prompt);
             }
@@ -2413,16 +2444,29 @@ impl ChatWidget {
         settings: &RawrAutoCompactionSettings,
         scratch_file: &str,
     ) -> String {
-        if settings.scratch_write_prompt.contains("{scratch_file}") {
-            settings
-                .scratch_write_prompt
-                .replace("{scratch_file}", scratch_file)
+        let template = settings.scratch_write_prompt.trim_end();
+        let expanded = self.rawr_expand_prompt_template(template, Some(scratch_file));
+        if template.contains("{scratch_file}") || template.contains("{scratchFile}") {
+            expanded
         } else {
-            format!(
-                "{}\n\nTarget file: `{scratch_file}`",
-                settings.scratch_write_prompt.trim_end()
-            )
+            format!("{expanded}\n\nTarget file: `{scratch_file}`")
         }
+    }
+
+    fn rawr_expand_prompt_template(&self, template: &str, scratch_file: Option<&str>) -> String {
+        let mut values = Vec::new();
+        if let Some(scratch_file) = scratch_file {
+            values.push(("scratchFile", scratch_file.to_string()));
+            values.push(("scratch_file", scratch_file.to_string()));
+        }
+        if let Some(thread_id) = self.thread_id {
+            values.push(("threadId", thread_id.to_string()));
+        }
+        rawr_prompts::expand_placeholders(template, &values)
+    }
+
+    fn rawr_emit_visibility_info(&mut self, message: String) {
+        self.add_info_message(format!("[rawr] {message}"), None);
     }
 
     fn rawr_build_agent_continuation_packet_prompt(
@@ -2433,33 +2477,24 @@ impl ChatWidget {
     ) -> String {
         if !do_scratch {
             if let Some(scratch_file) = scratch_file {
-                return format!(
-                    "Scratchpad: `{scratch_file}`\n\n{}",
-                    settings.agent_packet_prompt.trim()
+                let packet_prompt = self.rawr_expand_prompt_template(
+                    settings.agent_packet_prompt.trim(),
+                    Some(scratch_file),
                 );
+                return format!("Scratchpad: `{scratch_file}`\n\n{packet_prompt}");
             }
-            return settings.agent_packet_prompt.clone();
+            return self.rawr_expand_prompt_template(settings.agent_packet_prompt.trim(), None);
         }
 
         let scratch_prompt = if let Some(scratch_file) = scratch_file {
-            if settings.scratch_write_prompt.contains("{scratch_file}") {
-                settings
-                    .scratch_write_prompt
-                    .replace("{scratch_file}", scratch_file)
-            } else {
-                format!(
-                    "{}\n\nTarget file: `{scratch_file}`",
-                    settings.scratch_write_prompt.trim_end()
-                )
-            }
+            self.rawr_build_scratch_write_prompt(settings, scratch_file)
         } else {
-            settings.scratch_write_prompt.clone()
+            self.rawr_expand_prompt_template(settings.scratch_write_prompt.trim(), None)
         };
 
-        format!(
-            "{scratch_prompt}\n\n---\n\n{packet_prompt}",
-            packet_prompt = settings.agent_packet_prompt.trim()
-        )
+        let packet_prompt =
+            self.rawr_expand_prompt_template(settings.agent_packet_prompt.trim(), scratch_file);
+        format!("{scratch_prompt}\n\n---\n\n{packet_prompt}",)
     }
 
     fn rawr_build_post_compact_handoff_message(
@@ -2479,7 +2514,11 @@ impl ChatWidget {
         let packet_author = self.rawr_auto_compaction_packet_author();
         let mut settings = RawrAutoCompactionSettings::default_with_mode(mode, packet_author);
 
-        let (frontmatter_str, body) = split_yaml_frontmatter(RAWR_AUTO_COMPACT_PROMPT_TEMPLATE);
+        let auto_compact_prompt = rawr_prompts::read_prompt_or_default(
+            &self.config.codex_home,
+            rawr_prompts::RawrPromptKind::AutoCompact,
+        );
+        let (frontmatter_str, body) = split_yaml_frontmatter(&auto_compact_prompt);
         if let Some(frontmatter_str) = frontmatter_str {
             match serde_yaml::from_str::<RawrAutoCompactionPromptFrontmatter>(frontmatter_str) {
                 Ok(frontmatter) => {
@@ -2498,7 +2537,11 @@ impl ChatWidget {
             settings.agent_packet_prompt = body_prompt.to_string();
         }
 
-        let scratch_prompt = RAWR_SCRATCH_WRITE_PROMPT_TEMPLATE.trim();
+        let scratch_prompt = rawr_prompts::read_prompt_or_default(
+            &self.config.codex_home,
+            rawr_prompts::RawrPromptKind::ScratchWrite,
+        );
+        let scratch_prompt = scratch_prompt.trim();
         if !scratch_prompt.is_empty() {
             settings.scratch_write_prompt = scratch_prompt.to_string();
         }
@@ -3252,7 +3295,17 @@ impl ChatWidget {
         debug!("BackgroundEvent: {message}");
         self.bottom_pane.ensure_status_indicator();
         self.bottom_pane.set_interrupt_hint_visible(true);
-        self.set_status_header(message);
+        let (header, details) = message
+            .split_once('\n')
+            .map(|(header, details)| {
+                let header = header.trim().to_string();
+                let details = details.trim().to_string();
+                let details = (!details.is_empty()).then_some(details);
+                (header, details)
+            })
+            .unwrap_or((message.trim().to_string(), None));
+
+        self.set_status(header, details);
     }
 
     fn on_undo_started(&mut self, event: UndoStartedEvent) {
@@ -5091,9 +5144,17 @@ impl ChatWidget {
             EventMsg::RawrAutoCompactionJudgmentResult(ev) => {
                 self.rawr_on_auto_compaction_judgment_result(ev);
             }
+            EventMsg::ItemStarted(codex_core::protocol::ItemStartedEvent { item, .. }) => {
+                if matches!(item, codex_protocol::items::TurnItem::ContextCompaction(_)) {
+                    self.on_background_event(
+                        "Compacting thread context\nSummarizing and rewriting conversation history."
+                            .to_string(),
+                    );
+                }
+            }
             EventMsg::ContextCompacted(_) => {
                 self.rawr_on_context_compacted();
-                self.on_agent_message("Context compacted".to_owned());
+                self.add_info_message("Context compacted.".to_string(), None);
             }
             EventMsg::CollabAgentSpawnBegin(_) => {}
             EventMsg::CollabAgentSpawnEnd(ev) => self.on_collab_event(collab::spawn_end(ev)),

@@ -19,6 +19,7 @@ pub mod compaction_audit;
 mod rawr_arbiter;
 mod rawr_auto_compaction;
 mod rawr_auto_compaction_judgment;
+pub mod rawr_prompts;
 mod rawr_structured_state;
 pub use codex_thread::CodexThread;
 pub use codex_thread::ThreadConfigSnapshot;

@@ -20,10 +20,10 @@
 //! is in progress and while MCP server startup is in progress. Those lifecycles are tracked
 //! independently (`agent_turn_running` and `mcp_startup_status`) and synchronized via
 //! `update_task_running_state`.
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::path::Path;
@@ -2567,7 +2567,7 @@ impl ChatWidget {
         settings
     }
 
-    fn maybe_prompt_plan_implementation(&mut self, last_agent_message: Option<&str>) {
+    fn maybe_prompt_plan_implementation(&mut self, _last_agent_message: Option<&str>) {
         if !self.collaboration_modes_enabled() {
             return;
         }
@@ -2577,8 +2577,7 @@ impl ChatWidget {
         if self.active_mode_kind() != ModeKind::Plan {
             return;
         }
-        let has_message = last_agent_message.is_some_and(|message| !message.trim().is_empty());
-        if !has_message && !self.saw_plan_update_this_turn {
+        if !self.saw_plan_item_this_turn {
             return;
         }
         if !self.bottom_pane.no_modal_or_popup_active() {
@@ -2596,7 +2595,7 @@ impl ChatWidget {
     }
 
     fn open_plan_implementation_prompt(&mut self) {
-        let code_mask = collaboration_modes::code_mask(self.models_manager.as_ref());
+        let code_mask = collaboration_modes::default_mode_mask(self.models_manager.as_ref());
         let (implement_actions, implement_disabled_reason) = match code_mask {
             Some(mask) => {
                 let user_text = PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string();
@@ -5168,7 +5167,6 @@ impl ChatWidget {
             EventMsg::CollabCloseEnd(ev) => self.on_collab_event(collab::close_end(ev)),
             EventMsg::ThreadRolledBack(_) => {}
             EventMsg::RawResponseItem(_)
-            | EventMsg::ItemStarted(_)
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
             | EventMsg::ReasoningRawContentDelta(_)

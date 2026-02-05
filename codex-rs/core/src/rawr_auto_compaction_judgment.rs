@@ -31,7 +31,7 @@ pub(crate) async fn request_rawr_auto_compaction_judgment(
     boundaries_present: &[String],
     last_agent_message: &str,
 ) -> Result<RawrAutoCompactionJudgment> {
-    let codex_home = turn_context.client.config().codex_home.clone();
+    let codex_home = turn_context.config.codex_home.clone();
     if let Err(err) = rawr_prompts::ensure_rawr_prompt_files(&codex_home) {
         tracing::warn!("failed to ensure rawr prompt directory: {err}");
     }
@@ -56,7 +56,7 @@ pub(crate) async fn request_rawr_auto_compaction_judgment(
         sess.conversation_id,
         &turn_context.sub_id,
         sess.get_total_token_usage().await,
-        turn_context.client.get_model_context_window(),
+        turn_context.model_context_window(),
     );
 
     let prompt = Prompt {
@@ -65,6 +65,7 @@ pub(crate) async fn request_rawr_auto_compaction_judgment(
             role: "user".to_string(),
             content: vec![ContentItem::InputText { text: decision_ctx }],
             end_turn: None,
+            phase: None,
         }],
         tools: Vec::new(),
         parallel_tool_calls: false,
@@ -110,7 +111,7 @@ async fn drain_judgment_stream(
         };
         match event {
             Ok(codex_api::common::ResponseEvent::OutputItemDone(item)) => {
-                if let Some(text) = last_assistant_message_from_item(&item) {
+                if let Some(text) = last_assistant_message_from_item(&item, false) {
                     last_message = Some(text);
                 }
             }

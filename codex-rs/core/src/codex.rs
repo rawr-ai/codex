@@ -4,6 +4,7 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use crate::AuthManager;
 use crate::CodexAuth;
@@ -529,7 +530,11 @@ pub(crate) struct TurnContext {
 impl TurnContext {
     pub(crate) fn model_context_window(&self) -> Option<i64> {
         let effective_context_window_percent = self.model_info.effective_context_window_percent;
-        self.model_info.context_window.map(|context_window| {
+        let context_window = self
+            .model_info
+            .context_window
+            .or(self.config.model_context_window);
+        context_window.map(|context_window| {
             context_window.saturating_mul(effective_context_window_percent) / 100
         })
     }
@@ -4371,7 +4376,8 @@ pub(crate) async fn run_turn(
                         let percent_remaining = turn_context
                             .model_context_window()
                             .map(|context_window| {
-                                let remaining = context_window.saturating_sub(total_usage_tokens);
+                                let remaining =
+                                    context_window.saturating_sub(total_usage_tokens).max(0);
                                 if context_window == 0 {
                                     0
                                 } else {
@@ -4401,26 +4407,28 @@ pub(crate) async fn run_turn(
                         }
                         if rawr_mid_turn_state
                             .can_rearm(total_usage_tokens, min_tokens_since_compaction)
-                            && crate::rawr_auto_compaction::rawr_should_compact_mid_turn(
-                                config,
-                                percent_remaining,
-                                &signals,
-                            )
+                            && let Some(tier) = tier
                         {
-                            let is_emergency = tier
-                                == Some(
-                                    crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency,
+                            let should_compact_mid_turn =
+                                crate::rawr_auto_compaction::rawr_should_compact_mid_turn(
+                                    config,
+                                    percent_remaining,
+                                    &signals,
                                 );
-                            if let Some(tier) = tier
-                                && tier
-                                    != crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency
-                                    && let Some(decision_prompt_path) =
-                                        crate::rawr_auto_compaction::rawr_policy_decision_prompt_path(
-                                            config,
-                                            tier,
-                                        )
-                                    {
-                                        let tier_name = match tier {
+                            let decision_prompt_path =
+                                crate::rawr_auto_compaction::rawr_policy_decision_prompt_path(
+                                    config, tier,
+                                );
+                            if !should_compact_mid_turn && decision_prompt_path.is_none() {
+                                continue;
+                            }
+                            let is_emergency = tier
+                                == crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency;
+                            if tier
+                                != crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency
+                                && let Some(decision_prompt_path) = decision_prompt_path
+                            {
+                                let tier_name = match tier {
                                             crate::rawr_auto_compaction::RawrAutoCompactionTier::Early => {
                                                 "early"
                                             }
@@ -4435,34 +4443,32 @@ pub(crate) async fn run_turn(
                                             }
                                         };
 
-                                        let mut boundaries_present: Vec<String> = Vec::new();
-                                        if signals.saw_commit {
-                                            boundaries_present.push("commit".to_string());
-                                        }
-                                        if signals.saw_plan_checkpoint {
-                                            boundaries_present.push("plan_checkpoint".to_string());
-                                        }
-                                        if signals.saw_plan_update {
-                                            boundaries_present.push("plan_update".to_string());
-                                        }
-                                        if signals.saw_pr_checkpoint {
-                                            boundaries_present.push("pr_checkpoint".to_string());
-                                        }
-                                        if signals.saw_agent_done {
-                                            boundaries_present.push("agent_done".to_string());
-                                        }
-                                        if signals.saw_topic_shift {
-                                            boundaries_present.push("topic_shift".to_string());
-                                        }
-                                        if signals.saw_concluding_thought {
-                                            boundaries_present.push("concluding".to_string());
-                                        }
+                                let mut boundaries_present: Vec<String> = Vec::new();
+                                if signals.saw_commit {
+                                    boundaries_present.push("commit".to_string());
+                                }
+                                if signals.saw_plan_checkpoint {
+                                    boundaries_present.push("plan_checkpoint".to_string());
+                                }
+                                if signals.saw_plan_update {
+                                    boundaries_present.push("plan_update".to_string());
+                                }
+                                if signals.saw_pr_checkpoint {
+                                    boundaries_present.push("pr_checkpoint".to_string());
+                                }
+                                if signals.saw_agent_done {
+                                    boundaries_present.push("agent_done".to_string());
+                                }
+                                if signals.saw_topic_shift {
+                                    boundaries_present.push("topic_shift".to_string());
+                                }
+                                if signals.saw_concluding_thought {
+                                    boundaries_present.push("concluding".to_string());
+                                }
 
-                                        let last_agent_message_for_judgment =
-                                            sampling_request_last_agent_message
-                                                .as_deref()
-                                                .unwrap_or("");
-                                        let judgment =
+                                let last_agent_message_for_judgment =
+                                    sampling_request_last_agent_message.as_deref().unwrap_or("");
+                                let judgment =
                                             crate::rawr_auto_compaction_judgment::request_rawr_auto_compaction_judgment(
                                                 sess.as_ref(),
                                                 turn_context.as_ref(),
@@ -4473,15 +4479,13 @@ pub(crate) async fn run_turn(
                                                 last_agent_message_for_judgment,
                                             )
                                             .await;
-                                        let should_compact = judgment
-                                            .as_ref()
-                                            .map(|j| j.should_compact)
-                                            .unwrap_or(true);
-                                        if !should_compact {
-                                            rawr_mid_turn_state.record_compaction(total_usage_tokens);
-                                            continue;
-                                        }
-                                    }
+                                let should_compact =
+                                    judgment.as_ref().map(|j| j.should_compact).unwrap_or(true);
+                                if !should_compact {
+                                    rawr_mid_turn_state.record_compaction(total_usage_tokens);
+                                    continue;
+                                }
+                            }
                             let scratch_write_enabled = config
                                 .rawr_auto_compaction
                                 .as_ref()

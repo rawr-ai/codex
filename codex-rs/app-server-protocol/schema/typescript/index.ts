@@ -135,6 +135,7 @@ export type { Profile } from "./Profile";
 export type { RateLimitSnapshot } from "./RateLimitSnapshot";
 export type { RateLimitWindow } from "./RateLimitWindow";
 export type { RawResponseItemEvent } from "./RawResponseItemEvent";
+export type { RawrAutoCompactionJudgmentResultEvent } from "./RawrAutoCompactionJudgmentResultEvent";
 export type { ReasoningContentDeltaEvent } from "./ReasoningContentDeltaEvent";
 export type { ReasoningEffort } from "./ReasoningEffort";
 export type { ReasoningItem } from "./ReasoningItem";

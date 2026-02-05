@@ -61,6 +61,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_rmcp_client::OAuthCredentialsStoreMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
+use dirs::home_dir;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;

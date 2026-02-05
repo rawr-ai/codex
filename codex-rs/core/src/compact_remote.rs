@@ -14,7 +14,6 @@ use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
-use tracing::info;
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
@@ -53,18 +52,11 @@ async fn run_remote_compact_task_inner_impl(
         .await;
     let mut history = sess.clone_history().await;
     let base_instructions = sess.get_base_instructions().await;
-    let deleted_items = trim_function_call_history_to_fit_context_window(
+    let _deleted_items = trim_function_call_history_to_fit_context_window(
         &mut history,
         turn_context.as_ref(),
         &base_instructions,
     );
-    if deleted_items > 0 {
-        info!(
-            turn_id = %turn_context.sub_id,
-            deleted_items,
-            "trimmed history items before remote compaction"
-        );
-    }
 
     // Required to keep `/undo` available after compaction
     let ghost_snapshots: Vec<ResponseItem> = history

@@ -2220,6 +2220,7 @@ async fn auto_compact_skips_repeat_when_tokens_do_not_rearm() {
             text: "auto compacted".to_string(),
         }],
         end_turn: None,
+        phase: None,
     }];
     let compact_mock =
         mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
@@ -2383,6 +2384,7 @@ async fn rawr_mid_turn_compaction_injects_packet_and_handoff() {
             text: "RAWr mid-turn compacted".to_string(),
         }],
         end_turn: None,
+        phase: None,
     }];
     let compact_mock =
         mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
@@ -2484,6 +2486,7 @@ async fn rawr_mid_turn_compaction_rearms_after_token_growth() {
             text: "RAWr mid-turn compacted".to_string(),
         }],
         end_turn: None,
+        phase: None,
     }];
     let _compact_mock1 = mount_compact_json_once(
         &server,
@@ -2573,6 +2576,7 @@ async fn rawr_mid_turn_compaction_includes_scratch_prompt_and_handoff() {
             text: "RAWr mid-turn compacted".to_string(),
         }],
         end_turn: None,
+        phase: None,
     }];
     let compact_mock =
         mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
@@ -2769,6 +2773,7 @@ async fn rawr_mid_turn_compaction_judgment_approval_injects_packet() {
             text: "RAWr mid-turn compacted".to_string(),
         }],
         end_turn: None,
+        phase: None,
     }];
     let compact_mock =
         mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;

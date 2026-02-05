@@ -1631,6 +1631,7 @@ async fn rawr_auto_compaction_defers_to_next_user_turn_when_turn_complete_bounda
     let configured = codex_core::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
+        thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
         approval_policy: AskForApproval::Never,
@@ -1699,6 +1700,7 @@ async fn rawr_auto_compaction_preflight_does_not_run_for_local_shell_commands() 
     let configured = codex_core::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
+        thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
         approval_policy: AskForApproval::Never,

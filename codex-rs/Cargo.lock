@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "codex-cloud-requirements"
-version = "0.0.0"
+version = "0.96.0-alpha.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1723,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "codex-experimental-api-macros"
-version = "0.0.0"
+version = "0.96.0-alpha.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "codex-secrets"
-version = "0.0.0"
+version = "0.96.0-alpha.2"
 dependencies = [
  "age",
  "anyhow",
@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-home-dir"
-version = "0.0.0"
+version = "0.96.0-alpha.2"
 dependencies = [
  "dirs",
  "pretty_assertions",
@@ -5030,16 +5030,6 @@ name = "matchit"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b3eede3bdf92f3b4f9dc04072a9ce5ab557d5ec9038773bf9ffcd5588b3cc05b"
-
-[[package]]
-name = "mcp-types"
-version = "0.96.0-alpha.2"
-dependencies = [
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "ts-rs",
-]
 
 [[package]]
 name = "mcp_test_support"

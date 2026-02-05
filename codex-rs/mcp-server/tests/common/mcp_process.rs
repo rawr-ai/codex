@@ -174,7 +174,7 @@ impl McpProcess {
                     "version": build_version,
                     "user_agent": user_agent
                 },
-                "protocolVersion": mcp_types::MCP_SCHEMA_VERSION
+                "protocolVersion": ProtocolVersion::LATEST
             })
         );
 

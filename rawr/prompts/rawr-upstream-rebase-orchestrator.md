@@ -93,6 +93,10 @@ Use this when you choose to complete the checkpoint despite conflicts.
 6. Graphite alignment:
    - `gt sync --no-restack --no-interactive`
    - If `gt ls --all` shows descendants above trunk: `gt restack --upstack`
+   - Verify tracking health:
+     - `gt ls --all --show-untracked`
+     - If branches became untracked due to a plain `git rebase`, repair with:
+       - `gt track <branch> --parent codex/integration-upstream-main`
 
 7. Validation:
    - `cd codex-rs`
@@ -115,4 +119,3 @@ After every run, you must produce a short summary with:
   - `cargo test --all-features` result
 - Where the report artifacts were written:
   - `.scratch/rebase-daily/<YYYY-MM-DD>/`
-

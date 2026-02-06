@@ -120,8 +120,15 @@ verify_patch_rebase_clean() {
   }
   trap cleanup_verify RETURN
 
-  run git worktree add --detach "$tmpdir" "$PATCH_BRANCH"
-  run git -C "$tmpdir" fetch upstream --prune
+  if ! git worktree add --detach "$tmpdir" "$PATCH_BRANCH"; then
+    echo "Failed to create temporary verification worktree." >&2
+    return 1
+  fi
+
+  if ! git -C "$tmpdir" fetch upstream --prune; then
+    echo "Failed to fetch upstream in temporary verification worktree." >&2
+    return 1
+  fi
 
   if git -C "$tmpdir" rebase upstream/main; then
     log "patch branch rebase verified cleanly in temporary worktree"

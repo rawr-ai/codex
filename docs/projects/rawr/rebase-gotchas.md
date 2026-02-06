@@ -31,6 +31,8 @@ Date: 2026-02-06
 - Acquire a single-writer lock for scheduled runs.
 - Prefer explicit lease pushes when rewriting history.
 - Avoid global Graphite restacks in parallel environments; default to `gt sync --no-restack`.
+- Do not run `gt sync` while a checkpoint rewrite is in progress (it may overwrite local trunk if it cannot fast-forward).
+- After any plain `git rebase` checkpoint on trunk, run `gt ls --all --show-untracked` and repair tracking with `gt track` if needed.
 
 ## Why this prevents recurrence
 - The canonical parent branch is explicit and stable.

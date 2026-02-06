@@ -1,11 +1,11 @@
 # Next Orchestrator Handoff: Upstream Checkpoint Rebase
 
-Last updated: 2026-02-06T08:14:11Z (UTC)
+Last updated: 2026-02-06T08:15:23Z (UTC)
 Owner: RAWR fork maintenance
 
 ## Current state snapshot
 - Canonical integration branch: `codex/integration-upstream-main`
-- Current commit on integration branch: `32b2e75bd95ed9a67736a8bebea64f5170a6a46f`
+- Current commit on integration branch: `5e3a6e2c6f30a91452fe76c41db6f905c8d7ec02`
 - Fork `main` commit: `ebc65cb9fb3da9e374e70c6cdea2980c0ec27c71`
 - Upstream `main` commit: `dd80e332c45aefc935d68fe067026ccf40312ccd`
 - Merge-base (`codex/integration-upstream-main`, `upstream/main`): `048e0f3888a5c5bef8d2272e44b30a1aea4c8f92`
@@ -39,7 +39,7 @@ Non-negotiable policy:
 4. Graphite-first for stack/PR operations
 
 Current baseline:
-- integration branch: codex/integration-upstream-main @ 32b2e75bd95ed9a67736a8bebea64f5170a6a46f
+- integration branch: codex/integration-upstream-main @ 5e3a6e2c6f30a91452fe76c41db6f905c8d7ec02
 - upstream/main @ dd80e332c45aefc935d68fe067026ccf40312ccd
 - divergence (integration...upstream): 1 left / 3 right
 - previous canonical PR #18 is merged

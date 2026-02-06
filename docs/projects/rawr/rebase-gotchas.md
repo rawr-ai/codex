@@ -16,17 +16,21 @@ Date: 2026-02-06
 3. Compaction-trigger state can go stale if never consumed; clean at turn start.
 
 ## Canonical checkpoint drill (this cycle)
-- Verify active tracked chain in Graphite:
-  - `gt ls` should show `codex/integration-upstream-main -> codex/incremental-rebase-2026-02-06`.
-- Verify fork PR anchor:
-  - `gh pr list --repo rawr-ai/codex --state open` should show only PR `#18` (`codex/incremental-rebase-2026-02-06`).
+- Verify tracked chain in Graphite:
+  - `gt ls --all` should show `codex/integration-upstream-main` (and any tracked descendants, if they exist).
 - Rehearse the checkpoint sync explicitly against integration trunk:
   - `DRY_RUN=1 rawr/sync-upstream.sh codex/integration-upstream-main`
 - If dry-run is correct, execute the real checkpoint and then restack descendants:
   - `rawr/sync-upstream.sh codex/integration-upstream-main`
-  - `git checkout codex/incremental-rebase-2026-02-06`
   - `gt sync --no-restack`
-  - `gt restack --upstack`
+  - If `gt ls --all` shows tracked descendants above trunk: `gt restack --upstack`
+
+## Automation hazards (agent-first)
+- `DRY_RUN=1` must be a real verification pass (not a no-op).
+- Keep version bump idempotent (don’t fail on “nothing to commit”).
+- Acquire a single-writer lock for scheduled runs.
+- Prefer explicit lease pushes when rewriting history.
+- Avoid global Graphite restacks in parallel environments; default to `gt sync --no-restack`.
 
 ## Why this prevents recurrence
 - The canonical parent branch is explicit and stable.

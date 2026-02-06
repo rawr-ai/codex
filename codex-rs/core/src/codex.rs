@@ -4125,6 +4125,7 @@ pub(crate) async fn run_turn(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, event).await;
+    crate::compaction_audit::clear_next_compaction_trigger(sess.conversation_id);
     sess.rawr_reset_auto_compaction_signals(turn_context.sub_id.clone())
         .await;
     if !rawr_auto_compaction_enabled

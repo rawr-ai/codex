@@ -5,7 +5,7 @@ Goal: run the fork side-by-side with upstream Codex without sharing state by def
 ## Recommended usage
 - Keep upstream installed as `codex` (untouched).
 - Install this fork as `codex-rawr`.
-- By default, this fork uses `CODEX_HOME=~/.codex-rawr` when `CODEX_HOME` is unset.
+- Fork wrappers/scripts default `CODEX_HOME=~/.codex-rawr` when `CODEX_HOME` is unset.
 
 ## Local install (macOS/Linux)
 ```bash
@@ -52,7 +52,7 @@ Example:
 ln -sf "$HOME/.local/bin/codex-rawr" "$HOME/.local/bin/codex"
 ```
 
-This is safe with respect to state because the fork defaults `CODEX_HOME=~/.codex-rawr` (unless you override `CODEX_HOME`).
+This is safe with respect to state because the fork wrapper defaults `CODEX_HOME=~/.codex-rawr` (unless you override `CODEX_HOME`).
 
 ## Enable the watcher (v0 skeleton)
 Edit `~/.codex-rawr/config.toml`:
@@ -138,4 +138,4 @@ Happy Coder launches Codex’s MCP server using `codex mcp-server` (stdio transp
 This fork avoids that by keeping `codex --version` ahead of upstream (see `rawr/bump-fork-version.sh`), so launchers can reliably select `mcp-server` without shims.
 
 ## Update flow (keep rebases boring)
-See `codex/rawr/UPDATING.md`.
+See `rawr/UPDATING.md`.

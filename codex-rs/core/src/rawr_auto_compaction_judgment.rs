@@ -5,7 +5,6 @@ use crate::error::CodexErr;
 use crate::error::Result;
 use crate::rawr_prompts;
 use crate::stream_events_utils::last_assistant_message_from_item;
-use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -84,10 +83,9 @@ async fn drain_judgment_stream(
 ) -> Result<RawrAutoCompactionJudgment> {
     let mut client_session = sess.services.model_client.new_session();
     let turn_metadata_header = turn_context.resolve_turn_metadata_header().await;
-    let web_search_eligible = !matches!(
-        turn_context.config.web_search_mode,
-        Some(WebSearchMode::Disabled)
-    );
+    // Judgment is an internal non-transcript policy decision; keep tool
+    // eligibility disabled regardless of user-facing web search settings.
+    let web_search_eligible = false;
     let mut stream = client_session
         .stream(
             prompt,

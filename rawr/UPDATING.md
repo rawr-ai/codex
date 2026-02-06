@@ -1,46 +1,58 @@
 # rawr Codex fork: upstream updates
 
-The intent is to keep `origin/main` tracking upstream (no fork changes) and keep fork-specific changes on an explicit patch branch as a small, rebased patch series.
+The permanent operating model is:
+- Graphite operational trunk: `codex/integration-upstream-main`.
+- Day-to-day fork work stacks above that trunk (current tracked child: `codex/incremental-rebase-2026-02-06`).
+- `main` is not the day-to-day stack base.
 
-Patch branch options:
-- long-lived branch (for example `rawr/main`), or
-- cycle branch (for example `codex/rebase-upstream-YYYY-MM-DD`).
+Upstream sync is performed only at controlled checkpoints against `codex/integration-upstream-main`.
 
-The runbook and script require the patch branch to be explicit and never equal to `main`.
+## Checkpoint sync (preferred)
+Always pass the integration trunk explicitly:
 
-## One-liner (preferred)
-Run:
 ```bash
-rawr/sync-upstream.sh
-```
-
-To target a non-current patch branch:
-```bash
-rawr/sync-upstream.sh codex/rebase-upstream-2026-02-05
+rawr/sync-upstream.sh codex/integration-upstream-main
 ```
 
 Dry-run rehearsal:
+
 ```bash
-DRY_RUN=1 rawr/sync-upstream.sh codex/rebase-upstream-2026-02-05
+DRY_RUN=1 rawr/sync-upstream.sh codex/integration-upstream-main
 ```
 
-## Manual steps
-```bash
-git fetch upstream
-git checkout main
-git pull --ff-only upstream main
-git push origin main
+## After checkpoint sync
+Restack descendants of the integration trunk:
 
-git checkout <patch-branch>
+```bash
+git checkout codex/incremental-rebase-2026-02-06
+gt sync --no-restack
+gt restack --upstack
+```
+
+## Manual checkpoint flow (fallback)
+
+```bash
+git fetch --all --prune
+
+git checkout codex/integration-upstream-main
 git rebase upstream/main
-git push --force-with-lease origin <patch-branch>
+git push --force-with-lease origin codex/integration-upstream-main
+
+git checkout codex/incremental-rebase-2026-02-06
+gt sync --no-restack
+gt restack --upstack
 ```
 
 Notes:
-- Use `--force-with-lease` (not `--force`) so you don’t accidentally overwrite someone else’s work.
-- If rebases get painful, the fork delta is too big: split features into smaller commits and/or remove experimental changes.
-- Keep branch selection explicit and require a clean tree before syncing.
+- Do not rely on implicit "current branch" behavior for sync scripts.
+- Use `--force-with-lease` (not `--force`) for rewritten history.
+- `main` may still be updated as a mirror side effect by legacy tooling, but it is not the stack base.
 - For large rebases, run `git range-diff` before push.
+
+## Why this prevents recurrence
+- Explicit trunk targeting removes ambiguity about where upstream replay occurs.
+- Required restack after checkpoint keeps descendants aligned with the canonical base.
+- Keeping `main` out of daily stack parentage blocks accidental rebases onto stale bases.
 
 ## Fork versioning
 
@@ -48,4 +60,4 @@ This fork keeps `codex --version` ahead of upstream by computing:
 
 `fork_version = (latest upstream rust-v tag) + 1 minor`
 
-`rawr/sync-upstream.sh` runs `rawr/bump-fork-version.sh --commit` after rebasing so the version stays ahead automatically.
+`rawr/sync-upstream.sh` runs `rawr/bump-fork-version.sh --commit` during checkpoint sync so the fork version stays ahead automatically.

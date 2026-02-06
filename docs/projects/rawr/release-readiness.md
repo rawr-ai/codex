@@ -1,20 +1,26 @@
 # RAWR Release Readiness (2026-02-06)
 
 ## Scope
-- Phase: `C` (validation + hygiene + rebase-ready stop point)
-- Evidence timestamp (UTC): `2026-02-06T07:41:11Z`
+- Phase: `C` (validation + hygiene + publish/release completion)
+- Evidence timestamp (UTC): `2026-02-06T09:07:30Z`
 
 ## Trunk / Branch State
 - Operational trunk: `codex/integration-upstream-main`
 - `main` role: upstream mirror branch; not the day-to-day stack base
-- Active tracked chain (`gt ls`): `codex/integration-upstream-main -> codex/incremental-rebase-2026-02-06`
-- Current branch/HEAD: `codex/incremental-rebase-2026-02-06` at `ccfe087da`
-- Remote relation now: in sync with `origin/codex/incremental-rebase-2026-02-06`
-- Canonical fork PR state (`rawr-ai/codex`): only PR `#18` is open (`codex/incremental-rebase-2026-02-06`)
+- Active tracked chain (`gt ls --all`): `codex/integration-upstream-main`
+- Current branch/HEAD: `codex/integration-upstream-main` at `b59ec7afb`
+- Remote relation now: in sync with `origin/codex/integration-upstream-main`
+- Canonical fork PR state (`rawr-ai/codex`): PR `#18` is merged; no open PRs
 
 ## Optional Next Upstream Checkpoint (Handoff)
-- Next optional checkpoint is to replay `codex/integration-upstream-main` on `upstream/main`, then restack `codex/incremental-rebase-2026-02-06`.
-- This optional checkpoint was **not executed now**; Phase C stopped at validation + hygiene.
+- Next optional checkpoint is to replay `codex/integration-upstream-main` on `upstream/main`, then restack any in-flight branches.
+- This optional checkpoint was **not executed now**; Phase C stopped after validation + publish/release completion.
+
+## Publish / Release Evidence
+- Local publish: `bash rawr/publish-local.sh --no-bump-version --happy --force` (installed wrappers: `~/.local/bin/codex` + `~/.local/bin/codex-rawr`; local version: `codex-cli 0.100.0-alpha.3`)
+- Remote tag pushed: annotated tag `rust-v0.100.0-alpha.3` (`refs/tags/rust-v0.100.0-alpha.3`); tag object `ac17f1f4c5cac22edb395dc0205cea11fb834b08`
+- GitHub Release: https://github.com/rawr-ai/codex/releases/tag/rust-v0.100.0-alpha.3 (manual; no CI artifacts attached; assets: none; notes: generated from merged PR `#18`)
+- Why manual: `rust-release` workflow exists and is active, but this fork currently has no `push`-triggered Actions runs visible (only `workflow_dispatch` history), so the tag push did not produce a `rust-release` run.
 
 ## Validation Evidence (codex-rs)
 Executed from `codex-rs` during Phase C:
@@ -34,4 +40,6 @@ Raw logs:
 
 ## Outcome
 - Phase C validation bar: **PASS**
-- Trunk model, branch chain, and canonical PR state reflect the current incremental-rebase topology.
+- Trunk model and canonical PR state reflect the post-merge topology.
+- Local publish: **PASS**
+- Remote tag + GitHub Release: **PASS** (manual Release; no artifacts)

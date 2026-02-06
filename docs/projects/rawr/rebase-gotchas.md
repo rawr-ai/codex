@@ -15,12 +15,21 @@ Date: 2026-02-05
 3. Compaction-trigger state can go stale if never consumed; clean at turn start.
 
 ## Rebase drill (this cycle)
-- Performed with `DRY_RUN=1` and branch preflight checks.
-- Observed result on implementation branch:
-  - failed fast with `error: working tree must be clean before sync-upstream`.
+- Performed with clean tree and `DRY_RUN=1`:
+  - `DRY_RUN=1 rawr/sync-upstream.sh codex/rebase-upstream-2026-02-05`
+- Observed command path in dry-run output:
+  - `git fetch upstream`
+  - `git checkout main`
+  - `git pull --ff-only upstream main`
+  - `git push origin main`
+  - `git checkout codex/rebase-upstream-2026-02-05`
+  - `git rebase upstream/main`
+  - `bash rawr/bump-fork-version.sh --commit`
+  - `git push --force-with-lease origin codex/rebase-upstream-2026-02-05`
+  - restore starting branch
 - Interpretation:
-  - clean-tree gate is functioning as intended.
-  - full replay path (`mirror sync -> patch replay -> validation -> publish/rollback`) remains pending until a clean checkpoint.
+  - clean-tree gate and explicit patch-branch handling are both enforced.
+  - dry-run command ordering matches the runbook.
 
 ## Recurring checklist
 - [ ] clean tree

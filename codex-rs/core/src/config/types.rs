@@ -672,6 +672,107 @@ impl Default for ShellEnvironmentPolicy {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionMode {
+    Tag,
+    Suggest,
+    Auto,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionPacketAuthor {
+    Watcher,
+    Agent,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionBoundary {
+    Commit,
+    PlanCheckpoint,
+    PlanUpdate,
+    PrCheckpoint,
+    AgentDone,
+    TopicShift,
+    ConcludingThought,
+    TurnComplete,
+}
+
+/// Per-tier auto-compaction policy configuration.
+///
+/// This is the primary way to configure RAWR auto-compaction.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionPolicyToml {
+    pub early: Option<RawrAutoCompactionPolicyTierToml>,
+    pub ready: Option<RawrAutoCompactionPolicyTierToml>,
+    pub asap: Option<RawrAutoCompactionPolicyTierToml>,
+    pub emergency: Option<RawrAutoCompactionPolicyTierToml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionPolicyTierToml {
+    /// Trigger threshold for this tier. When `percent_remaining < percent_remaining_lt`,
+    /// this tier is eligible.
+    pub percent_remaining_lt: Option<i64>,
+
+    /// Boundaries that may trigger compaction for this tier (commit/pr/plan/etc).
+    ///
+    /// If unset, defaults are used.
+    pub requires_any_boundary: Option<Vec<RawrAutoCompactionBoundary>>,
+
+    /// When enabled, plan-based boundaries (`plan_update`, `plan_checkpoint`) only count
+    /// when there is a semantic break in the conversation (agent_done/topic_shift/concluding),
+    /// unless a non-plan boundary (commit/pr) is also present.
+    pub plan_boundaries_require_semantic_break: Option<bool>,
+
+    /// Optional prompt file used to make a judgement call before compaction triggers
+    /// in this tier.
+    ///
+    /// This prompt should instruct the watcher to output a structured decision (e.g.
+    /// JSON) indicating whether to compact now vs. defer.
+    pub decision_prompt_path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrRepoObservationToml {
+    /// When enabled, Codex will attempt to collect lightweight Graphite ("gt") context
+    /// for RAWR structured state (best-effort; failures are ignored).
+    pub graphite_enabled: Option<bool>,
+    /// Max chars of `gt` output to persist per observation (to cap store growth).
+    pub graphite_max_chars: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionToml {
+    pub mode: Option<RawrAutoCompactionMode>,
+    pub packet_author: Option<RawrAutoCompactionPacketAuthor>,
+    /// When enabled, the watcher may ask the in-session agent to write a scratchpad file before
+    /// compaction so verbatim research notes/drafts survive history rewrite.
+    pub scratch_write_enabled: Option<bool>,
+    /// Max chars of tail context included in watcher-side packet prompts.
+    pub packet_max_tail_chars: Option<usize>,
+    /// Optional model override used for compaction requests triggered by the watcher.
+    pub compaction_model: Option<String>,
+    /// Optional reasoning effort override used for watcher-triggered compactions.
+    pub compaction_reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+    /// Optional verbosity override used for watcher-triggered compactions.
+    pub compaction_verbosity: Option<codex_protocol::config_types::Verbosity>,
+    /// New, preferred policy configuration (per-tier thresholds + boundaries + optional judgement prompt).
+    pub policy: Option<RawrAutoCompactionPolicyToml>,
+    #[serde(default)]
+    pub repo_observation: Option<RawrRepoObservationToml>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

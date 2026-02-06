@@ -4,6 +4,7 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use crate::AuthManager;
 use crate::CodexAuth;
@@ -177,6 +178,7 @@ use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnDiffEvent;
 use crate::protocol::WarningEvent;
+use crate::rawr_auto_compaction::RawrAutoCompactionSignals;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::RolloutRecorderParams;
 use crate::rollout::map_session_init_error;
@@ -499,6 +501,11 @@ pub(crate) struct Session {
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) services: SessionServices,
     next_internal_sub_id: AtomicU64,
+    rawr_auto_compaction_signals: Mutex<RawrAutoCompactionSignals>,
+    rawr_boundary_event_seq: AtomicU64,
+    rawr_decision_seq: AtomicU64,
+    rawr_boundary_store_lock: Mutex<()>,
+    auto_compaction_rearm: Mutex<AutoCompactionRearmState>,
 }
 
 /// The context needed for a single turn of the thread.
@@ -539,7 +546,11 @@ pub(crate) struct TurnContext {
 impl TurnContext {
     pub(crate) fn model_context_window(&self) -> Option<i64> {
         let effective_context_window_percent = self.model_info.effective_context_window_percent;
-        self.model_info.context_window.map(|context_window| {
+        let context_window = self
+            .model_info
+            .context_window
+            .or(self.config.model_context_window);
+        context_window.map(|context_window| {
             context_window.saturating_mul(effective_context_window_percent) / 100
         })
     }
@@ -1076,6 +1087,11 @@ impl Session {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            rawr_auto_compaction_signals: Mutex::new(RawrAutoCompactionSignals::default()),
+            rawr_boundary_event_seq: AtomicU64::new(0),
+            rawr_decision_seq: AtomicU64::new(0),
+            rawr_boundary_store_lock: Mutex::new(()),
+            auto_compaction_rearm: Mutex::new(AutoCompactionRearmState::default()),
         });
 
         // Dispatch the SessionConfiguredEvent first and then report any errors.
@@ -1165,7 +1181,7 @@ impl Session {
         format!("auto-compact-{id}")
     }
 
-    async fn get_total_token_usage(&self) -> i64 {
+    pub(crate) async fn get_total_token_usage(&self) -> i64 {
         let state = self.state.lock().await;
         state.get_total_token_usage(state.server_reasoning_included())
     }
@@ -2061,6 +2077,341 @@ impl Session {
         self.features.clone()
     }
 
+    pub(crate) async fn rawr_reset_auto_compaction_signals(&self, turn_id: String) {
+        if !self.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+        let turn_id_for_store = turn_id.clone();
+        {
+            let mut guard = self.rawr_auto_compaction_signals.lock().await;
+            guard.reset_for_turn(turn_id);
+        }
+        self.rawr_append_boundary_event(
+            turn_id_for_store.as_str(),
+            crate::rawr_structured_state::RawrBoundarySource::Core,
+            crate::rawr_structured_state::RawrBoundaryKind::TurnStarted,
+        )
+        .await;
+    }
+
+    async fn rawr_emit_visibility_event(&self, turn_id: &str, message: String) {
+        let event = EventMsg::BackgroundEvent(BackgroundEventEvent { message });
+        self.send_event_raw(Event {
+            id: turn_id.to_string(),
+            msg: event,
+        })
+        .await;
+    }
+
+    async fn rawr_append_boundary_event(
+        &self,
+        turn_id: &str,
+        source: crate::rawr_structured_state::RawrBoundarySource,
+        kind: crate::rawr_structured_state::RawrBoundaryKind,
+    ) {
+        if !self.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+
+        let (codex_home, cwd, repo_observation_cfg, config) = {
+            let state = self.state.lock().await;
+            let config = &state.session_configuration.original_config_do_not_use;
+            let repo_observation_cfg = config
+                .rawr_auto_compaction
+                .as_ref()
+                .and_then(|rawr| rawr.repo_observation.as_ref())
+                .map(
+                    |obs| crate::rawr_structured_state::RawrRepoObservationConfig {
+                        graphite_enabled: obs.graphite_enabled.unwrap_or(false),
+                        graphite_max_chars: obs.graphite_max_chars.unwrap_or(4_096),
+                    },
+                )
+                .unwrap_or_default();
+            (
+                config.codex_home.clone(),
+                state.session_configuration.cwd.clone(),
+                repo_observation_cfg,
+                config.clone(),
+            )
+        };
+
+        let total_usage_tokens = self.get_total_token_usage().await;
+        let decision_seq = self.rawr_decision_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let seq = self.rawr_boundary_event_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let repo =
+            crate::rawr_structured_state::observe_repo_snapshot(&cwd, repo_observation_cfg, &kind)
+                .await;
+        let mut event = crate::rawr_structured_state::new_boundary_event(
+            self.conversation_id,
+            turn_id,
+            seq,
+            source,
+            kind,
+        );
+        event.repo = repo;
+        let status_message = rawr_boundary_status_message(&event);
+        self.rawr_emit_visibility_event(turn_id, status_message)
+            .await;
+
+        let _guard = self.rawr_boundary_store_lock.lock().await;
+        match crate::rawr_structured_state::append_boundary_event(&codex_home, &event).await {
+            Ok(mut state) => {
+                let decision = crate::rawr_arbiter::RawrArbiter::evaluate_boundary_event(
+                    &config,
+                    &state,
+                    &event,
+                    decision_seq,
+                    crate::rawr_arbiter::RawrTokenContext {
+                        total_usage_tokens,
+                        model_context_window: config.model_context_window,
+                    },
+                );
+                if crate::rawr_arbiter::should_persist_shadow_decision(&event.kind, &decision)
+                    && let Err(err) = crate::rawr_structured_state::append_compaction_decision(
+                        &codex_home,
+                        &decision,
+                        &mut state,
+                    )
+                    .await
+                {
+                    tracing::warn!("rawr decision store write failed: {err}");
+                }
+            }
+            Err(err) => {
+                tracing::warn!("rawr boundary store write failed: {err}");
+            }
+        }
+    }
+
+    pub(crate) async fn rawr_note_token_pressure_decision(
+        &self,
+        config: &crate::config::Config,
+        turn_id: &str,
+        percent_remaining: i64,
+        signals: &RawrAutoCompactionSignals,
+        total_usage_tokens: i64,
+        model_context_window: Option<i64>,
+    ) {
+        if !self.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+
+        let thresholds =
+            crate::rawr_auto_compaction::RawrAutoCompactionThresholds::from_config(config);
+        if crate::rawr_auto_compaction::rawr_pick_tier(thresholds, percent_remaining).is_none() {
+            return;
+        }
+
+        let codex_home = config.codex_home.clone();
+        let decision_seq = self.rawr_decision_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let decision = crate::rawr_arbiter::RawrArbiter::evaluate_token_pressure_mid_turn(
+            config,
+            self.conversation_id,
+            turn_id,
+            signals,
+            decision_seq,
+            crate::rawr_arbiter::RawrTokenContext {
+                total_usage_tokens,
+                model_context_window,
+            },
+        );
+        let status_message = rawr_decision_status_message(&decision);
+        self.rawr_emit_visibility_event(turn_id, status_message)
+            .await;
+
+        let _guard = self.rawr_boundary_store_lock.lock().await;
+        let mut state = match crate::rawr_structured_state::load_thread_state(
+            &codex_home,
+            self.conversation_id,
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::warn!("rawr decision store load failed: {err}");
+                return;
+            }
+        };
+        if let Err(err) = crate::rawr_structured_state::append_compaction_decision(
+            &codex_home,
+            &decision,
+            &mut state,
+        )
+        .await
+        {
+            tracing::warn!("rawr decision store write failed: {err}");
+        }
+    }
+
+    pub(crate) async fn rawr_note_exec_boundary(
+        &self,
+        turn_id: &str,
+        command: &[String],
+        exit_code: i32,
+    ) {
+        if !self.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+        let mut saw_commit = false;
+        let mut saw_pr_checkpoint = false;
+        {
+            let mut guard = self.rawr_auto_compaction_signals.lock().await;
+            if !guard.is_active_turn(turn_id) {
+                return;
+            }
+            if exit_code == 0 {
+                if crate::rawr_auto_compaction::rawr_command_looks_like_git_commit(command)
+                    && !guard.saw_commit
+                {
+                    guard.saw_commit = true;
+                    saw_commit = true;
+                }
+                if crate::rawr_auto_compaction::rawr_command_looks_like_pr_checkpoint(command)
+                    && !guard.saw_pr_checkpoint
+                {
+                    guard.saw_pr_checkpoint = true;
+                    saw_pr_checkpoint = true;
+                }
+            }
+        }
+
+        if saw_commit {
+            self.rawr_append_boundary_event(
+                turn_id,
+                crate::rawr_structured_state::RawrBoundarySource::Tool,
+                crate::rawr_structured_state::RawrBoundaryKind::Commit,
+            )
+            .await;
+        }
+        if saw_pr_checkpoint {
+            self.rawr_append_boundary_event(
+                turn_id,
+                crate::rawr_structured_state::RawrBoundarySource::Tool,
+                crate::rawr_structured_state::RawrBoundaryKind::PrCheckpoint,
+            )
+            .await;
+        }
+    }
+
+    pub(crate) async fn rawr_note_plan_update(
+        &self,
+        turn_id: &str,
+        update: &codex_protocol::plan_tool::UpdatePlanArgs,
+    ) {
+        if !self.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+        let checkpoint = crate::rawr_auto_compaction::rawr_plan_update_is_checkpoint(update);
+        {
+            let mut guard = self.rawr_auto_compaction_signals.lock().await;
+            if !guard.is_active_turn(turn_id) {
+                return;
+            }
+            guard.saw_plan_update = true;
+            if checkpoint {
+                guard.saw_plan_checkpoint = true;
+            }
+        }
+
+        self.rawr_append_boundary_event(
+            turn_id,
+            crate::rawr_structured_state::RawrBoundarySource::Tool,
+            crate::rawr_structured_state::RawrBoundaryKind::PlanUpdated { checkpoint },
+        )
+        .await;
+    }
+
+    pub(crate) async fn rawr_note_semantic_boundary(
+        &self,
+        turn_id: &str,
+        last_agent_message: &str,
+    ) {
+        if !self.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+        let mut events: Vec<crate::rawr_structured_state::RawrBoundaryKind> = Vec::new();
+        {
+            let mut guard = self.rawr_auto_compaction_signals.lock().await;
+            if !guard.is_active_turn(turn_id) {
+                return;
+            }
+            if crate::rawr_auto_compaction::rawr_agent_message_looks_done(last_agent_message)
+                && !guard.saw_agent_done
+            {
+                guard.saw_agent_done = true;
+                events.push(crate::rawr_structured_state::RawrBoundaryKind::AgentDone);
+            }
+            if crate::rawr_auto_compaction::rawr_agent_message_looks_like_topic_shift(
+                last_agent_message,
+            ) && !guard.saw_topic_shift
+            {
+                guard.saw_topic_shift = true;
+                events.push(crate::rawr_structured_state::RawrBoundaryKind::TopicShift);
+            }
+            if crate::rawr_auto_compaction::rawr_agent_message_looks_like_concluding_thought(
+                last_agent_message,
+            ) && !guard.saw_concluding_thought
+            {
+                guard.saw_concluding_thought = true;
+                events.push(crate::rawr_structured_state::RawrBoundaryKind::ConcludingThought);
+            }
+        }
+
+        for event in events {
+            self.rawr_append_boundary_event(
+                turn_id,
+                crate::rawr_structured_state::RawrBoundarySource::Core,
+                event,
+            )
+            .await;
+        }
+    }
+
+    pub(crate) async fn rawr_auto_compaction_signals(
+        &self,
+        turn_id: &str,
+    ) -> RawrAutoCompactionSignals {
+        let guard = self.rawr_auto_compaction_signals.lock().await;
+        if guard.is_active_turn(turn_id) {
+            guard.clone()
+        } else {
+            RawrAutoCompactionSignals::default()
+        }
+    }
+
+    pub(crate) async fn rawr_note_compaction_completed(
+        &self,
+        turn_id: &str,
+        trigger: Option<codex_protocol::protocol::CompactionTrigger>,
+        total_tokens_before: i64,
+        total_tokens_after: i64,
+    ) {
+        self.rawr_append_boundary_event(
+            turn_id,
+            crate::rawr_structured_state::RawrBoundarySource::Compaction,
+            crate::rawr_structured_state::RawrBoundaryKind::CompactionCompleted {
+                trigger,
+                total_tokens_before,
+                total_tokens_after,
+            },
+        )
+        .await;
+    }
+
+    pub(crate) async fn auto_compaction_can_rearm(
+        &self,
+        total_usage_tokens: i64,
+        min_tokens_since_compaction: i64,
+    ) -> bool {
+        let guard = self.auto_compaction_rearm.lock().await;
+        guard.can_rearm(total_usage_tokens, min_tokens_since_compaction)
+    }
+
+    pub(crate) async fn auto_compaction_record_compaction(&self, total_usage_tokens: i64) {
+        let mut guard = self.auto_compaction_rearm.lock().await;
+        guard.record_compaction(total_usage_tokens);
+    }
+
     pub(crate) async fn collaboration_mode(&self) -> CollaborationMode {
         let state = self.state.lock().await;
         state.session_configuration.collaboration_mode.clone()
@@ -2171,6 +2522,17 @@ impl Session {
         self.send_token_count_event(turn_context).await;
     }
 
+    pub(crate) async fn update_token_usage_info_quiet(
+        &self,
+        turn_context: &TurnContext,
+        token_usage: Option<&TokenUsage>,
+    ) {
+        let mut state = self.state.lock().await;
+        if let Some(token_usage) = token_usage {
+            state.update_token_info_from_usage(token_usage, turn_context.model_context_window());
+        }
+    }
+
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
         let history = self.clone_history().await;
         let base_instructions = self.get_base_instructions().await;
@@ -2214,6 +2576,11 @@ impl Session {
             state.set_rate_limits(new_rate_limits);
         }
         self.send_token_count_event(turn_context).await;
+    }
+
+    pub(crate) async fn update_rate_limits_quiet(&self, new_rate_limits: RateLimitSnapshot) {
+        let mut state = self.state.lock().await;
+        state.set_rate_limits(new_rate_limits);
     }
 
     pub(crate) async fn mcp_dependency_prompted(&self) -> HashSet<String> {
@@ -2721,6 +3088,26 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::Compact => {
                 handlers::compact(&sess, sub.id.clone()).await;
             }
+            Op::RawrAutoCompactionJudgment {
+                request_id,
+                tier,
+                percent_remaining,
+                boundaries_present,
+                last_agent_message,
+                decision_prompt_path,
+            } => {
+                handlers::rawr_auto_compaction_judgment(
+                    &sess,
+                    sub.id.clone(),
+                    request_id,
+                    tier,
+                    percent_remaining,
+                    boundaries_present,
+                    last_agent_message,
+                    decision_prompt_path,
+                )
+                .await;
+            }
             Op::ThreadRollback { num_turns } => {
                 handlers::thread_rollback(&sess, sub.id.clone(), num_turns).await;
             }
@@ -2788,6 +3175,7 @@ mod handlers {
     use codex_protocol::protocol::ListSkillsResponseEvent;
     use codex_protocol::protocol::McpServerRefreshConfig;
     use codex_protocol::protocol::Op;
+    use codex_protocol::protocol::RawrAutoCompactionJudgmentResultEvent;
     use codex_protocol::protocol::RemoteSkillDownloadedEvent;
     use codex_protocol::protocol::RemoteSkillSummary;
     use codex_protocol::protocol::ReviewDecision;
@@ -2812,6 +3200,8 @@ mod handlers {
     use std::sync::Arc;
     use tracing::info;
     use tracing::warn;
+
+    use crate::rawr_auto_compaction_judgment::request_rawr_auto_compaction_judgment;
 
     pub async fn interrupt(sess: &Arc<Session>) {
         sess.interrupt_task().await;
@@ -3030,6 +3420,68 @@ mod handlers {
         }
     }
 
+    pub async fn rawr_auto_compaction_judgment(
+        sess: &Arc<Session>,
+        sub_id: String,
+        request_id: String,
+        tier: String,
+        percent_remaining: i64,
+        boundaries_present: Vec<String>,
+        last_agent_message: String,
+        decision_prompt_path: String,
+    ) {
+        let boundaries_json =
+            serde_json::to_string(&boundaries_present).unwrap_or_else(|_| "[]".to_string());
+        sess.rawr_emit_visibility_event(
+            sub_id.as_str(),
+            format!(
+                "RAWR judgment: start\nrequest_id={request_id}, tier={tier}, percent_remaining={percent_remaining}, boundaries={boundaries_json}"
+            ),
+        )
+        .await;
+
+        let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
+        let result = match request_rawr_auto_compaction_judgment(
+            sess,
+            &turn_context,
+            &decision_prompt_path,
+            &tier,
+            percent_remaining,
+            &boundaries_present,
+            &last_agent_message,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => crate::rawr_auto_compaction_judgment::RawrAutoCompactionJudgment {
+                should_compact: true,
+                reason: format!("Failed to run RAWR judgment: {err}"),
+            },
+        };
+
+        sess.rawr_emit_visibility_event(
+            sub_id.as_str(),
+            format!(
+                "RAWR judgment: result\nrequest_id={request_id}, should_compact={}, reason={}",
+                result.should_compact, result.reason
+            ),
+        )
+        .await;
+
+        sess.send_event_raw(Event {
+            id: sub_id,
+            msg: EventMsg::RawrAutoCompactionJudgmentResult(
+                RawrAutoCompactionJudgmentResultEvent {
+                    request_id,
+                    tier,
+                    should_compact: result.should_compact,
+                    reason: result.reason,
+                },
+            ),
+        })
+        .await;
+    }
+
     pub async fn request_user_input_response(
         sess: &Arc<Session>,
         id: String,
@@ -3243,7 +3695,16 @@ mod handlers {
     }
 
     pub async fn compact(sess: &Arc<Session>, sub_id: String) {
-        let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+        let mut turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+
+        if sess.enabled(crate::features::Feature::RawrAutoCompaction)
+            && matches!(
+                crate::compaction_audit::peek_next_compaction_trigger(sess.conversation_id),
+                Some(codex_protocol::protocol::CompactionTrigger::AutoWatcher { .. })
+            )
+        {
+            turn_context = super::rawr_compaction_turn_context(sess, &turn_context).await;
+        }
 
         sess.spawn_task(
             Arc::clone(&turn_context),
@@ -3602,6 +4063,160 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct RawrMidTurnTriggerContext {
+    trigger_percent_remaining: i64,
+    trigger_total_tokens: i64,
+    saw_commit: bool,
+    saw_plan_checkpoint: bool,
+    saw_plan_update: bool,
+    saw_pr_checkpoint: bool,
+    scratch_file: Option<String>,
+}
+
+#[derive(Debug)]
+enum RawrMidTurnCompactionPhase {
+    Idle,
+    AwaitingPacket { trigger: RawrMidTurnTriggerContext },
+    AwaitingHandoff,
+}
+
+#[derive(Debug)]
+struct RawrMidTurnCompactionState {
+    phase: RawrMidTurnCompactionPhase,
+    pending_injection: Option<String>,
+    last_compaction_total_tokens: Option<i64>,
+    last_shadow_token_pressure_tier: Option<crate::rawr_auto_compaction::RawrAutoCompactionTier>,
+}
+
+#[derive(Debug, Default)]
+struct AutoCompactionRearmState {
+    last_compaction_total_tokens: Option<i64>,
+}
+
+impl AutoCompactionRearmState {
+    fn can_rearm(&self, total_usage_tokens: i64, min_tokens_since_compaction: i64) -> bool {
+        self.last_compaction_total_tokens
+            .map(|last| total_usage_tokens.saturating_sub(last) >= min_tokens_since_compaction)
+            .unwrap_or(true)
+    }
+
+    fn record_compaction(&mut self, total_usage_tokens: i64) {
+        self.last_compaction_total_tokens = Some(total_usage_tokens);
+    }
+}
+
+impl RawrMidTurnCompactionState {
+    fn new() -> Self {
+        Self {
+            phase: RawrMidTurnCompactionPhase::Idle,
+            pending_injection: None,
+            last_compaction_total_tokens: None,
+            last_shadow_token_pressure_tier: None,
+        }
+    }
+
+    fn take_pending_injection(&mut self) -> Option<String> {
+        self.pending_injection.take()
+    }
+
+    fn start_pre_compact(&mut self, prompt: String, trigger: RawrMidTurnTriggerContext) {
+        self.phase = RawrMidTurnCompactionPhase::AwaitingPacket { trigger };
+        self.pending_injection = Some(prompt);
+    }
+
+    fn is_awaiting_packet(&self) -> bool {
+        matches!(
+            self.phase,
+            RawrMidTurnCompactionPhase::AwaitingPacket { .. }
+        )
+    }
+
+    fn take_trigger(&mut self) -> Option<RawrMidTurnTriggerContext> {
+        match std::mem::replace(&mut self.phase, RawrMidTurnCompactionPhase::Idle) {
+            RawrMidTurnCompactionPhase::AwaitingPacket { trigger } => Some(trigger),
+            other => {
+                self.phase = other;
+                None
+            }
+        }
+    }
+
+    fn schedule_handoff(&mut self, handoff: String) {
+        self.phase = RawrMidTurnCompactionPhase::AwaitingHandoff;
+        self.pending_injection = Some(handoff);
+    }
+
+    fn finish_handoff(&mut self) {
+        self.phase = RawrMidTurnCompactionPhase::Idle;
+    }
+
+    fn record_compaction(&mut self, total_usage_tokens: i64) {
+        self.last_compaction_total_tokens = Some(total_usage_tokens);
+    }
+
+    fn can_rearm(&self, total_usage_tokens: i64, min_tokens_since_compaction: i64) -> bool {
+        self.last_compaction_total_tokens
+            .map(|last| total_usage_tokens.saturating_sub(last) >= min_tokens_since_compaction)
+            .unwrap_or(true)
+    }
+
+    fn should_log_shadow_token_pressure(
+        &mut self,
+        tier: Option<crate::rawr_auto_compaction::RawrAutoCompactionTier>,
+    ) -> bool {
+        let Some(tier) = tier else {
+            return false;
+        };
+
+        let next_rank = rawr_tier_rank(tier);
+        let last_rank = self
+            .last_shadow_token_pressure_tier
+            .map(rawr_tier_rank)
+            .unwrap_or(0);
+
+        if self.last_shadow_token_pressure_tier.is_none() || next_rank > last_rank {
+            self.last_shadow_token_pressure_tier = Some(tier);
+            return true;
+        }
+
+        false
+    }
+}
+
+fn rawr_tier_rank(tier: crate::rawr_auto_compaction::RawrAutoCompactionTier) -> u8 {
+    match tier {
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Early => 1,
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Ready => 2,
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Asap => 3,
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency => 4,
+    }
+}
+
+fn rawr_mid_turn_min_tokens_since_compaction(context_window: Option<i64>) -> i64 {
+    match context_window {
+        Some(window) => window.saturating_div(50).max(64),
+        None => 256,
+    }
+}
+
+async fn rawr_inject_synthetic_user_message(
+    sess: &Session,
+    turn_context: &TurnContext,
+    text: String,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let items = vec![UserInput::Text {
+        text,
+        text_elements: Vec::new(),
+    }];
+    let response_item: ResponseItem = ResponseInputItem::from(items.clone()).into();
+    sess.record_user_prompt_and_emit_turn_item(turn_context, &items, response_item)
+        .await;
+}
+
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
 /// replies with either:
 ///
@@ -3627,16 +4242,27 @@ pub(crate) async fn run_turn(
     }
 
     let model_info = turn_context.model_info.clone();
-    let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
     let total_usage_tokens = sess.get_total_token_usage().await;
-
+    let rawr_auto_compaction_enabled = sess.enabled(Feature::RawrAutoCompaction);
+    let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
+    let min_tokens_since_compaction =
+        rawr_mid_turn_min_tokens_since_compaction(turn_context.model_context_window());
     let event = EventMsg::TurnStarted(TurnStartedEvent {
         model_context_window: turn_context.model_context_window(),
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, event).await;
-    if total_usage_tokens >= auto_compact_limit {
-        run_auto_compact(&sess, &turn_context).await;
+    crate::compaction_audit::clear_next_compaction_trigger(sess.conversation_id);
+    sess.rawr_reset_auto_compaction_signals(turn_context.sub_id.clone())
+        .await;
+    if !rawr_auto_compaction_enabled
+        && total_usage_tokens >= auto_compact_limit
+        && sess
+            .auto_compaction_can_rearm(total_usage_tokens, min_tokens_since_compaction)
+            .await
+    {
+        let total_after = run_auto_compact(&sess, &turn_context).await;
+        sess.auto_compaction_record_compaction(total_after).await;
     }
 
     let skills_outcome = Some(
@@ -3736,8 +4362,20 @@ pub(crate) async fn run_turn(
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
     let mut client_session = sess.services.model_client.new_session();
+    let mut rawr_mid_turn_state = RawrMidTurnCompactionState::new();
 
     loop {
+        if let Some(injection) = rawr_mid_turn_state.take_pending_injection() {
+            rawr_inject_synthetic_user_message(sess.as_ref(), turn_context.as_ref(), injection)
+                .await;
+            if matches!(
+                rawr_mid_turn_state.phase,
+                RawrMidTurnCompactionPhase::AwaitingHandoff
+            ) {
+                rawr_mid_turn_state.finish_handoff();
+            }
+        }
+
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
@@ -3815,10 +4453,225 @@ pub(crate) async fn run_turn(
                     needs_follow_up,
                     "post sampling token usage"
                 );
+                if rawr_auto_compaction_enabled {
+                    if let Some(last_message) = sampling_request_last_agent_message.as_deref() {
+                        sess.rawr_note_semantic_boundary(
+                            turn_context.sub_id.as_str(),
+                            last_message,
+                        )
+                        .await;
+                    }
+                    if rawr_mid_turn_state.is_awaiting_packet() {
+                        if needs_follow_up {
+                            continue;
+                        }
+                        if let Some(packet) = sampling_request_last_agent_message {
+                            if let Some(trigger) = rawr_mid_turn_state.take_trigger() {
+                                let pre_compact_tokens = trigger.trigger_total_tokens;
+                                let handoff = crate::rawr_auto_compaction::rawr_build_post_compact_handoff_message(
+                                    packet,
+                                    trigger.scratch_file.as_deref(),
+                                );
+                                crate::compaction_audit::set_next_compaction_trigger(
+                                    sess.conversation_id,
+                                    crate::rawr_compaction_trigger::auto_watcher_trigger(
+                                        trigger.trigger_percent_remaining,
+                                        trigger.saw_commit,
+                                        trigger.saw_plan_checkpoint,
+                                        trigger.saw_plan_update,
+                                        trigger.saw_pr_checkpoint,
+                                        crate::rawr_compaction_trigger::packet_author_from_rawr_config(
+                                            crate::config::types::RawrAutoCompactionPacketAuthor::Agent,
+                                        ),
+                                    ),
+                                );
+                                run_rawr_auto_compact(&sess, &turn_context).await;
+                                let total_usage_tokens = sess.get_total_token_usage().await;
+                                rawr_mid_turn_state
+                                    .record_compaction(pre_compact_tokens.min(total_usage_tokens));
+                                rawr_mid_turn_state.schedule_handoff(handoff);
+                                sess.rawr_reset_auto_compaction_signals(
+                                    turn_context.sub_id.clone(),
+                                )
+                                .await;
+                            }
+                            continue;
+                        }
+                        continue;
+                    }
+                    if needs_follow_up {
+                        let config = turn_context.config.as_ref();
+                        let percent_remaining = turn_context
+                            .model_context_window()
+                            .map(|context_window| {
+                                let remaining =
+                                    context_window.saturating_sub(total_usage_tokens).max(0);
+                                if context_window == 0 {
+                                    0
+                                } else {
+                                    remaining.saturating_mul(100) / context_window
+                                }
+                            })
+                            .unwrap_or(i64::MAX);
+                        let signals = sess
+                            .rawr_auto_compaction_signals(turn_context.sub_id.as_str())
+                            .await;
+                        let tier = crate::rawr_auto_compaction::rawr_pick_tier(
+                            crate::rawr_auto_compaction::RawrAutoCompactionThresholds::from_config(
+                                config,
+                            ),
+                            percent_remaining,
+                        );
+                        if rawr_mid_turn_state.should_log_shadow_token_pressure(tier) {
+                            sess.rawr_note_token_pressure_decision(
+                                config,
+                                turn_context.sub_id.as_str(),
+                                percent_remaining,
+                                &signals,
+                                total_usage_tokens,
+                                turn_context.model_context_window(),
+                            )
+                            .await;
+                        }
+                        if rawr_mid_turn_state
+                            .can_rearm(total_usage_tokens, min_tokens_since_compaction)
+                            && let Some(tier) = tier
+                        {
+                            let should_compact_mid_turn =
+                                crate::rawr_auto_compaction::rawr_should_compact_mid_turn(
+                                    config,
+                                    percent_remaining,
+                                    &signals,
+                                );
+                            let decision_prompt_path =
+                                crate::rawr_auto_compaction::rawr_policy_decision_prompt_path(
+                                    config, tier,
+                                );
+                            if !should_compact_mid_turn && decision_prompt_path.is_none() {
+                                continue;
+                            }
+                            let is_emergency = tier
+                                == crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency;
+                            if tier
+                                != crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency
+                                && let Some(decision_prompt_path) = decision_prompt_path
+                            {
+                                let tier_name = match tier {
+                                            crate::rawr_auto_compaction::RawrAutoCompactionTier::Early => {
+                                                "early"
+                                            }
+                                            crate::rawr_auto_compaction::RawrAutoCompactionTier::Ready => {
+                                                "ready"
+                                            }
+                                            crate::rawr_auto_compaction::RawrAutoCompactionTier::Asap => {
+                                                "asap"
+                                            }
+                                            crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency => {
+                                                unreachable!()
+                                            }
+                                        };
+
+                                let mut boundaries_present: Vec<String> = Vec::new();
+                                if signals.saw_commit {
+                                    boundaries_present.push("commit".to_string());
+                                }
+                                if signals.saw_plan_checkpoint {
+                                    boundaries_present.push("plan_checkpoint".to_string());
+                                }
+                                if signals.saw_plan_update {
+                                    boundaries_present.push("plan_update".to_string());
+                                }
+                                if signals.saw_pr_checkpoint {
+                                    boundaries_present.push("pr_checkpoint".to_string());
+                                }
+                                if signals.saw_agent_done {
+                                    boundaries_present.push("agent_done".to_string());
+                                }
+                                if signals.saw_topic_shift {
+                                    boundaries_present.push("topic_shift".to_string());
+                                }
+                                if signals.saw_concluding_thought {
+                                    boundaries_present.push("concluding".to_string());
+                                }
+
+                                let last_agent_message_for_judgment =
+                                    sampling_request_last_agent_message.as_deref().unwrap_or("");
+                                let judgment =
+                                            crate::rawr_auto_compaction_judgment::request_rawr_auto_compaction_judgment(
+                                                sess.as_ref(),
+                                                turn_context.as_ref(),
+                                                decision_prompt_path,
+                                                tier_name,
+                                                percent_remaining,
+                                                &boundaries_present,
+                                                last_agent_message_for_judgment,
+                                            )
+                                            .await;
+                                let should_compact =
+                                    judgment.as_ref().map(|j| j.should_compact).unwrap_or(true);
+                                if !should_compact {
+                                    rawr_mid_turn_state.record_compaction(total_usage_tokens);
+                                    continue;
+                                }
+                            }
+                            let scratch_write_enabled = config
+                                .rawr_auto_compaction
+                                .as_ref()
+                                .and_then(|rawr| rawr.scratch_write_enabled)
+                                .unwrap_or(false);
+                            let do_scratch =
+                                crate::rawr_auto_compaction::rawr_should_schedule_scratch_write(
+                                    scratch_write_enabled,
+                                    is_emergency,
+                                    &signals,
+                                );
+                            let scratch_file = if do_scratch {
+                                Some(crate::rawr_auto_compaction::rawr_scratch_file_rel_path(
+                                    &turn_context.session_source,
+                                    &sess.conversation_id,
+                                ))
+                            } else {
+                                None
+                            };
+                            let packet_prompt =
+                                crate::rawr_auto_compaction::rawr_load_agent_packet_prompt(
+                                    &config.codex_home,
+                                );
+                            let scratch_prompt =
+                                crate::rawr_auto_compaction::rawr_load_scratch_write_prompt(
+                                    &config.codex_home,
+                                );
+                            let prompt = crate::rawr_auto_compaction::rawr_build_agent_continuation_packet_prompt(
+                                packet_prompt.as_str(),
+                                scratch_prompt.as_str(),
+                                do_scratch,
+                                scratch_file.as_deref(),
+                                Some(sess.conversation_id),
+                            );
+                            let trigger = RawrMidTurnTriggerContext {
+                                trigger_percent_remaining: percent_remaining,
+                                trigger_total_tokens: total_usage_tokens,
+                                saw_commit: signals.saw_commit,
+                                saw_plan_checkpoint: signals.saw_plan_checkpoint,
+                                saw_plan_update: signals.saw_plan_update,
+                                saw_pr_checkpoint: signals.saw_pr_checkpoint,
+                                scratch_file,
+                            };
+                            rawr_mid_turn_state.start_pre_compact(prompt, trigger);
+                            continue;
+                        }
+                    }
+                }
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
-                if token_limit_reached && needs_follow_up {
-                    run_auto_compact(&sess, &turn_context).await;
+                if token_limit_reached && needs_follow_up && !rawr_auto_compaction_enabled {
+                    if sess
+                        .auto_compaction_can_rearm(total_usage_tokens, min_tokens_since_compaction)
+                        .await
+                    {
+                        let total_after = run_auto_compact(&sess, &turn_context).await;
+                        sess.auto_compaction_record_compaction(total_after).await;
+                    }
                     continue;
                 }
 
@@ -3876,12 +4729,105 @@ pub(crate) async fn run_turn(
     last_agent_message
 }
 
-async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
-    if should_use_remote_compact_task(sess.as_ref(), &turn_context.provider) {
+async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) -> i64 {
+    let auto_compact_limit = turn_context
+        .model_info
+        .auto_compact_token_limit()
+        .unwrap_or(i64::MAX);
+    let use_remote = should_use_remote_compact_task(sess.as_ref(), &turn_context.provider);
+    if use_remote {
         run_inline_remote_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await;
     } else {
         run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await;
     }
+    let mut total_usage_tokens = sess.get_total_token_usage().await;
+    if use_remote && total_usage_tokens >= auto_compact_limit {
+        run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await;
+        total_usage_tokens = sess.get_total_token_usage().await;
+    }
+    total_usage_tokens
+}
+
+async fn rawr_compaction_turn_context(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+) -> Arc<TurnContext> {
+    let config = turn_context.config.as_ref();
+    let rawr = config.rawr_auto_compaction.as_ref();
+    let compaction_model = rawr
+        .and_then(|rawr| rawr.compaction_model.as_deref())
+        .unwrap_or("gpt-5.2");
+    let compaction_effort = rawr
+        .and_then(|rawr| rawr.compaction_reasoning_effort)
+        .unwrap_or(codex_protocol::openai_models::ReasoningEffort::High);
+    let compaction_verbosity = rawr
+        .and_then(|rawr| rawr.compaction_verbosity)
+        .unwrap_or(codex_protocol::config_types::Verbosity::High);
+
+    // Override the model for the compaction request, but keep the rest of the turn context stable.
+    // This gives us a predictable, high-quality compaction even when the session model differs.
+    let model_info = sess
+        .services
+        .models_manager
+        .get_model_info(compaction_model, config)
+        .await;
+
+    let mut per_turn_config = (*config).clone();
+    per_turn_config.model = Some(compaction_model.to_string());
+    per_turn_config.model_verbosity = Some(compaction_verbosity);
+    per_turn_config.model_reasoning_effort = Some(compaction_effort);
+    let reasoning_effort = per_turn_config.model_reasoning_effort;
+    let reasoning_summary = per_turn_config.model_reasoning_summary;
+    let per_turn_config = Arc::new(per_turn_config);
+
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        features: &per_turn_config.features,
+        web_search_mode: per_turn_config.web_search_mode,
+    });
+    let otel_manager = turn_context
+        .otel_manager
+        .clone()
+        .with_model(compaction_model, model_info.slug.as_str());
+
+    Arc::new(TurnContext {
+        sub_id: turn_context.sub_id.clone(),
+        config: Arc::clone(&per_turn_config),
+        auth_manager: turn_context.auth_manager.clone(),
+        model_info: model_info.clone(),
+        otel_manager,
+        provider: turn_context.provider.clone(),
+        reasoning_effort,
+        reasoning_summary,
+        session_source: turn_context.session_source.clone(),
+        cwd: turn_context.cwd.clone(),
+        developer_instructions: turn_context.developer_instructions.clone(),
+        compact_prompt: turn_context.compact_prompt.clone(),
+        user_instructions: turn_context.user_instructions.clone(),
+        collaboration_mode: turn_context.collaboration_mode.clone(),
+        personality: turn_context.personality,
+        approval_policy: turn_context.approval_policy,
+        sandbox_policy: turn_context.sandbox_policy.clone(),
+        windows_sandbox_level: turn_context.windows_sandbox_level,
+        shell_environment_policy: per_turn_config.shell_environment_policy.clone(),
+        tools_config,
+        features: per_turn_config.features.clone(),
+        ghost_snapshot: per_turn_config.ghost_snapshot.clone(),
+        final_output_json_schema: turn_context.final_output_json_schema.clone(),
+        codex_linux_sandbox_exe: per_turn_config.codex_linux_sandbox_exe.clone(),
+        tool_call_gate: Arc::new(ReadinessFlag::new()),
+        truncation_policy: model_info.truncation_policy.into(),
+        dynamic_tools: turn_context.dynamic_tools.clone(),
+        turn_metadata_header: turn_context.turn_metadata_header.clone(),
+    })
+}
+
+async fn run_rawr_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
+    let _ = run_auto_compact(
+        sess,
+        &rawr_compaction_turn_context(sess, turn_context).await,
+    )
+    .await;
 }
 
 fn filter_connectors_for_input(
@@ -4823,6 +5769,150 @@ async fn try_run_sampling_request(
     outcome
 }
 
+fn rawr_boundary_status_message(event: &crate::rawr_structured_state::RawrBoundaryEvent) -> String {
+    let header = format!("RAWR boundary: {}", rawr_boundary_kind_label(&event.kind));
+    let mut details = Vec::new();
+    details.push(format!(
+        "source={}",
+        rawr_boundary_source_label(event.source)
+    ));
+    details.push(format!("turn_id={}", event.turn_id));
+    details.push(format!("seq={}", event.seq));
+
+    match &event.kind {
+        crate::rawr_structured_state::RawrBoundaryKind::TurnStarted => {}
+        crate::rawr_structured_state::RawrBoundaryKind::PlanUpdated { checkpoint } => {
+            details.push(format!("checkpoint={checkpoint}"));
+        }
+        crate::rawr_structured_state::RawrBoundaryKind::Commit => {}
+        crate::rawr_structured_state::RawrBoundaryKind::PrCheckpoint => {}
+        crate::rawr_structured_state::RawrBoundaryKind::AgentDone => {}
+        crate::rawr_structured_state::RawrBoundaryKind::TopicShift => {}
+        crate::rawr_structured_state::RawrBoundaryKind::ConcludingThought => {}
+        crate::rawr_structured_state::RawrBoundaryKind::CompactionCompleted {
+            trigger,
+            total_tokens_before,
+            total_tokens_after,
+        } => {
+            details.push(format!("tokens_before={total_tokens_before}"));
+            details.push(format!("tokens_after={total_tokens_after}"));
+            if let Some(trigger) = trigger {
+                details.push(format!("trigger={trigger:?}"));
+            }
+        }
+    }
+
+    if let Some(repo) = event.repo.as_ref() {
+        if let Some(branch) = repo.git.branch.as_ref() {
+            details.push(format!("git_branch={branch}"));
+        }
+        if let Some(graphite) = repo.graphite.as_ref() {
+            details.push(rawr_graphite_status_detail(graphite));
+        }
+    }
+
+    if details.is_empty() {
+        header
+    } else {
+        format!("{header}\n{}", details.join(", "))
+    }
+}
+
+fn rawr_boundary_kind_label(kind: &crate::rawr_structured_state::RawrBoundaryKind) -> &'static str {
+    match kind {
+        crate::rawr_structured_state::RawrBoundaryKind::TurnStarted => "turn_started",
+        crate::rawr_structured_state::RawrBoundaryKind::PlanUpdated { .. } => "plan_updated",
+        crate::rawr_structured_state::RawrBoundaryKind::Commit => "commit",
+        crate::rawr_structured_state::RawrBoundaryKind::PrCheckpoint => "pr_checkpoint",
+        crate::rawr_structured_state::RawrBoundaryKind::AgentDone => "agent_done",
+        crate::rawr_structured_state::RawrBoundaryKind::TopicShift => "topic_shift",
+        crate::rawr_structured_state::RawrBoundaryKind::ConcludingThought => "concluding_thought",
+        crate::rawr_structured_state::RawrBoundaryKind::CompactionCompleted { .. } => {
+            "compaction_completed"
+        }
+    }
+}
+
+fn rawr_boundary_source_label(
+    source: crate::rawr_structured_state::RawrBoundarySource,
+) -> &'static str {
+    match source {
+        crate::rawr_structured_state::RawrBoundarySource::Core => "core",
+        crate::rawr_structured_state::RawrBoundarySource::Tool => "tool",
+        crate::rawr_structured_state::RawrBoundarySource::Compaction => "compaction",
+    }
+}
+
+fn rawr_graphite_status_detail(
+    snapshot: &crate::rawr_structured_state::RawrGraphiteSnapshot,
+) -> String {
+    let status = if let Some(status) = snapshot.status.as_ref() {
+        status.as_str()
+    } else if snapshot.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    if let Some(error) = snapshot.error.as_ref() {
+        format!("graphite={status} error={error}")
+    } else {
+        format!("graphite={status}")
+    }
+}
+
+fn rawr_decision_status_message(
+    decision: &crate::rawr_structured_state::RawrCompactionDecision,
+) -> String {
+    let header = "RAWR decision: token_pressure".to_string();
+    let mut details = Vec::new();
+    details.push(format!(
+        "action={}",
+        rawr_decision_action_label(decision.action)
+    ));
+    if let Some(tier) = decision.tier.as_ref() {
+        details.push(format!("tier={tier}"));
+    }
+    if let Some(percent_remaining) = decision.percent_remaining {
+        details.push(format!("percent_remaining={percent_remaining}"));
+    }
+    if !decision.reasons.is_empty() {
+        let reasons = decision
+            .reasons
+            .iter()
+            .map(rawr_decision_reason_label)
+            .collect::<Vec<_>>()
+            .join("|");
+        details.push(format!("reasons={reasons}"));
+    }
+    format!("{header}\n{}", details.join(", "))
+}
+
+fn rawr_decision_action_label(
+    action: crate::rawr_structured_state::RawrDecisionAction,
+) -> &'static str {
+    match action {
+        crate::rawr_structured_state::RawrDecisionAction::NoAction => "no_action",
+        crate::rawr_structured_state::RawrDecisionAction::ConsiderCompaction => {
+            "consider_compaction"
+        }
+    }
+}
+
+fn rawr_decision_reason_label(
+    reason: &crate::rawr_structured_state::RawrDecisionReason,
+) -> &'static str {
+    match reason {
+        crate::rawr_structured_state::RawrDecisionReason::MissingContextWindow => {
+            "missing_context_window"
+        }
+        crate::rawr_structured_state::RawrDecisionReason::AboveThreshold => "above_threshold",
+        crate::rawr_structured_state::RawrDecisionReason::BoundaryGatingNotSatisfied => {
+            "boundary_gating_not_satisfied"
+        }
+        crate::rawr_structured_state::RawrDecisionReason::EligibleByPolicy => "eligible_by_policy",
+    }
+}
+
 pub(super) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<String> {
     responses.iter().rev().find_map(|item| {
         if let ResponseItem::Message { role, content, .. } = item {
@@ -4916,6 +6006,56 @@ mod tests {
             end_turn: None,
             phase: None,
         }
+    }
+
+    #[test]
+    fn rawr_mid_turn_shadow_token_pressure_dedupes_until_tier_escalates() {
+        let mut state = super::RawrMidTurnCompactionState::new();
+        use crate::rawr_auto_compaction::RawrAutoCompactionTier;
+
+        assert_eq!(state.should_log_shadow_token_pressure(None), false);
+
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Early)),
+            true
+        );
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Early)),
+            false
+        );
+
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Ready)),
+            true
+        );
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Ready)),
+            false
+        );
+
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Asap)),
+            true
+        );
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Asap)),
+            false
+        );
+
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Emergency)),
+            true
+        );
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Emergency)),
+            false
+        );
+
+        // De-escalation should not re-log.
+        assert_eq!(
+            state.should_log_shadow_token_pressure(Some(RawrAutoCompactionTier::Asap)),
+            false
+        );
     }
 
     fn make_connector(id: &str, name: &str) -> AppInfo {
@@ -5820,6 +6960,11 @@ mod tests {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            rawr_auto_compaction_signals: Mutex::new(RawrAutoCompactionSignals::default()),
+            rawr_boundary_event_seq: AtomicU64::new(0),
+            rawr_decision_seq: AtomicU64::new(0),
+            rawr_boundary_store_lock: Mutex::new(()),
+            auto_compaction_rearm: Mutex::new(AutoCompactionRearmState::default()),
         };
 
         (session, turn_context)
@@ -5950,6 +7095,11 @@ mod tests {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            rawr_auto_compaction_signals: Mutex::new(RawrAutoCompactionSignals::default()),
+            rawr_boundary_event_seq: AtomicU64::new(0),
+            rawr_decision_seq: AtomicU64::new(0),
+            rawr_boundary_store_lock: Mutex::new(()),
+            auto_compaction_rearm: Mutex::new(AutoCompactionRearmState::default()),
         });
 
         (session, turn_context, rx_event)
@@ -6429,6 +7579,7 @@ mod tests {
         rollout_items.push(RolloutItem::Compacted(CompactedItem {
             message: summary1.to_string(),
             replacement_history: None,
+            trigger: None,
         }));
 
         let user2 = ResponseItem::Message {
@@ -6467,6 +7618,7 @@ mod tests {
         rollout_items.push(RolloutItem::Compacted(CompactedItem {
             message: summary2.to_string(),
             replacement_history: None,
+            trigger: None,
         }));
 
         let user3 = ResponseItem::Message {

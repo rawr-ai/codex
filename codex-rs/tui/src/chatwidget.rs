@@ -23,6 +23,9 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,6 +47,11 @@ use codex_chatgpt::connectors;
 use codex_core::config::Config;
 use codex_core::config::ConstraintResult;
 use codex_core::config::types::Notifications;
+use codex_core::config::types::RawrAutoCompactionBoundary;
+use codex_core::config::types::RawrAutoCompactionMode;
+use codex_core::config::types::RawrAutoCompactionPacketAuthor;
+use codex_core::config::types::RawrAutoCompactionPolicyTierToml;
+use codex_core::config::types::RawrAutoCompactionPolicyToml;
 use codex_core::config_loader::ConfigLayerStackOrdering;
 use codex_core::features::FEATURES;
 use codex_core::features::Feature;
@@ -84,6 +92,7 @@ use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::RateLimitSnapshot;
+use codex_core::protocol::RawrAutoCompactionJudgmentResultEvent;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::SkillMetadata as ProtocolSkillMetadata;
@@ -101,6 +110,7 @@ use codex_core::protocol::ViewImageToolCallEvent;
 use codex_core::protocol::WarningEvent;
 use codex_core::protocol::WebSearchBeginEvent;
 use codex_core::protocol::WebSearchEndEvent;
+use codex_core::rawr_prompts;
 use codex_core::skills::model::SkillMetadata;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
@@ -230,6 +240,7 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use strum::IntoEnumIterator;
+use uuid::Uuid;
 
 const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it locally";
 const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
@@ -499,6 +510,7 @@ pub(crate) struct ChatWidget {
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
     token_info: Option<TokenUsageInfo>,
+    status_token_info: Option<TokenUsageInfo>,
     rate_limit_snapshot: Option<RateLimitSnapshotDisplay>,
     plan_type: Option<PlanType>,
     rate_limit_warnings: RateLimitWarningState,
@@ -609,6 +621,475 @@ pub(crate) struct ChatWidget {
     // True once we've attempted a branch lookup for the current CWD.
     status_line_branch_lookup_complete: bool,
     external_editor_state: ExternalEditorState,
+    rawr_auto_compaction_state: RawrAutoCompactionState,
+    rawr_saw_commit_this_turn: bool,
+    rawr_saw_plan_checkpoint_this_turn: bool,
+    rawr_saw_pr_checkpoint_this_turn: bool,
+    rawr_preflight_compaction_pending: Option<RawrAutoCompactionTriggerContext>,
+    /// When compaction completes while a user message is queued, avoid starting an extra
+    /// model turn by injecting the post-compaction handoff into the next queued user message.
+    rawr_post_compact_handoff_pending: Option<String>,
+    rawr_scratch_agent_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawrAutoCompactionTriggerContext {
+    trigger_percent_remaining: i64,
+    saw_commit: bool,
+    saw_plan_checkpoint: bool,
+    saw_plan_update: bool,
+    saw_pr_checkpoint: bool,
+    agent_done: bool,
+    last_agent_message: Option<String>,
+    scratch_file: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum RawrAutoCompactionState {
+    Idle,
+    AwaitingScratchWrite {
+        trigger: RawrAutoCompactionTriggerContext,
+        packet_author: RawrAutoCompactionPacketAuthor,
+    },
+    AwaitingJudgment {
+        request_id: String,
+        trigger: RawrAutoCompactionTriggerContext,
+        settings: RawrAutoCompactionSettings,
+        should_defer_to_next_user_turn: bool,
+    },
+    AwaitingPacket {
+        trigger: RawrAutoCompactionTriggerContext,
+        packet_author: RawrAutoCompactionPacketAuthor,
+    },
+    Compacting {
+        trigger: RawrAutoCompactionTriggerContext,
+        packet_author: RawrAutoCompactionPacketAuthor,
+        packet: String,
+        saw_context_compacted: bool,
+        saw_turn_complete: bool,
+        should_inject_packet: bool,
+    },
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[derive(Default)]
+struct RawrAutoCompactionPromptFrontmatter {
+    version: Option<u32>,
+    trigger: RawrAutoCompactionTriggerRules,
+    packet: RawrAutoCompactionPacketRules,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawrAutoCompactionTriggerRules {
+    early_percent_remaining_lt: Option<i64>,
+    ready_percent_remaining_lt: Option<i64>,
+    asap_percent_remaining_lt: Option<i64>,
+    emergency_percent_remaining_lt: i64,
+    auto_requires_any_boundary: Vec<RawrAutoCompactionBoundary>,
+}
+
+impl Default for RawrAutoCompactionTriggerRules {
+    fn default() -> Self {
+        Self {
+            early_percent_remaining_lt: Some(85),
+            ready_percent_remaining_lt: Some(75),
+            asap_percent_remaining_lt: Some(65),
+            emergency_percent_remaining_lt: 15,
+            auto_requires_any_boundary: vec![
+                RawrAutoCompactionBoundary::Commit,
+                RawrAutoCompactionBoundary::PrCheckpoint,
+                RawrAutoCompactionBoundary::PlanCheckpoint,
+                RawrAutoCompactionBoundary::AgentDone,
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawrAutoCompactionPacketRules {
+    max_tail_chars: usize,
+}
+
+impl Default for RawrAutoCompactionPacketRules {
+    fn default() -> Self {
+        Self {
+            max_tail_chars: 1200,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawrAutoCompactionTier {
+    Early,
+    Ready,
+    Asap,
+    Emergency,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawrAutoCompactionThresholds {
+    early_percent_remaining_lt: i64,
+    ready_percent_remaining_lt: i64,
+    asap_percent_remaining_lt: i64,
+    emergency_percent_remaining_lt: i64,
+}
+
+impl RawrAutoCompactionThresholds {
+    fn from_settings(settings: &RawrAutoCompactionSettings) -> Self {
+        let defaults = Self {
+            early_percent_remaining_lt: 85,
+            ready_percent_remaining_lt: 75,
+            asap_percent_remaining_lt: 65,
+            emergency_percent_remaining_lt: 15,
+        };
+        let trigger = &settings.prompt_frontmatter.trigger;
+
+        let mut thresholds = Self {
+            early_percent_remaining_lt: trigger
+                .early_percent_remaining_lt
+                .unwrap_or(defaults.early_percent_remaining_lt),
+            ready_percent_remaining_lt: trigger
+                .ready_percent_remaining_lt
+                .unwrap_or(defaults.ready_percent_remaining_lt),
+            asap_percent_remaining_lt: trigger
+                .asap_percent_remaining_lt
+                .unwrap_or(defaults.asap_percent_remaining_lt),
+            emergency_percent_remaining_lt: trigger.emergency_percent_remaining_lt,
+        };
+
+        if let Some(policy) = settings.policy.as_ref() {
+            thresholds.early_percent_remaining_lt = policy
+                .early
+                .as_ref()
+                .and_then(|tier| tier.percent_remaining_lt)
+                .unwrap_or(thresholds.early_percent_remaining_lt);
+            thresholds.ready_percent_remaining_lt = policy
+                .ready
+                .as_ref()
+                .and_then(|tier| tier.percent_remaining_lt)
+                .unwrap_or(thresholds.ready_percent_remaining_lt);
+            thresholds.asap_percent_remaining_lt = policy
+                .asap
+                .as_ref()
+                .and_then(|tier| tier.percent_remaining_lt)
+                .unwrap_or(thresholds.asap_percent_remaining_lt);
+            thresholds.emergency_percent_remaining_lt = policy
+                .emergency
+                .as_ref()
+                .and_then(|tier| tier.percent_remaining_lt)
+                .unwrap_or(thresholds.emergency_percent_remaining_lt);
+        }
+
+        thresholds
+    }
+}
+
+fn rawr_pick_tier(
+    thresholds: RawrAutoCompactionThresholds,
+    percent_remaining: i64,
+) -> Option<RawrAutoCompactionTier> {
+    if percent_remaining < thresholds.emergency_percent_remaining_lt {
+        return Some(RawrAutoCompactionTier::Emergency);
+    }
+    if percent_remaining < thresholds.asap_percent_remaining_lt {
+        return Some(RawrAutoCompactionTier::Asap);
+    }
+    if percent_remaining < thresholds.ready_percent_remaining_lt {
+        return Some(RawrAutoCompactionTier::Ready);
+    }
+    if percent_remaining < thresholds.early_percent_remaining_lt {
+        return Some(RawrAutoCompactionTier::Early);
+    }
+    None
+}
+
+fn rawr_allowed_boundaries_for_tier(
+    tier: RawrAutoCompactionTier,
+) -> &'static [RawrAutoCompactionBoundary] {
+    match tier {
+        RawrAutoCompactionTier::Early => &[
+            RawrAutoCompactionBoundary::PlanCheckpoint,
+            RawrAutoCompactionBoundary::PlanUpdate,
+            RawrAutoCompactionBoundary::PrCheckpoint,
+            RawrAutoCompactionBoundary::TopicShift,
+        ],
+        RawrAutoCompactionTier::Ready => &[
+            RawrAutoCompactionBoundary::Commit,
+            RawrAutoCompactionBoundary::PlanCheckpoint,
+            RawrAutoCompactionBoundary::PlanUpdate,
+            RawrAutoCompactionBoundary::PrCheckpoint,
+            RawrAutoCompactionBoundary::TopicShift,
+        ],
+        RawrAutoCompactionTier::Asap => &[
+            RawrAutoCompactionBoundary::Commit,
+            RawrAutoCompactionBoundary::PlanCheckpoint,
+            RawrAutoCompactionBoundary::PlanUpdate,
+            RawrAutoCompactionBoundary::PrCheckpoint,
+            RawrAutoCompactionBoundary::AgentDone,
+            RawrAutoCompactionBoundary::TopicShift,
+            RawrAutoCompactionBoundary::ConcludingThought,
+        ],
+        RawrAutoCompactionTier::Emergency => &[],
+    }
+}
+
+fn rawr_policy_tier(
+    policy: Option<&RawrAutoCompactionPolicyToml>,
+    tier: RawrAutoCompactionTier,
+) -> Option<&RawrAutoCompactionPolicyTierToml> {
+    let policy = policy?;
+    match tier {
+        RawrAutoCompactionTier::Early => policy.early.as_ref(),
+        RawrAutoCompactionTier::Ready => policy.ready.as_ref(),
+        RawrAutoCompactionTier::Asap => policy.asap.as_ref(),
+        RawrAutoCompactionTier::Emergency => policy.emergency.as_ref(),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawrAutoCompactionBoundaryCheck {
+    has_any_required_boundary: bool,
+    satisfied_plan_boundary: bool,
+    satisfied_non_plan_boundary: bool,
+}
+
+fn rawr_check_boundaries(
+    allowed_boundaries: &[RawrAutoCompactionBoundary],
+    required_boundaries: &[RawrAutoCompactionBoundary],
+    boundary_values: &std::collections::HashMap<RawrAutoCompactionBoundary, bool>,
+) -> RawrAutoCompactionBoundaryCheck {
+    let mut result = RawrAutoCompactionBoundaryCheck {
+        has_any_required_boundary: false,
+        satisfied_plan_boundary: false,
+        satisfied_non_plan_boundary: false,
+    };
+
+    for boundary in required_boundaries {
+        if *boundary == RawrAutoCompactionBoundary::TurnComplete {
+            result.has_any_required_boundary = true;
+            continue;
+        }
+        if !allowed_boundaries.is_empty() && !allowed_boundaries.contains(boundary) {
+            continue;
+        }
+        let Some(value) = boundary_values.get(boundary) else {
+            continue;
+        };
+        if !*value {
+            continue;
+        }
+        result.has_any_required_boundary = true;
+        match boundary {
+            RawrAutoCompactionBoundary::PlanCheckpoint | RawrAutoCompactionBoundary::PlanUpdate => {
+                result.satisfied_plan_boundary = true;
+            }
+            RawrAutoCompactionBoundary::Commit | RawrAutoCompactionBoundary::PrCheckpoint => {
+                result.satisfied_non_plan_boundary = true;
+            }
+            RawrAutoCompactionBoundary::AgentDone
+            | RawrAutoCompactionBoundary::TopicShift
+            | RawrAutoCompactionBoundary::ConcludingThought
+            | RawrAutoCompactionBoundary::TurnComplete => {}
+        }
+    }
+
+    result
+}
+
+#[derive(Debug, Clone)]
+struct RawrAutoCompactionSettings {
+    mode: RawrAutoCompactionMode,
+    packet_author: RawrAutoCompactionPacketAuthor,
+    scratch_write_enabled: bool,
+    policy: Option<RawrAutoCompactionPolicyToml>,
+    prompt_frontmatter: RawrAutoCompactionPromptFrontmatter,
+    agent_packet_prompt: String,
+    scratch_write_prompt: String,
+}
+
+impl RawrAutoCompactionSettings {
+    fn default_with_mode(
+        mode: RawrAutoCompactionMode,
+        packet_author: RawrAutoCompactionPacketAuthor,
+    ) -> Self {
+        let prompt_frontmatter = RawrAutoCompactionPromptFrontmatter::default();
+        Self {
+            mode,
+            packet_author,
+            scratch_write_enabled: false,
+            policy: None,
+            prompt_frontmatter,
+            agent_packet_prompt: default_rawr_agent_packet_prompt(),
+            scratch_write_prompt: default_rawr_scratch_write_prompt(),
+        }
+    }
+}
+
+const RAWR_SCRATCH_FALLBACK_AGENT_NAMES: [&str; 24] = [
+    "Aria", "Atlas", "Beau", "Cleo", "Ezra", "Jade", "Juno", "Luna", "Milo", "Nova", "Orion",
+    "Pax", "Quinn", "Reid", "Remy", "Rhea", "Rory", "Sage", "Skye", "Toby", "Vera", "Wren", "Zane",
+    "Zoe",
+];
+
+fn default_rawr_agent_packet_prompt() -> String {
+    [
+        "[rawr] Before we compact this thread, produce a **continuation context packet** for yourself.",
+        "",
+        "Requirements:",
+        "- Keep it short and structured.",
+        "- Include: overarching goal, current state, next steps, invariants/decisions, and a final directive to continue after compaction.",
+        "- Do not include secrets; redact tokens/keys.",
+    ]
+    .join("\n")
+}
+
+fn default_rawr_scratch_write_prompt() -> String {
+    [
+        "[rawr] Before we compact this thread, write a scratchpad file with what you just worked on.",
+        "",
+        "Target file: `{scratch_file}`",
+        "",
+        "Requirements:",
+        "- Create the `.scratch/` directory if it doesn't exist.",
+        "- Append a new section (do not delete prior scratch content).",
+        "- Prefer verbatim notes/drafts over summaries; include raw details that are useful later.",
+        "- Include links/paths to any important files you edited or created.",
+        "- After writing, confirm in your next message that the scratch file was written and include the exact path.",
+    ]
+    .join("\n")
+}
+
+fn rawr_command_looks_like_git_commit(command: &[String]) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+
+    let joined = command.join(" ").to_ascii_lowercase();
+    if joined.contains("git commit") {
+        return true;
+    }
+
+    fn basename(s: &str) -> &str {
+        std::path::Path::new(s)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or(s)
+    }
+
+    command
+        .windows(2)
+        .any(|pair| basename(pair[0].as_str()) == "git" && pair[1].eq_ignore_ascii_case("commit"))
+}
+
+fn rawr_command_looks_like_pr_checkpoint(command: &[String]) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+    let joined = command.join(" ").to_ascii_lowercase();
+
+    if joined.contains("git push") {
+        return true;
+    }
+    if joined.contains("gt submit") || joined.contains("gt ss") {
+        return true;
+    }
+    if joined.contains("gt create") || joined.contains("gt review") || joined.contains("gt land") {
+        return true;
+    }
+    if joined.contains("gh pr create")
+        || joined.contains("gh pr close")
+        || joined.contains("gh pr merge")
+        || joined.contains("gh pr reopen")
+        || joined.contains("gh pr review")
+    {
+        return true;
+    }
+
+    false
+}
+
+fn rawr_agent_message_looks_done(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    if lower.contains("not done")
+        || lower.contains("not completed")
+        || lower.contains("not finished")
+    {
+        return false;
+    }
+    ["done", "completed", "finished", "shipped", "pushed"]
+        .into_iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn rawr_agent_message_looks_like_topic_shift(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    [
+        "moving on",
+        "switching to",
+        "next,",
+        "next:",
+        "next up",
+        "now, let's",
+        "now let's",
+        "we'll now",
+    ]
+    .into_iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn rawr_agent_message_looks_like_concluding_thought(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    [
+        "in summary",
+        "to summarize",
+        "to wrap up",
+        "wrapping up",
+        "conclusion",
+        "concluding",
+        "final thoughts",
+        "next steps",
+    ]
+    .into_iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn split_yaml_frontmatter(contents: &str) -> (Option<&str>, &str) {
+    let mut iter = contents.split_inclusive('\n');
+    let Some(first_line) = iter.next() else {
+        return (None, contents);
+    };
+    if first_line.trim_end_matches(['\r', '\n']) != "---" {
+        return (None, contents);
+    }
+
+    let frontmatter_start = first_line.len();
+    let mut cursor = frontmatter_start;
+
+    for piece in iter {
+        let piece_start = cursor;
+        let line = piece.trim_end_matches(['\r', '\n']);
+        if line == "---" {
+            let frontmatter = &contents[frontmatter_start..piece_start];
+            let body_start = piece_start.saturating_add(piece.len());
+            let body = contents.get(body_start..).unwrap_or("");
+            return (Some(frontmatter), body);
+        }
+        cursor = cursor.saturating_add(piece.len());
+    }
+
+    (None, contents)
 }
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
@@ -974,6 +1455,7 @@ impl ChatWidget {
         self.thread_id = Some(event.session_id);
         self.thread_name = event.thread_name.clone();
         self.forked_from = event.forked_from_id;
+        self.rawr_scratch_agent_name = None;
         self.current_rollout_path = event.rollout_path.clone();
         self.current_cwd = Some(event.cwd.clone());
         let initial_messages = event.initial_messages.clone();
@@ -1248,6 +1730,22 @@ impl ChatWidget {
         self.plan_stream_controller = None;
         self.turn_runtime_metrics = RuntimeMetricsSummary::default();
         self.otel_manager.reset_runtime_metrics();
+        self.rawr_saw_commit_this_turn = false;
+        self.rawr_saw_plan_checkpoint_this_turn = false;
+        self.rawr_saw_pr_checkpoint_this_turn = false;
+        if let RawrAutoCompactionState::Compacting {
+            saw_context_compacted: false,
+            saw_turn_complete: true,
+            ..
+        } = self.rawr_auto_compaction_state
+        {
+            self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+            self.add_info_message(
+                "[rawr] auto-compaction watcher: compaction did not complete; skipping post-compact injection."
+                    .to_string(),
+                None,
+            );
+        }
         self.bottom_pane.clear_quit_shortcut_hint();
         self.quit_shortcut_expires_at = None;
         self.quit_shortcut_key = None;
@@ -1304,12 +1802,16 @@ impl ChatWidget {
         self.request_redraw();
 
         if !from_replay && self.queued_user_messages.is_empty() {
-            self.maybe_prompt_plan_implementation();
+            self.maybe_prompt_plan_implementation(last_agent_message.as_deref());
         }
         // Keep this flag for replayed completion events so a subsequent live TurnComplete can
         // still show the prompt once after thread switch replay.
         if !from_replay {
+            self.saw_plan_update_this_turn = false;
             self.saw_plan_item_this_turn = false;
+        }
+        if !from_replay {
+            self.maybe_rawr_auto_compact(last_agent_message.as_deref());
         }
         // If there is a queued user message, send exactly one now to begin the next turn.
         self.maybe_send_next_queued_input();
@@ -1321,7 +1823,967 @@ impl ChatWidget {
         self.maybe_show_pending_rate_limit_prompt();
     }
 
-    fn maybe_prompt_plan_implementation(&mut self) {
+    fn rawr_auto_compaction_mode(&self) -> RawrAutoCompactionMode {
+        self.config
+            .rawr_auto_compaction
+            .as_ref()
+            .and_then(|config| config.mode)
+            .unwrap_or(RawrAutoCompactionMode::Suggest)
+    }
+
+    fn rawr_auto_compaction_packet_author(&self) -> RawrAutoCompactionPacketAuthor {
+        codex_core::config::rawr::packet_author(&self.config)
+    }
+
+    fn maybe_rawr_auto_compact(&mut self, last_agent_message: Option<&str>) {
+        let settings = self.rawr_load_auto_compaction_settings();
+        self.maybe_rawr_auto_compact_with_settings(last_agent_message, settings);
+    }
+
+    fn maybe_rawr_auto_compact_with_settings(
+        &mut self,
+        last_agent_message: Option<&str>,
+        settings: RawrAutoCompactionSettings,
+    ) {
+        if !self.config.features.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+        if self.bottom_pane.is_task_running() || self.agent_turn_running {
+            return;
+        }
+        if self.is_review_mode {
+            return;
+        }
+
+        match std::mem::replace(
+            &mut self.rawr_auto_compaction_state,
+            RawrAutoCompactionState::Idle,
+        ) {
+            RawrAutoCompactionState::Idle => {
+                self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+            }
+            RawrAutoCompactionState::AwaitingJudgment {
+                request_id,
+                trigger,
+                settings,
+                should_defer_to_next_user_turn,
+            } => {
+                // Waiting on an internal judgment result event; do not re-evaluate until it arrives.
+                self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingJudgment {
+                    request_id,
+                    trigger,
+                    settings,
+                    should_defer_to_next_user_turn,
+                };
+                return;
+            }
+            RawrAutoCompactionState::AwaitingScratchWrite {
+                trigger,
+                packet_author,
+            } => {
+                // Scratch write step completed (best-effort). Proceed to continuation packet step,
+                // which must happen immediately before compaction.
+                match packet_author {
+                    RawrAutoCompactionPacketAuthor::Watcher => {
+                        let packet = self.rawr_build_post_compact_packet(
+                            &trigger,
+                            settings.prompt_frontmatter.packet.max_tail_chars,
+                        );
+                        self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                            trigger,
+                            packet_author,
+                            packet,
+                            saw_context_compacted: false,
+                            saw_turn_complete: false,
+                            should_inject_packet: true,
+                        };
+                        self.rawr_trigger_compact();
+                        return;
+                    }
+                    RawrAutoCompactionPacketAuthor::Agent => {
+                        let scratch_file = trigger.scratch_file.clone();
+                        self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingPacket {
+                            trigger,
+                            packet_author,
+                        };
+                        let prompt = self.rawr_build_agent_continuation_packet_prompt(
+                            &settings,
+                            false,
+                            scratch_file.as_deref(),
+                        );
+                        self.rawr_request_packet_from_agent(prompt);
+                        return;
+                    }
+                }
+            }
+            RawrAutoCompactionState::AwaitingPacket {
+                trigger,
+                packet_author,
+            } => {
+                let packet = last_agent_message
+                    .unwrap_or("Continue the remaining work after compaction.")
+                    .to_string();
+                self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                    trigger,
+                    packet_author,
+                    packet,
+                    saw_context_compacted: false,
+                    saw_turn_complete: false,
+                    should_inject_packet: true,
+                };
+                self.rawr_trigger_compact();
+                return;
+            }
+            RawrAutoCompactionState::Compacting {
+                trigger,
+                packet,
+                saw_context_compacted,
+                should_inject_packet,
+                packet_author,
+                ..
+            } => {
+                if saw_context_compacted {
+                    if should_inject_packet {
+                        self.rawr_inject_post_compact_packet(&trigger, packet);
+                    } else {
+                        self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+                    }
+                } else {
+                    self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                        trigger,
+                        packet_author,
+                        packet,
+                        saw_context_compacted: false,
+                        saw_turn_complete: true,
+                        should_inject_packet,
+                    };
+                }
+                return;
+            }
+        }
+
+        let Some(info) = self.token_info.as_ref() else {
+            return;
+        };
+        let Some(percent_remaining) = self.context_remaining_percent(info) else {
+            return;
+        };
+
+        let thresholds = RawrAutoCompactionThresholds::from_settings(&settings);
+        let Some(tier) = rawr_pick_tier(thresholds, percent_remaining) else {
+            return;
+        };
+
+        let policy_tier = rawr_policy_tier(settings.policy.as_ref(), tier);
+        let policy_boundaries = policy_tier.and_then(|tier| tier.requires_any_boundary.as_deref());
+        let allowed_boundaries =
+            policy_boundaries.unwrap_or_else(|| rawr_allowed_boundaries_for_tier(tier));
+        let agent_done = last_agent_message.is_some_and(rawr_agent_message_looks_done);
+        let has_semantic_boundary = agent_done
+            || last_agent_message.is_some_and(rawr_agent_message_looks_like_topic_shift)
+            || last_agent_message.is_some_and(rawr_agent_message_looks_like_concluding_thought);
+        let required_boundaries = if policy_boundaries.is_some() {
+            allowed_boundaries
+        } else if settings
+            .prompt_frontmatter
+            .trigger
+            .auto_requires_any_boundary
+            .is_empty()
+        {
+            allowed_boundaries
+        } else {
+            settings
+                .prompt_frontmatter
+                .trigger
+                .auto_requires_any_boundary
+                .as_slice()
+        };
+
+        let is_emergency = tier == RawrAutoCompactionTier::Emergency;
+        let requires_semantic_boundary_for_plan = policy_tier
+            .and_then(|tier| tier.plan_boundaries_require_semantic_break)
+            .unwrap_or(matches!(
+                tier,
+                RawrAutoCompactionTier::Early | RawrAutoCompactionTier::Ready
+            ));
+
+        let mut boundary_values = std::collections::HashMap::new();
+        boundary_values.insert(
+            RawrAutoCompactionBoundary::Commit,
+            self.rawr_saw_commit_this_turn,
+        );
+        boundary_values.insert(
+            RawrAutoCompactionBoundary::PrCheckpoint,
+            self.rawr_saw_pr_checkpoint_this_turn,
+        );
+        boundary_values.insert(
+            RawrAutoCompactionBoundary::PlanCheckpoint,
+            self.rawr_saw_plan_checkpoint_this_turn,
+        );
+        boundary_values.insert(
+            RawrAutoCompactionBoundary::PlanUpdate,
+            self.saw_plan_update_this_turn,
+        );
+        boundary_values.insert(RawrAutoCompactionBoundary::AgentDone, agent_done);
+        boundary_values.insert(
+            RawrAutoCompactionBoundary::TopicShift,
+            last_agent_message.is_some_and(rawr_agent_message_looks_like_topic_shift),
+        );
+        boundary_values.insert(
+            RawrAutoCompactionBoundary::ConcludingThought,
+            last_agent_message.is_some_and(rawr_agent_message_looks_like_concluding_thought),
+        );
+
+        let boundary_check =
+            rawr_check_boundaries(allowed_boundaries, required_boundaries, &boundary_values);
+        let has_any_required_boundary = boundary_check.has_any_required_boundary;
+
+        let should_compact_due_to_boundaries = if is_emergency {
+            true
+        } else if !has_any_required_boundary {
+            false
+        } else {
+            !(requires_semantic_boundary_for_plan
+                && boundary_check.satisfied_plan_boundary
+                && !boundary_check.satisfied_non_plan_boundary
+                && !has_semantic_boundary)
+        };
+
+        match settings.mode {
+            RawrAutoCompactionMode::Tag => {
+                self.add_info_message(
+                    format!(
+                        "[rawr] auto-compaction watcher: would compact now (tag). Context window: {percent_remaining}% left."
+                    ),
+                    None,
+                );
+            }
+            RawrAutoCompactionMode::Suggest => {
+                self.add_info_message(
+                    format!(
+                        "[rawr] auto-compaction watcher: recommend compact now (suggest). Context window: {percent_remaining}% left. Run `/compact` to proceed, or set `rawr_auto_compaction.mode = \"auto\"` in config.toml for automatic compaction."
+                    ),
+                    None,
+                );
+            }
+            RawrAutoCompactionMode::Auto => {
+                if !should_compact_due_to_boundaries {
+                    self.add_info_message(
+                        format!(
+                            "[rawr] auto-compaction watcher: skipping auto compact (no natural boundary / semantic break). Context window: {percent_remaining}% left. Run `/compact` or edit prompts to adjust boundary gating."
+                        ),
+                        None,
+                    );
+                    return;
+                }
+
+                if !is_emergency {
+                    let decision_prompt_path = policy_tier
+                        .and_then(|tier| tier.decision_prompt_path.as_deref())
+                        .map(str::to_string);
+                    if let Some(decision_prompt_path) = decision_prompt_path {
+                        let tier_name = match tier {
+                            RawrAutoCompactionTier::Early => "early",
+                            RawrAutoCompactionTier::Ready => "ready",
+                            RawrAutoCompactionTier::Asap => "asap",
+                            RawrAutoCompactionTier::Emergency => unreachable!(),
+                        };
+
+                        let should_defer_to_next_user_turn = settings.packet_author
+                            == RawrAutoCompactionPacketAuthor::Watcher
+                            && required_boundaries
+                                .contains(&RawrAutoCompactionBoundary::TurnComplete);
+
+                        let mut boundaries_present: Vec<String> = Vec::new();
+                        if self.rawr_saw_commit_this_turn {
+                            boundaries_present.push("commit".to_string());
+                        }
+                        if self.rawr_saw_pr_checkpoint_this_turn {
+                            boundaries_present.push("pr_checkpoint".to_string());
+                        }
+                        if self.rawr_saw_plan_checkpoint_this_turn {
+                            boundaries_present.push("plan_checkpoint".to_string());
+                        }
+                        if self.saw_plan_update_this_turn {
+                            boundaries_present.push("plan_update".to_string());
+                        }
+                        if agent_done {
+                            boundaries_present.push("agent_done".to_string());
+                        }
+                        if last_agent_message.is_some_and(rawr_agent_message_looks_like_topic_shift)
+                        {
+                            boundaries_present.push("topic_shift".to_string());
+                        }
+                        if last_agent_message
+                            .is_some_and(rawr_agent_message_looks_like_concluding_thought)
+                        {
+                            boundaries_present.push("concluding".to_string());
+                        }
+                        boundaries_present.push("turn_complete".to_string());
+
+                        let trigger = self.rawr_capture_auto_compaction_trigger(
+                            percent_remaining,
+                            last_agent_message,
+                            agent_done,
+                        );
+
+                        let request_id = Uuid::new_v4().to_string();
+                        self.rawr_auto_compaction_state =
+                            RawrAutoCompactionState::AwaitingJudgment {
+                                request_id: request_id.clone(),
+                                trigger,
+                                settings: settings.clone(),
+                                should_defer_to_next_user_turn,
+                            };
+
+                        self.rawr_emit_visibility_info(format!(
+                            "auto-compaction: request judgment (tier={tier_name}, percent_remaining={percent_remaining})"
+                        ));
+                        self.submit_op(Op::RawrAutoCompactionJudgment {
+                            request_id,
+                            tier: tier_name.to_string(),
+                            percent_remaining,
+                            boundaries_present,
+                            last_agent_message: last_agent_message.unwrap_or("").to_string(),
+                            decision_prompt_path,
+                        });
+                        return;
+                    }
+                }
+
+                match settings.packet_author {
+                    RawrAutoCompactionPacketAuthor::Watcher => {
+                        let mut trigger = self.rawr_capture_auto_compaction_trigger(
+                            percent_remaining,
+                            last_agent_message,
+                            agent_done,
+                        );
+                        if self.rawr_should_schedule_scratch_write(
+                            &settings,
+                            &trigger,
+                            is_emergency,
+                        ) {
+                            let scratch_file = self.rawr_scratch_file_rel_path();
+                            trigger.scratch_file = Some(scratch_file.clone());
+                            self.rawr_auto_compaction_state =
+                                RawrAutoCompactionState::AwaitingScratchWrite {
+                                    trigger,
+                                    packet_author: RawrAutoCompactionPacketAuthor::Watcher,
+                                };
+                            let prompt = self
+                                .rawr_build_scratch_write_prompt(&settings, scratch_file.as_str());
+                            self.rawr_emit_visibility_info(format!(
+                                "auto-compaction: requesting scratch write ({scratch_file})"
+                            ));
+                            self.rawr_submit_injected_user_turn(prompt);
+                            return;
+                        }
+
+                        let should_defer_to_next_user_turn =
+                            required_boundaries.contains(&RawrAutoCompactionBoundary::TurnComplete);
+                        if should_defer_to_next_user_turn
+                            && self.rawr_preflight_compaction_pending.is_none()
+                        {
+                            self.rawr_emit_visibility_info(
+                                "auto-compaction: deferring until next user turn (waiting on turn_complete boundary)"
+                                    .to_string(),
+                            );
+                            self.rawr_preflight_compaction_pending = Some(trigger);
+                            self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+                            return;
+                        }
+
+                        let packet = self.rawr_build_post_compact_packet(
+                            &trigger,
+                            settings.prompt_frontmatter.packet.max_tail_chars,
+                        );
+                        self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                            trigger,
+                            packet_author: RawrAutoCompactionPacketAuthor::Watcher,
+                            packet,
+                            saw_context_compacted: false,
+                            saw_turn_complete: false,
+                            should_inject_packet: true,
+                        };
+                        self.rawr_trigger_compact();
+                    }
+                    RawrAutoCompactionPacketAuthor::Agent => {
+                        let mut trigger = self.rawr_capture_auto_compaction_trigger(
+                            percent_remaining,
+                            last_agent_message,
+                            agent_done,
+                        );
+                        let do_scratch = self.rawr_should_schedule_scratch_write(
+                            &settings,
+                            &trigger,
+                            is_emergency,
+                        );
+                        let scratch_file = if do_scratch {
+                            Some(self.rawr_scratch_file_rel_path())
+                        } else {
+                            None
+                        };
+                        if let Some(scratch_file) = scratch_file.as_ref() {
+                            trigger.scratch_file = Some(scratch_file.clone());
+                        }
+                        self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingPacket {
+                            trigger,
+                            packet_author: RawrAutoCompactionPacketAuthor::Agent,
+                        };
+                        let prompt = self.rawr_build_agent_continuation_packet_prompt(
+                            &settings,
+                            do_scratch,
+                            scratch_file.as_deref(),
+                        );
+                        self.rawr_request_packet_from_agent(prompt);
+                    }
+                }
+            }
+        }
+    }
+
+    fn rawr_trigger_compact(&mut self) {
+        if let RawrAutoCompactionState::Compacting {
+            trigger,
+            packet_author,
+            ..
+        } = &self.rawr_auto_compaction_state
+            && let Some(thread_id) = self.thread_id
+        {
+            codex_core::compaction_audit::set_next_compaction_trigger(
+                thread_id,
+                codex_core::rawr_compaction_trigger::auto_watcher_trigger(
+                    trigger.trigger_percent_remaining,
+                    trigger.saw_commit,
+                    trigger.saw_plan_checkpoint,
+                    trigger.saw_plan_update,
+                    trigger.saw_pr_checkpoint,
+                    codex_core::rawr_compaction_trigger::packet_author_from_rawr_config(
+                        *packet_author,
+                    ),
+                ),
+            );
+        }
+        self.rawr_emit_visibility_info(
+            "auto-compaction: triggering compaction (Op::Compact)".to_string(),
+        );
+        self.clear_token_usage();
+        self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
+    }
+
+    fn rawr_on_auto_compaction_judgment_result(
+        &mut self,
+        ev: RawrAutoCompactionJudgmentResultEvent,
+    ) {
+        if !self.config.features.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+
+        let state = std::mem::replace(
+            &mut self.rawr_auto_compaction_state,
+            RawrAutoCompactionState::Idle,
+        );
+
+        let RawrAutoCompactionState::AwaitingJudgment {
+            request_id,
+            trigger,
+            settings,
+            should_defer_to_next_user_turn,
+        } = state
+        else {
+            self.rawr_auto_compaction_state = state;
+            return;
+        };
+
+        if ev.request_id != request_id {
+            self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingJudgment {
+                request_id,
+                trigger,
+                settings,
+                should_defer_to_next_user_turn,
+            };
+            return;
+        }
+
+        if !ev.should_compact {
+            self.rawr_emit_visibility_info(format!(
+                "auto-compaction judgment: veto (reason={})",
+                ev.reason
+            ));
+            self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+            return;
+        }
+
+        self.rawr_emit_visibility_info(format!(
+            "auto-compaction judgment: approve (reason={})",
+            ev.reason
+        ));
+        if should_defer_to_next_user_turn && self.rawr_preflight_compaction_pending.is_none() {
+            self.rawr_emit_visibility_info(
+                "auto-compaction: deferring until next user turn (waiting on turn_complete boundary)"
+                    .to_string(),
+            );
+            self.rawr_preflight_compaction_pending = Some(trigger);
+            self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+            return;
+        }
+
+        self.rawr_begin_auto_compaction_from_trigger(trigger, settings);
+    }
+
+    fn rawr_on_context_compacted(&mut self) {
+        if !self.config.features.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+        self.rawr_preflight_compaction_pending = None;
+        match std::mem::replace(
+            &mut self.rawr_auto_compaction_state,
+            RawrAutoCompactionState::Idle,
+        ) {
+            RawrAutoCompactionState::Compacting {
+                trigger,
+                packet_author,
+                packet,
+                saw_turn_complete,
+                should_inject_packet,
+                ..
+            } => {
+                if saw_turn_complete && should_inject_packet {
+                    self.rawr_inject_post_compact_packet(&trigger, packet);
+                } else {
+                    self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                        trigger,
+                        packet_author,
+                        packet,
+                        saw_context_compacted: true,
+                        saw_turn_complete,
+                        should_inject_packet,
+                    };
+                }
+            }
+            other => {
+                self.rawr_auto_compaction_state = other;
+            }
+        }
+    }
+
+    fn rawr_inject_post_compact_packet(
+        &mut self,
+        trigger: &RawrAutoCompactionTriggerContext,
+        packet: String,
+    ) {
+        self.rawr_auto_compaction_state = RawrAutoCompactionState::Idle;
+        let text = self.rawr_build_post_compact_handoff_message(trigger, packet);
+        if self.queued_user_messages.is_empty() {
+            self.rawr_emit_visibility_info(
+                "auto-compaction: injecting post-compact handoff".to_string(),
+            );
+            self.rawr_submit_injected_user_turn(text);
+        } else {
+            self.rawr_emit_visibility_info(
+                "auto-compaction: queued post-compact handoff for next user turn".to_string(),
+            );
+            self.rawr_post_compact_handoff_pending = Some(text);
+        }
+    }
+
+    fn rawr_submit_injected_user_turn(&mut self, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+
+        let items = vec![UserInput::Text {
+            text: text.clone(),
+            text_elements: Vec::new(),
+        }];
+
+        let effective_mode = self.effective_collaboration_mode();
+        let collaboration_mode = if self.collaboration_modes_enabled() {
+            self.active_collaboration_mask
+                .as_ref()
+                .map(|_| effective_mode.clone())
+        } else {
+            None
+        };
+        let op = Op::UserTurn {
+            items,
+            cwd: self.config.cwd.clone(),
+            approval_policy: self.config.approval_policy.value(),
+            sandbox_policy: self.config.sandbox_policy.get().clone(),
+            model: effective_mode.model().to_string(),
+            effort: effective_mode.reasoning_effort(),
+            summary: self.config.model_reasoning_summary,
+            final_output_json_schema: None,
+            collaboration_mode,
+            personality: None,
+        };
+
+        self.codex_op_tx.send(op).unwrap_or_else(|e| {
+            tracing::error!("failed to send injected message: {e}");
+        });
+
+        self.add_to_history(history_cell::new_user_prompt(text, Vec::new(), Vec::new()));
+    }
+
+    fn rawr_request_packet_from_agent(&mut self, prompt: String) {
+        self.rawr_submit_injected_user_turn(prompt);
+    }
+
+    fn rawr_build_post_compact_packet(
+        &self,
+        trigger: &RawrAutoCompactionTriggerContext,
+        max_tail_chars: usize,
+    ) -> String {
+        let mut tail = trigger
+            .last_agent_message
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if tail.len() > max_tail_chars {
+            tail.truncate(max_tail_chars);
+            tail.push('…');
+        }
+
+        let mut lines = Vec::new();
+        lines.push("**Continuation context packet (post-compaction injection)**".to_string());
+        lines.push(String::new());
+        lines.push("Overarching goal".to_string());
+        lines.push("- Continue the work you were doing immediately before compaction.".to_string());
+        lines.push(String::new());
+        lines.push("Why compaction happened".to_string());
+        lines.push(format!(
+            "- Triggered by rawr auto-compaction watcher at {}% context remaining.",
+            trigger.trigger_percent_remaining
+        ));
+        lines.push(format!(
+            "- Natural boundary signals: commit={}, plan_checkpoint={}, agent_done={}",
+            trigger.saw_commit, trigger.saw_plan_checkpoint, trigger.agent_done
+        ));
+        lines.push(String::new());
+        lines.push("Last agent output (memory trigger)".to_string());
+        lines.push(if tail.is_empty() {
+            "- (none)".to_string()
+        } else {
+            format!("- {tail}")
+        });
+        lines.push(String::new());
+        lines.push("Directive".to_string());
+        lines.push(
+            "- Continue with the remaining work now; do not restart from scratch.".to_string(),
+        );
+
+        lines.join("\n")
+    }
+
+    fn rawr_capture_auto_compaction_trigger(
+        &self,
+        percent_remaining: i64,
+        last_agent_message: Option<&str>,
+        agent_done: bool,
+    ) -> RawrAutoCompactionTriggerContext {
+        RawrAutoCompactionTriggerContext {
+            trigger_percent_remaining: percent_remaining,
+            saw_commit: self.rawr_saw_commit_this_turn,
+            saw_plan_checkpoint: self.rawr_saw_plan_checkpoint_this_turn,
+            saw_plan_update: self.saw_plan_update_this_turn,
+            saw_pr_checkpoint: self.rawr_saw_pr_checkpoint_this_turn,
+            agent_done,
+            last_agent_message: last_agent_message.map(str::to_string),
+            scratch_file: None,
+        }
+    }
+
+    fn rawr_begin_auto_compaction_from_trigger(
+        &mut self,
+        mut trigger: RawrAutoCompactionTriggerContext,
+        settings: RawrAutoCompactionSettings,
+    ) {
+        let is_emergency = trigger.trigger_percent_remaining
+            < settings
+                .prompt_frontmatter
+                .trigger
+                .emergency_percent_remaining_lt;
+        let do_scratch = self.rawr_should_schedule_scratch_write(&settings, &trigger, is_emergency);
+        let scratch_file = if do_scratch {
+            Some(self.rawr_scratch_file_rel_path())
+        } else {
+            None
+        };
+        if let Some(scratch_file) = scratch_file.as_ref() {
+            trigger.scratch_file = Some(scratch_file.clone());
+        }
+
+        match settings.packet_author {
+            RawrAutoCompactionPacketAuthor::Watcher => {
+                if let Some(scratch_file) = scratch_file.as_ref() {
+                    self.rawr_auto_compaction_state =
+                        RawrAutoCompactionState::AwaitingScratchWrite {
+                            trigger,
+                            packet_author: RawrAutoCompactionPacketAuthor::Watcher,
+                        };
+                    let prompt =
+                        self.rawr_build_scratch_write_prompt(&settings, scratch_file.as_str());
+                    self.rawr_emit_visibility_info(format!(
+                        "auto-compaction: requesting scratch write ({scratch_file})"
+                    ));
+                    self.rawr_submit_injected_user_turn(prompt);
+                    return;
+                }
+
+                self.rawr_emit_visibility_info(
+                    "auto-compaction: watcher packet selected".to_string(),
+                );
+                let packet = self.rawr_build_post_compact_packet(
+                    &trigger,
+                    settings.prompt_frontmatter.packet.max_tail_chars,
+                );
+
+                self.rawr_auto_compaction_state = RawrAutoCompactionState::Compacting {
+                    trigger,
+                    packet_author: RawrAutoCompactionPacketAuthor::Watcher,
+                    packet,
+                    saw_context_compacted: false,
+                    saw_turn_complete: false,
+                    should_inject_packet: true,
+                };
+                self.rawr_trigger_compact();
+            }
+            RawrAutoCompactionPacketAuthor::Agent => {
+                self.rawr_auto_compaction_state = RawrAutoCompactionState::AwaitingPacket {
+                    trigger,
+                    packet_author: RawrAutoCompactionPacketAuthor::Agent,
+                };
+                let prompt = self.rawr_build_agent_continuation_packet_prompt(
+                    &settings,
+                    do_scratch,
+                    scratch_file.as_deref(),
+                );
+                self.rawr_emit_visibility_info(
+                    "auto-compaction: requesting continuation packet from agent".to_string(),
+                );
+                self.rawr_request_packet_from_agent(prompt);
+            }
+        }
+    }
+
+    fn rawr_should_schedule_scratch_write(
+        &self,
+        settings: &RawrAutoCompactionSettings,
+        trigger: &RawrAutoCompactionTriggerContext,
+        is_emergency: bool,
+    ) -> bool {
+        if !settings.scratch_write_enabled {
+            return false;
+        }
+        if is_emergency {
+            return false;
+        }
+        trigger.agent_done
+            || trigger.saw_plan_checkpoint
+            || trigger.saw_plan_update
+            || trigger.saw_pr_checkpoint
+            || trigger.saw_commit
+            || self.had_work_activity
+    }
+
+    fn rawr_scratch_file_rel_path(&mut self) -> String {
+        let agent_name = self.rawr_scratch_agent_name();
+        format!(".scratch/agent-{agent_name}.scratch.md")
+    }
+
+    fn rawr_scratch_agent_name(&mut self) -> String {
+        if let Some(name) = self.rawr_scratch_agent_name.as_ref() {
+            return name.clone();
+        }
+
+        let name = self
+            .rawr_agent_identity_from_session_source()
+            .unwrap_or_else(|| self.rawr_random_agent_name());
+        let name = if name.is_empty() {
+            "codex".to_string()
+        } else {
+            name
+        };
+        self.rawr_scratch_agent_name = Some(name.clone());
+        name
+    }
+
+    fn rawr_agent_identity_from_session_source(&self) -> Option<String> {
+        let source = self.otel_manager.session_source();
+        let identity = source.strip_prefix("subagent_")?;
+        let sanitized = Self::rawr_sanitize_agent_name(identity);
+        if sanitized.is_empty() {
+            None
+        } else {
+            Some(sanitized)
+        }
+    }
+
+    fn rawr_random_agent_name(&self) -> String {
+        if RAWR_SCRATCH_FALLBACK_AGENT_NAMES.is_empty() {
+            return "codex".to_string();
+        }
+
+        let name = if let Some(thread_id) = self.thread_id {
+            let mut hasher = DefaultHasher::new();
+            thread_id.hash(&mut hasher);
+            let seed = hasher.finish() as usize;
+            RAWR_SCRATCH_FALLBACK_AGENT_NAMES[seed % RAWR_SCRATCH_FALLBACK_AGENT_NAMES.len()]
+        } else {
+            let mut rng = rand::rng();
+            let idx = rng.random_range(0..RAWR_SCRATCH_FALLBACK_AGENT_NAMES.len());
+            RAWR_SCRATCH_FALLBACK_AGENT_NAMES[idx]
+        };
+
+        Self::rawr_sanitize_agent_name(name)
+    }
+
+    fn rawr_sanitize_agent_name(name: &str) -> String {
+        let mut out = String::with_capacity(name.len());
+        let mut last_dash = false;
+        for ch in name.chars() {
+            let ch = ch.to_ascii_lowercase();
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch);
+                last_dash = false;
+            } else if !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
+        }
+        out.trim_matches('-').to_string()
+    }
+
+    fn rawr_build_scratch_write_prompt(
+        &self,
+        settings: &RawrAutoCompactionSettings,
+        scratch_file: &str,
+    ) -> String {
+        let template = settings.scratch_write_prompt.trim_end();
+        let expanded = self.rawr_expand_prompt_template(template, Some(scratch_file));
+        if template.contains("{scratch_file}") || template.contains("{scratchFile}") {
+            expanded
+        } else {
+            format!("{expanded}\n\nTarget file: `{scratch_file}`")
+        }
+    }
+
+    fn rawr_expand_prompt_template(&self, template: &str, scratch_file: Option<&str>) -> String {
+        let mut values = Vec::new();
+        if let Some(scratch_file) = scratch_file {
+            values.push(("scratchFile", scratch_file.to_string()));
+            values.push(("scratch_file", scratch_file.to_string()));
+        }
+        if let Some(thread_id) = self.thread_id {
+            values.push(("threadId", thread_id.to_string()));
+        }
+        rawr_prompts::expand_placeholders(template, &values)
+    }
+
+    fn rawr_emit_visibility_info(&mut self, message: String) {
+        self.add_info_message(format!("[rawr] {message}"), None);
+    }
+
+    fn rawr_build_agent_continuation_packet_prompt(
+        &self,
+        settings: &RawrAutoCompactionSettings,
+        do_scratch: bool,
+        scratch_file: Option<&str>,
+    ) -> String {
+        if !do_scratch {
+            if let Some(scratch_file) = scratch_file {
+                let packet_prompt = self.rawr_expand_prompt_template(
+                    settings.agent_packet_prompt.trim(),
+                    Some(scratch_file),
+                );
+                return format!("Scratchpad: `{scratch_file}`\n\n{packet_prompt}");
+            }
+            return self.rawr_expand_prompt_template(settings.agent_packet_prompt.trim(), None);
+        }
+
+        let scratch_prompt = if let Some(scratch_file) = scratch_file {
+            self.rawr_build_scratch_write_prompt(settings, scratch_file)
+        } else {
+            self.rawr_expand_prompt_template(settings.scratch_write_prompt.trim(), None)
+        };
+
+        let packet_prompt =
+            self.rawr_expand_prompt_template(settings.agent_packet_prompt.trim(), scratch_file);
+        format!("{scratch_prompt}\n\n---\n\n{packet_prompt}",)
+    }
+
+    fn rawr_build_post_compact_handoff_message(
+        &self,
+        trigger: &RawrAutoCompactionTriggerContext,
+        packet: String,
+    ) -> String {
+        if let Some(scratch_file) = trigger.scratch_file.as_deref() {
+            format!("Scratchpad: `{scratch_file}`\n\n{packet}")
+        } else {
+            packet
+        }
+    }
+
+    fn rawr_load_auto_compaction_settings(&self) -> RawrAutoCompactionSettings {
+        let mode = self.rawr_auto_compaction_mode();
+        let packet_author = self.rawr_auto_compaction_packet_author();
+        let mut settings = RawrAutoCompactionSettings::default_with_mode(mode, packet_author);
+
+        let auto_compact_prompt = rawr_prompts::read_prompt_or_default(
+            &self.config.codex_home,
+            rawr_prompts::RawrPromptKind::AutoCompact,
+        );
+        let (frontmatter_str, body) = split_yaml_frontmatter(&auto_compact_prompt);
+        if let Some(frontmatter_str) = frontmatter_str {
+            match serde_yaml::from_str::<RawrAutoCompactionPromptFrontmatter>(frontmatter_str) {
+                Ok(frontmatter) => {
+                    settings.prompt_frontmatter = frontmatter;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to parse rawr auto-compaction prompt frontmatter: {err}"
+                    );
+                }
+            }
+        }
+
+        let body_prompt = body.trim();
+        if !body_prompt.is_empty() {
+            settings.agent_packet_prompt = body_prompt.to_string();
+        }
+
+        let scratch_prompt = rawr_prompts::read_prompt_or_default(
+            &self.config.codex_home,
+            rawr_prompts::RawrPromptKind::ScratchWrite,
+        );
+        let scratch_prompt = scratch_prompt.trim();
+        if !scratch_prompt.is_empty() {
+            settings.scratch_write_prompt = scratch_prompt.to_string();
+        }
+
+        if let Some(config) = self.config.rawr_auto_compaction.as_ref() {
+            if let Some(mode) = config.mode {
+                settings.mode = mode;
+            }
+            if let Some(packet_author) = config.packet_author {
+                settings.packet_author = packet_author;
+            }
+            if let Some(enabled) = config.scratch_write_enabled {
+                settings.scratch_write_enabled = enabled;
+            }
+            if let Some(policy) = config.policy.as_ref() {
+                settings.policy = Some(policy.clone());
+            }
+            if let Some(max_tail_chars) = config.packet_max_tail_chars {
+                settings.prompt_frontmatter.packet.max_tail_chars = max_tail_chars;
+            }
+        }
+
+        settings
+    }
+
+    fn maybe_prompt_plan_implementation(&mut self, _last_agent_message: Option<&str>) {
         if !self.collaboration_modes_enabled() {
             return;
         }
@@ -1349,8 +2811,8 @@ impl ChatWidget {
     }
 
     fn open_plan_implementation_prompt(&mut self) {
-        let default_mask = collaboration_modes::default_mode_mask(self.models_manager.as_ref());
-        let (implement_actions, implement_disabled_reason) = match default_mask {
+        let code_mask = collaboration_modes::default_mode_mask(self.models_manager.as_ref());
+        let (implement_actions, implement_disabled_reason) = match code_mask {
             Some(mask) => {
                 let user_text = PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string();
                 let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
@@ -1361,13 +2823,13 @@ impl ChatWidget {
                 })];
                 (actions, None)
             }
-            None => (Vec::new(), Some("Default mode unavailable".to_string())),
+            None => (Vec::new(), Some("Code mode unavailable".to_string())),
         };
 
         let items = vec![
             SelectionItem {
                 name: PLAN_IMPLEMENTATION_YES.to_string(),
-                description: Some("Switch to Default and start coding.".to_string()),
+                description: Some("Switch to Code and start coding.".to_string()),
                 selected_description: None,
                 is_current: false,
                 actions: implement_actions,
@@ -1401,6 +2863,7 @@ impl ChatWidget {
             None => {
                 self.bottom_pane.set_context_window(None, None);
                 self.token_info = None;
+                self.status_token_info = None;
             }
         }
     }
@@ -1409,6 +2872,7 @@ impl ChatWidget {
         let percent = self.context_remaining_percent(&info);
         let used_tokens = self.context_used_tokens(&info, percent.is_some());
         self.bottom_pane.set_context_window(percent, used_tokens);
+        self.status_token_info = Some(info.clone());
         self.token_info = Some(info);
     }
 
@@ -1717,6 +3181,13 @@ impl ChatWidget {
 
     fn on_plan_update(&mut self, update: UpdatePlanArgs) {
         self.saw_plan_update_this_turn = true;
+        self.rawr_saw_plan_checkpoint_this_turn = self.rawr_saw_plan_checkpoint_this_turn
+            || update.plan.iter().any(|item| {
+                matches!(
+                    item.status,
+                    codex_protocol::plan_tool::StepStatus::Completed
+                )
+            });
         self.add_to_history(history_cell::new_plan_update(update));
     }
 
@@ -2044,7 +3515,17 @@ impl ChatWidget {
         debug!("BackgroundEvent: {message}");
         self.bottom_pane.ensure_status_indicator();
         self.bottom_pane.set_interrupt_hint_visible(true);
-        self.set_status_header(message);
+        let (header, details) = message
+            .split_once('\n')
+            .map(|(header, details)| {
+                let header = header.trim().to_string();
+                let details = details.trim().to_string();
+                let details = (!details.is_empty()).then_some(details);
+                (header, details)
+            })
+            .unwrap_or((message.trim().to_string(), None));
+
+        self.set_status(header, details);
     }
 
     fn on_undo_started(&mut self, event: UndoStartedEvent) {
@@ -2221,6 +3702,13 @@ impl ChatWidget {
         };
         let is_unified_exec_interaction =
             matches!(source, ExecCommandSource::UnifiedExecInteraction);
+
+        if ev.exit_code == 0 && rawr_command_looks_like_git_commit(&command) {
+            self.rawr_saw_commit_this_turn = true;
+        }
+        if ev.exit_code == 0 && rawr_command_looks_like_pr_checkpoint(&command) {
+            self.rawr_saw_pr_checkpoint_this_turn = true;
+        }
 
         let needs_new = self
             .active_cell
@@ -2530,6 +4018,7 @@ impl ChatWidget {
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             token_info: None,
+            status_token_info: None,
             rate_limit_snapshot: None,
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
@@ -2582,6 +4071,13 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
+            rawr_saw_commit_this_turn: false,
+            rawr_saw_plan_checkpoint_this_turn: false,
+            rawr_saw_pr_checkpoint_this_turn: false,
+            rawr_preflight_compaction_pending: None,
+            rawr_post_compact_handoff_pending: None,
+            rawr_scratch_agent_name: None,
         };
 
         widget.prefetch_rate_limits();
@@ -2692,6 +4188,7 @@ impl ChatWidget {
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             token_info: None,
+            status_token_info: None,
             rate_limit_snapshot: None,
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
@@ -2744,6 +4241,13 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
+            rawr_saw_commit_this_turn: false,
+            rawr_saw_plan_checkpoint_this_turn: false,
+            rawr_saw_pr_checkpoint_this_turn: false,
+            rawr_preflight_compaction_pending: None,
+            rawr_post_compact_handoff_pending: None,
+            rawr_scratch_agent_name: None,
         };
 
         widget.prefetch_rate_limits();
@@ -2843,6 +4347,7 @@ impl ChatWidget {
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             token_info: None,
+            status_token_info: None,
             rate_limit_snapshot: None,
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
@@ -2895,6 +4400,13 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
+            rawr_saw_commit_this_turn: false,
+            rawr_saw_plan_checkpoint_this_turn: false,
+            rawr_saw_pr_checkpoint_this_turn: false,
+            rawr_preflight_compaction_pending: None,
+            rawr_post_compact_handoff_pending: None,
+            rawr_scratch_agent_name: None,
         };
 
         widget.prefetch_rate_limits();
@@ -3545,12 +5057,46 @@ impl ChatWidget {
         }
     }
 
-    fn submit_user_message(&mut self, user_message: UserMessage) {
+    fn submit_user_message(&mut self, mut user_message: UserMessage) {
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
             self.queued_user_messages.push_front(user_message);
             self.refresh_queued_user_messages();
             return;
+        }
+
+        if self.config.features.enabled(Feature::RawrAutoCompaction)
+            && !self.bottom_pane.is_task_running()
+            && !self.agent_turn_running
+            && !self.is_review_mode
+            && self
+                .rawr_preflight_compaction_pending
+                .as_ref()
+                .is_some_and(|_| !user_message.text.trim_start().starts_with('!'))
+        {
+            if let Some(trigger) = self.rawr_preflight_compaction_pending.take() {
+                self.queued_user_messages.push_front(user_message);
+                self.refresh_queued_user_messages();
+                let settings = self.rawr_load_auto_compaction_settings();
+                self.rawr_begin_auto_compaction_from_trigger(trigger, settings);
+                return;
+            }
+            tracing::warn!(
+                "rawr preflight compaction was expected but missing; continuing without preflight"
+            );
+        }
+
+        if self
+            .rawr_post_compact_handoff_pending
+            .as_ref()
+            .is_some_and(|_| !user_message.text.trim_start().starts_with('!'))
+            && let Some(handoff) = self.rawr_post_compact_handoff_pending.take()
+        {
+            user_message.text = format!(
+                "{handoff}\n\n---\n\n{original}",
+                original = user_message.text
+            );
+            user_message.text_elements.clear();
         }
 
         let UserMessage {
@@ -3879,7 +5425,21 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request, from_replay)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
-            EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
+            EventMsg::RawrAutoCompactionJudgmentResult(ev) => {
+                self.rawr_on_auto_compaction_judgment_result(ev);
+            }
+            EventMsg::ItemStarted(codex_core::protocol::ItemStartedEvent { item, .. }) => {
+                if matches!(item, codex_protocol::items::TurnItem::ContextCompaction(_)) {
+                    self.on_background_event(
+                        "Compacting thread context\nSummarizing and rewriting conversation history."
+                            .to_string(),
+                    );
+                }
+            }
+            EventMsg::ContextCompacted(_) => {
+                self.rawr_on_context_compacted();
+                self.add_info_message("Context compacted.".to_string(), None);
+            }
             EventMsg::CollabAgentSpawnBegin(_) => {}
             EventMsg::CollabAgentSpawnEnd(ev) => self.on_collab_event(collab::spawn_end(ev)),
             EventMsg::CollabAgentInteractionBegin(_) => {}
@@ -3892,7 +5452,6 @@ impl ChatWidget {
             EventMsg::CollabCloseEnd(ev) => self.on_collab_event(collab::close_end(ev)),
             EventMsg::ThreadRolledBack(_) => {}
             EventMsg::RawResponseItem(_)
-            | EventMsg::ItemStarted(_)
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
             | EventMsg::ReasoningRawContentDelta(_)
@@ -4031,10 +5590,50 @@ impl ChatWidget {
 
     // If idle and there are queued inputs, submit exactly one to start the next turn.
     fn maybe_send_next_queued_input(&mut self) {
+        if matches!(
+            self.rawr_auto_compaction_state,
+            RawrAutoCompactionState::AwaitingScratchWrite { .. }
+                | RawrAutoCompactionState::AwaitingJudgment { .. }
+                | RawrAutoCompactionState::AwaitingPacket { .. }
+                | RawrAutoCompactionState::Compacting {
+                    saw_context_compacted: false,
+                    ..
+                }
+        ) {
+            return;
+        }
+        if self.rawr_preflight_compaction_pending.is_some() && !self.queued_user_messages.is_empty()
+        {
+            let is_local_shell = self
+                .queued_user_messages
+                .front()
+                .is_some_and(|msg| msg.text.trim_start().starts_with('!'));
+            if is_local_shell {
+                return;
+            }
+            if let Some(trigger) = self.rawr_preflight_compaction_pending.take() {
+                let settings = self.rawr_load_auto_compaction_settings();
+                self.rawr_begin_auto_compaction_from_trigger(trigger, settings);
+                return;
+            }
+            tracing::warn!(
+                "rawr preflight compaction was expected but missing; continuing without preflight"
+            );
+        }
         if self.bottom_pane.is_task_running() {
             return;
         }
         if let Some(user_message) = self.queued_user_messages.pop_front() {
+            let mut user_message = user_message;
+            if !user_message.text.trim_start().starts_with('!')
+                && let Some(handoff) = self.rawr_post_compact_handoff_pending.take()
+            {
+                user_message.text = format!(
+                    "{handoff}\n\n---\n\n{original}",
+                    original = user_message.text
+                );
+                user_message.text_elements.clear();
+            }
             self.submit_user_message(user_message);
         }
         // Update the list to reflect the remaining queued messages (if any).
@@ -4061,7 +5660,7 @@ impl ChatWidget {
 
     pub(crate) fn add_status_output(&mut self) {
         let default_usage = TokenUsage::default();
-        let token_info = self.token_info.as_ref();
+        let token_info = self.status_token_info.as_ref().or(self.token_info.as_ref());
         let total_usage = token_info
             .map(|ti| &ti.total_token_usage)
             .unwrap_or(&default_usage);

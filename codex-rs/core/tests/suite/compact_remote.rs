@@ -4,7 +4,10 @@ use std::fs;
 
 use anyhow::Result;
 use codex_core::CodexAuth;
+use codex_core::compaction_audit;
 use codex_core::features::Feature;
+use codex_core::protocol::CompactionPacketAuthor;
+use codex_core::protocol::CompactionTrigger;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::ItemCompletedEvent;
 use codex_core::protocol::ItemStartedEvent;
@@ -255,6 +258,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
             .with_config(|config| {
                 config.features.enable(Feature::RemoteCompaction);
                 config.model_context_window = Some(2_000);
+                config.model_auto_compact_token_limit = Some(i64::MAX);
             }),
     )
     .await?;
@@ -323,6 +327,21 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
     );
 
     let compact_request = compact_mock.single_request();
+    let call_inputs = compact_request.inputs_of_type("function_call");
+    let call_ids = call_inputs
+        .iter()
+        .filter_map(|item| item.get("call_id").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>();
+    let output_inputs = compact_request.inputs_of_type("function_call_output");
+    let output_ids = output_inputs
+        .iter()
+        .filter_map(|item| item.get("call_id").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>();
+    let input_items = compact_request.input();
+    let input_types = input_items
+        .iter()
+        .filter_map(|item| item.get("type").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>();
     let user_messages = compact_request.message_input_texts("user");
     assert!(
         user_messages
@@ -342,7 +361,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
             && compact_request
                 .function_call_output_text(retained_call_id)
                 .is_some(),
-        "expected compact request to keep the older function call/result pair"
+        "expected compact request to keep the older function call/result pair; call_ids={call_ids:?} output_ids={output_ids:?} input_types={input_types:?}"
     );
     assert!(
         !compact_request.has_function_call(trimmed_call_id)
@@ -735,6 +754,18 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
+    let expected_trigger = CompactionTrigger::AutoWatcher {
+        trigger_percent_remaining: 7,
+        saw_commit: false,
+        saw_plan_checkpoint: true,
+        saw_plan_update: false,
+        saw_pr_checkpoint: false,
+        packet_author: CompactionPacketAuthor::Watcher,
+    };
+    compaction_audit::set_next_compaction_trigger(
+        harness.test().session_configured.session_id,
+        expected_trigger.clone(),
+    );
     codex.submit(Op::Compact).await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -757,6 +788,7 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
         if let RolloutItem::Compacted(compacted) = entry.item
             && compacted.message.is_empty()
             && compacted.replacement_history.as_ref() == Some(&compacted_history)
+            && compacted.trigger == Some(expected_trigger.clone())
         {
             saw_compacted_history = true;
             break;

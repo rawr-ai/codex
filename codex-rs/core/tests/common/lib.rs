@@ -11,6 +11,7 @@ use codex_core::config::ConfigOverrides;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use regex_lite::Regex;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 pub mod apps_test_server;
 pub mod context_snapshot;
@@ -203,7 +204,7 @@ where
     use tokio::time::timeout;
     loop {
         // Allow a bit more time to accommodate async startup work (e.g. config IO, tool discovery)
-        let ev = timeout(wait_time.max(Duration::from_secs(10)), codex.next_event())
+        let ev = timeout(wait_time.max(Duration::from_secs(15)), codex.next_event())
             .await
             .expect("timeout waiting for event")
             .expect("stream ended unexpectedly");
@@ -241,7 +242,130 @@ pub fn format_with_current_shell_display_non_login(command: &str) -> String {
 }
 
 pub fn stdio_server_bin() -> Result<String, CargoBinError> {
-    codex_utils_cargo_bin::cargo_bin("test_stdio_server").map(|p| p.to_string_lossy().to_string())
+    match STDIO_SERVER_BIN.get_or_init(resolve_stdio_server_bin) {
+        Ok(path) => Ok(path.clone()),
+        Err(message) => Err(CargoBinError::NotFound {
+            name: "test_stdio_server".to_string(),
+            env_keys: vec!["CARGO_BIN_EXE_test_stdio_server".to_string()],
+            fallback: message.clone(),
+        }),
+    }
+}
+
+static STDIO_SERVER_BIN: OnceLock<Result<String, String>> = OnceLock::new();
+
+static CODEX_CLI_BIN: OnceLock<Result<std::path::PathBuf, String>> = OnceLock::new();
+
+pub fn codex_cli_bin() -> Result<std::path::PathBuf, CargoBinError> {
+    match CODEX_CLI_BIN.get_or_init(resolve_codex_cli_bin) {
+        Ok(path) => Ok(path.clone()),
+        Err(message) => Err(CargoBinError::NotFound {
+            name: "codex".to_string(),
+            env_keys: vec!["CARGO_BIN_EXE_codex".to_string()],
+            fallback: message.clone(),
+        }),
+    }
+}
+
+fn resolve_codex_cli_bin() -> Result<std::path::PathBuf, String> {
+    if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex") {
+        return Ok(path);
+    }
+
+    if codex_utils_cargo_bin::runfiles_available() {
+        return Err("codex binary not available in runfiles".to_string());
+    }
+
+    let workspace_root = find_workspace_root()?;
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = std::process::Command::new(cargo)
+        .current_dir(&workspace_root)
+        .args(["build", "-p", "codex-cli", "--bin", "codex"])
+        .output()
+        .map_err(|err| format!("failed to run cargo build for codex: {err}"))?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "cargo build -p codex-cli --bin codex failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        ));
+    }
+
+    let exe = format!("codex{}", std::env::consts::EXE_SUFFIX);
+    let path = workspace_root.join("target").join("debug").join(exe);
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(format!(
+            "cargo build reported success, but binary not found at {}",
+            path.display()
+        ))
+    }
+}
+
+fn resolve_stdio_server_bin() -> Result<String, String> {
+    if let Ok(path) = codex_utils_cargo_bin::cargo_bin("test_stdio_server") {
+        return Ok(path.to_string_lossy().to_string());
+    }
+
+    // Under Bazel, the runfiles should contain the binary (and `cargo_bin` should have worked).
+    if codex_utils_cargo_bin::runfiles_available() {
+        return Err("test_stdio_server not available in runfiles".to_string());
+    }
+
+    // When running `cargo test -p codex-core`, Cargo does not build workspace binaries from other
+    // packages, so we build `codex-rmcp-client --bin test_stdio_server` on-demand.
+    let workspace_root = find_workspace_root()?;
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = std::process::Command::new(cargo)
+        .current_dir(&workspace_root)
+        .args([
+            "build",
+            "-p",
+            "codex-rmcp-client",
+            "--bin",
+            "test_stdio_server",
+        ])
+        .output()
+        .map_err(|err| format!("failed to run cargo build for test_stdio_server: {err}"))?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "cargo build -p codex-rmcp-client --bin test_stdio_server failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        ));
+    }
+
+    let exe = format!("test_stdio_server{}", std::env::consts::EXE_SUFFIX);
+    let path = workspace_root.join("target").join("debug").join(exe);
+    if path.exists() {
+        Ok(path.to_string_lossy().to_string())
+    } else {
+        Err(format!(
+            "cargo build reported success, but binary not found at {}",
+            path.display()
+        ))
+    }
+}
+
+fn find_workspace_root() -> Result<std::path::PathBuf, String> {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for ancestor in manifest_dir.ancestors() {
+        let candidate = ancestor.join("Cargo.toml");
+        if !candidate.exists() {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&candidate) else {
+            continue;
+        };
+        if contents.contains("[workspace]") {
+            return Ok(ancestor.to_path_buf());
+        }
+    }
+    Err(format!(
+        "could not find workspace root by searching ancestors of {}",
+        manifest_dir.display()
+    ))
 }
 
 pub mod fs_wait {

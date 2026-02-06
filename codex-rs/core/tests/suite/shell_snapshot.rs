@@ -50,7 +50,9 @@ struct SnapshotRunOptions {
 
 async fn wait_for_snapshot(codex_home: &Path) -> Result<PathBuf> {
     let snapshot_dir = codex_home.join("shell_snapshots");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Shell snapshot capture itself has a larger timeout (see core/src/shell_snapshot.rs). Under
+    // load, the snapshot file may not appear quickly even though capture is still progressing.
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Ok(mut entries) = fs::read_dir(&snapshot_dir).await
             && let Some(entry) = entries.next_entry().await?

@@ -62,6 +62,8 @@ async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
 ) -> CodexResult<()> {
+    let compaction_trigger =
+        crate::compaction_audit::take_next_compaction_trigger(sess.conversation_id);
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
@@ -71,18 +73,11 @@ async fn run_remote_compact_task_inner_impl(
     let stripped_model_switch_item =
         extract_trailing_model_switch_update_for_compaction_request(&mut history);
     let base_instructions = sess.get_base_instructions().await;
-    let deleted_items = trim_function_call_history_to_fit_context_window(
+    let _deleted_items = trim_function_call_history_to_fit_context_window(
         &mut history,
         turn_context.as_ref(),
         &base_instructions,
     );
-    if deleted_items > 0 {
-        info!(
-            turn_id = %turn_context.sub_id,
-            deleted_items,
-            "trimmed history items before remote compaction"
-        );
-    }
 
     // Required to keep `/undo` available after compaction
     let ghost_snapshots: Vec<ResponseItem> = history
@@ -140,6 +135,7 @@ async fn run_remote_compact_task_inner_impl(
     let compacted_item = CompactedItem {
         message: String::new(),
         replacement_history: Some(new_history),
+        trigger: compaction_trigger,
     };
     sess.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
         .await;

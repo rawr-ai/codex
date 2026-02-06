@@ -22,6 +22,11 @@ use codex_core::config::Constrained;
 use codex_core::config::ConstraintError;
 #[cfg(target_os = "windows")]
 use codex_core::config::types::WindowsSandboxModeToml;
+use codex_core::config::types::RawrAutoCompactionBoundary;
+use codex_core::config::types::RawrAutoCompactionMode;
+use codex_core::config::types::RawrAutoCompactionPacketAuthor;
+use codex_core::config::types::RawrAutoCompactionPolicyTierToml;
+use codex_core::config::types::RawrAutoCompactionPolicyToml;
 use codex_core::config_loader::RequirementSource;
 use codex_core::features::Feature;
 use codex_core::models_manager::manager::ModelsManager;
@@ -31,6 +36,7 @@ use codex_core::protocol::AgentReasoningDeltaEvent;
 use codex_core::protocol::AgentReasoningEvent;
 use codex_core::protocol::ApplyPatchApprovalRequestEvent;
 use codex_core::protocol::BackgroundEventEvent;
+use codex_core::protocol::ContextCompactedEvent;
 use codex_core::protocol::CreditsSnapshot;
 use codex_core::protocol::Event;
 use codex_core::protocol::EventMsg;
@@ -1607,6 +1613,8 @@ async fn make_chatwidget_manual(
         initial_user_message: None,
         token_info: None,
         rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+        status_token_info: None,
+        rate_limit_snapshot: None,
         plan_type: None,
         rate_limit_warnings: RateLimitWarningState::default(),
         rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
@@ -1666,6 +1674,13 @@ async fn make_chatwidget_manual(
         status_line_branch_pending: false,
         status_line_branch_lookup_complete: false,
         external_editor_state: ExternalEditorState::Closed,
+        rawr_auto_compaction_state: RawrAutoCompactionState::Idle,
+        rawr_saw_commit_this_turn: false,
+        rawr_saw_plan_checkpoint_this_turn: false,
+        rawr_saw_pr_checkpoint_this_turn: false,
+        rawr_preflight_compaction_pending: None,
+        rawr_post_compact_handoff_pending: None,
+        rawr_scratch_agent_name: None,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)
@@ -1781,6 +1796,918 @@ fn make_token_info(total_tokens: i64, context_window: i64) -> TokenUsageInfo {
         last_token_usage: usage(total_tokens),
         model_context_window: Some(context_window),
     }
+}
+
+fn drain_for_compact(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> bool {
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(ev, AppEvent::CodexOp(Op::Compact)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn next_rawr_judgment_op(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) -> Op {
+    loop {
+        match op_rx.try_recv() {
+            Ok(op @ Op::RawrAutoCompactionJudgment { .. }) => return op,
+            Ok(_) => continue,
+            Err(TryRecvError::Empty) => panic!("expected a rawr judgment op but queue was empty"),
+            Err(TryRecvError::Disconnected) => {
+                panic!("expected rawr judgment op but channel closed")
+            }
+        }
+    }
+}
+
+fn make_rawr_settings_for_test(
+    mode: RawrAutoCompactionMode,
+    packet_author: RawrAutoCompactionPacketAuthor,
+) -> RawrAutoCompactionSettings {
+    let mut settings = RawrAutoCompactionSettings::default_with_mode(mode, packet_author);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .early_percent_remaining_lt = Some(85);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .ready_percent_remaining_lt = Some(75);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .asap_percent_remaining_lt = Some(65);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .emergency_percent_remaining_lt = 15;
+    settings
+}
+
+fn inject_context_compacted(chat: &mut ChatWidget) {
+    chat.handle_codex_event(Event {
+        id: "ev-ctx-1".to_string(),
+        msg: EventMsg::ContextCompacted(ContextCompactedEvent {}),
+    });
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_auto_mode_requires_boundary_unless_emergency() {
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+
+    // 50% remaining (below default 75 trigger), but no boundary -> should not auto compact.
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+    let mut settings = RawrAutoCompactionSettings::default_with_mode(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+    chat.maybe_rawr_auto_compact_with_settings(None, settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), false);
+
+    // If a commit boundary is present, auto mode should compact.
+    chat.rawr_saw_commit_this_turn = true;
+    chat.maybe_rawr_auto_compact_with_settings(None, settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // Emergency threshold should compact even without boundaries.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    // ~10% remaining: (20k window, 12k baseline, 8k effective, 7.2k used => 10% left).
+    chat.set_token_info(Some(make_token_info(19_200, 20_000)));
+    chat.maybe_rawr_auto_compact_with_settings(None, settings);
+    assert_eq!(drain_for_compact(&mut rx), true);
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_respects_tiered_boundaries() {
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .early_percent_remaining_lt = Some(80);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .ready_percent_remaining_lt = Some(60);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .asap_percent_remaining_lt = Some(40);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .emergency_percent_remaining_lt = 20;
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![
+        RawrAutoCompactionBoundary::Commit,
+        RawrAutoCompactionBoundary::PlanCheckpoint,
+        RawrAutoCompactionBoundary::PlanUpdate,
+        RawrAutoCompactionBoundary::PrCheckpoint,
+        RawrAutoCompactionBoundary::AgentDone,
+        RawrAutoCompactionBoundary::TopicShift,
+        RawrAutoCompactionBoundary::ConcludingThought,
+    ];
+
+    // Early tier: plan update alone should not compact.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(14_400, 20_000))); // 70% remaining
+    chat.saw_plan_update_this_turn = true;
+    chat.maybe_rawr_auto_compact_with_settings(Some("continuing"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), false);
+
+    // Early tier: plan update should compact if there's a semantic break.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(14_400, 20_000))); // 70% remaining
+    chat.saw_plan_update_this_turn = true;
+    chat.maybe_rawr_auto_compact_with_settings(Some("done"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // Early tier: plan checkpoint should compact.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(14_400, 20_000))); // 70% remaining
+    chat.rawr_saw_plan_checkpoint_this_turn = true;
+    chat.maybe_rawr_auto_compact_with_settings(Some("done"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // Ready tier: plan update alone should not compact without a semantic break.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(15_600, 20_000))); // 55% remaining
+    chat.saw_plan_update_this_turn = true;
+    chat.maybe_rawr_auto_compact_with_settings(Some("plan update"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), false);
+
+    // Ready tier: plan update should compact if there's a semantic break.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(15_600, 20_000))); // 55% remaining
+    chat.saw_plan_update_this_turn = true;
+    chat.maybe_rawr_auto_compact_with_settings(Some("done"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // ASAP tier: agent-done should compact.
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(17_200, 20_000))); // 35% remaining
+    chat.maybe_rawr_auto_compact_with_settings(Some("done"), settings);
+    assert_eq!(drain_for_compact(&mut rx), true);
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_policy_overrides_frontmatter_boundaries() {
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(13_600, 20_000))); // 80% remaining (Early)
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+
+    settings.policy = Some(RawrAutoCompactionPolicyToml {
+        early: Some(RawrAutoCompactionPolicyTierToml {
+            requires_any_boundary: Some(vec![RawrAutoCompactionBoundary::PlanUpdate]),
+            plan_boundaries_require_semantic_break: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    chat.rawr_saw_commit_this_turn = true;
+    chat.saw_plan_update_this_turn = false;
+    chat.maybe_rawr_auto_compact_with_settings(Some("done"), settings.clone());
+    assert_eq!(
+        drain_for_compact(&mut rx),
+        false,
+        "policy should disable commit-only compaction"
+    );
+
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(13_600, 20_000))); // 80% remaining (Early)
+    chat.saw_plan_update_this_turn = true;
+    chat.maybe_rawr_auto_compact_with_settings(Some("continuing"), settings);
+    assert_eq!(
+        drain_for_compact(&mut rx),
+        true,
+        "policy should allow plan-update compaction"
+    );
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_policy_overrides_thresholds() {
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(13_200, 20_000))); // 85% remaining (above frontmatter 80)
+    chat.rawr_saw_commit_this_turn = true;
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .early_percent_remaining_lt = Some(80);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .ready_percent_remaining_lt = Some(60);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .asap_percent_remaining_lt = Some(40);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .emergency_percent_remaining_lt = 20;
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+
+    chat.maybe_rawr_auto_compact_with_settings(Some("done"), settings.clone());
+    assert_eq!(
+        drain_for_compact(&mut rx),
+        false,
+        "expected no compaction at 85% with early=80"
+    );
+
+    settings.policy = Some(RawrAutoCompactionPolicyToml {
+        early: Some(RawrAutoCompactionPolicyTierToml {
+            percent_remaining_lt: Some(90),
+            requires_any_boundary: Some(vec![RawrAutoCompactionBoundary::Commit]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    chat.maybe_rawr_auto_compact_with_settings(Some("done"), settings);
+    assert_eq!(
+        drain_for_compact(&mut rx),
+        true,
+        "expected compaction at 85% with policy early=90"
+    );
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_policy_can_disable_plan_semantic_break_gating() {
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(13_600, 20_000))); // 80% remaining (Early)
+    chat.saw_plan_update_this_turn = true;
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings.policy = Some(RawrAutoCompactionPolicyToml {
+        early: Some(RawrAutoCompactionPolicyTierToml {
+            requires_any_boundary: Some(vec![RawrAutoCompactionBoundary::PlanUpdate]),
+            plan_boundaries_require_semantic_break: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    chat.maybe_rawr_auto_compact_with_settings(Some("continuing"), settings);
+    assert_eq!(drain_for_compact(&mut rx), true);
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_policy_can_enable_turn_complete_preflight() {
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(13_600, 20_000))); // 80% remaining (Early)
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+
+    settings.policy = Some(RawrAutoCompactionPolicyToml {
+        early: Some(RawrAutoCompactionPolicyTierToml {
+            requires_any_boundary: Some(vec![RawrAutoCompactionBoundary::TurnComplete]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings);
+    assert_eq!(drain_for_compact(&mut rx), false);
+    assert!(chat.rawr_preflight_compaction_pending.is_some());
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_judgment_veto_prevents_compaction() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.rawr_saw_pr_checkpoint_this_turn = true;
+    chat.set_token_info(Some(make_token_info(14_400, 20_000))); // 70% remaining
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .early_percent_remaining_lt = Some(80);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .ready_percent_remaining_lt = Some(60);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .asap_percent_remaining_lt = Some(40);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .emergency_percent_remaining_lt = 20;
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::PrCheckpoint];
+    settings.policy = Some(RawrAutoCompactionPolicyToml {
+        early: Some(RawrAutoCompactionPolicyTierToml {
+            decision_prompt_path: Some("rawr/prompts/rawr-auto-compaction-judgment.md".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings);
+    assert_eq!(drain_for_compact(&mut rx), false);
+    assert_matches!(
+        chat.rawr_auto_compaction_state,
+        RawrAutoCompactionState::AwaitingJudgment { .. }
+    );
+
+    let op = next_rawr_judgment_op(&mut op_rx);
+    let Op::RawrAutoCompactionJudgment {
+        request_id, tier, ..
+    } = op
+    else {
+        panic!("expected Op::RawrAutoCompactionJudgment");
+    };
+    assert_eq!(tier, "early");
+
+    chat.handle_codex_event(Event {
+        id: "rawr-judge".into(),
+        msg: EventMsg::RawrAutoCompactionJudgmentResult(
+            codex_core::protocol::RawrAutoCompactionJudgmentResultEvent {
+                request_id,
+                tier: "early".to_string(),
+                should_compact: false,
+                reason: "keep context together".to_string(),
+            },
+        ),
+    });
+    assert_eq!(drain_for_compact(&mut rx), false);
+    assert_matches!(
+        chat.rawr_auto_compaction_state,
+        RawrAutoCompactionState::Idle
+    );
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_judgment_approval_triggers_compaction() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.rawr_saw_pr_checkpoint_this_turn = true;
+    chat.set_token_info(Some(make_token_info(14_400, 20_000))); // 70% remaining
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .early_percent_remaining_lt = Some(80);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .ready_percent_remaining_lt = Some(60);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .asap_percent_remaining_lt = Some(40);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .emergency_percent_remaining_lt = 20;
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::PrCheckpoint];
+    settings.policy = Some(RawrAutoCompactionPolicyToml {
+        early: Some(RawrAutoCompactionPolicyTierToml {
+            decision_prompt_path: Some("rawr/prompts/rawr-auto-compaction-judgment.md".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings);
+    assert_eq!(drain_for_compact(&mut rx), false);
+    assert_matches!(
+        chat.rawr_auto_compaction_state,
+        RawrAutoCompactionState::AwaitingJudgment { .. }
+    );
+    let request_id = match next_rawr_judgment_op(&mut op_rx) {
+        Op::RawrAutoCompactionJudgment { request_id, .. } => request_id,
+        other => panic!("expected Op::RawrAutoCompactionJudgment, got {other:?}"),
+    };
+
+    chat.handle_codex_event(Event {
+        id: "rawr-judge".into(),
+        msg: EventMsg::RawrAutoCompactionJudgmentResult(
+            codex_core::protocol::RawrAutoCompactionJudgmentResultEvent {
+                request_id,
+                tier: "early".to_string(),
+                should_compact: true,
+                reason: "phase boundary".to_string(),
+            },
+        ),
+    });
+    assert_eq!(drain_for_compact(&mut rx), true);
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_judgment_ignores_mismatched_request_id() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.rawr_saw_pr_checkpoint_this_turn = true;
+    chat.set_token_info(Some(make_token_info(14_400, 20_000))); // 70% remaining
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .early_percent_remaining_lt = Some(80);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .ready_percent_remaining_lt = Some(60);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .asap_percent_remaining_lt = Some(40);
+    settings
+        .prompt_frontmatter
+        .trigger
+        .emergency_percent_remaining_lt = 20;
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::PrCheckpoint];
+    settings.policy = Some(RawrAutoCompactionPolicyToml {
+        early: Some(RawrAutoCompactionPolicyTierToml {
+            decision_prompt_path: Some("rawr/prompts/rawr-auto-compaction-judgment.md".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings);
+    assert_eq!(drain_for_compact(&mut rx), false);
+    assert_matches!(
+        chat.rawr_auto_compaction_state,
+        RawrAutoCompactionState::AwaitingJudgment { .. }
+    );
+
+    let request_id = match next_rawr_judgment_op(&mut op_rx) {
+        Op::RawrAutoCompactionJudgment { request_id, .. } => request_id,
+        other => panic!("expected Op::RawrAutoCompactionJudgment, got {other:?}"),
+    };
+
+    chat.handle_codex_event(Event {
+        id: "rawr-judge-wrong".into(),
+        msg: EventMsg::RawrAutoCompactionJudgmentResult(
+            codex_core::protocol::RawrAutoCompactionJudgmentResultEvent {
+                request_id: "wrong".to_string(),
+                tier: "early".to_string(),
+                should_compact: true,
+                reason: "phase boundary".to_string(),
+            },
+        ),
+    });
+
+    assert_eq!(drain_for_compact(&mut rx), false);
+    assert_matches!(
+        chat.rawr_auto_compaction_state,
+        RawrAutoCompactionState::AwaitingJudgment { .. }
+    );
+
+    chat.handle_codex_event(Event {
+        id: "rawr-judge-right".into(),
+        msg: EventMsg::RawrAutoCompactionJudgmentResult(
+            codex_core::protocol::RawrAutoCompactionJudgmentResultEvent {
+                request_id,
+                tier: "early".to_string(),
+                should_compact: true,
+                reason: "phase boundary".to_string(),
+            },
+        ),
+    });
+    assert_eq!(drain_for_compact(&mut rx), true);
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_auto_watcher_packet_e2e() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.rawr_saw_commit_this_turn = true;
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+    settings.prompt_frontmatter.packet.max_tail_chars = 200;
+
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // Compaction finished (event)...
+    inject_context_compacted(&mut chat);
+
+    // ...and then the compaction task turn completes; the watcher injects the packet.
+    chat.maybe_rawr_auto_compact_with_settings(None, settings);
+    let injected = next_submit_op(&mut op_rx);
+    let Op::UserTurn { items, .. } = injected else {
+        panic!("expected Op::UserTurn");
+    };
+    let text = match &items[0] {
+        UserInput::Text { text, .. } => text.clone(),
+        other => panic!("expected UserInput::Text, got {other:?}"),
+    };
+    assert!(
+        text.contains("Continuation context packet"),
+        "expected packet header, got: {text}"
+    );
+    assert!(
+        text.contains("Natural boundary signals: commit=true"),
+        "expected boundary summary, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_injects_packet_when_turn_complete_arrives_before_context_compacted() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.rawr_saw_commit_this_turn = true;
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+    settings.prompt_frontmatter.packet.max_tail_chars = 200;
+
+    // Trigger compaction.
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // Compaction turn completes first (out-of-order relative to ContextCompacted).
+    chat.maybe_rawr_auto_compact_with_settings(None, settings);
+
+    // Later, we receive the actual ContextCompacted event; the watcher should still inject.
+    inject_context_compacted(&mut chat);
+    let injected = next_submit_op(&mut op_rx);
+    let Op::UserTurn { items, .. } = injected else {
+        panic!("expected Op::UserTurn");
+    };
+    let text = match &items[0] {
+        UserInput::Text { text, .. } => text.clone(),
+        other => panic!("expected UserInput::Text, got {other:?}"),
+    };
+    assert!(
+        text.contains("Continuation context packet"),
+        "expected packet header, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_defers_to_next_user_turn_when_turn_complete_boundary_enabled() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_core::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        approval_policy: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::ReadOnly,
+        cwd: PathBuf::from("/home/user/project"),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "configured".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    while rx.try_recv().is_ok() {}
+
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::TurnComplete];
+
+    // Turn completed and we're low on context. With the turn-complete boundary enabled, the
+    // watcher should defer compaction until the next user message arrives.
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings);
+    assert_eq!(drain_for_compact(&mut rx), false);
+    assert!(chat.rawr_preflight_compaction_pending.is_some());
+
+    // Next user message triggers compaction before starting any work.
+    chat.queue_user_message(UserMessage::from("next user message"));
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // When the compaction turn completes, the queued user message is submitted.
+    inject_context_compacted(&mut chat);
+    chat.on_task_complete(None, false);
+    let submitted = next_submit_op(&mut op_rx);
+    let Op::UserTurn { items, .. } = submitted else {
+        panic!("expected Op::UserTurn");
+    };
+    let text = match &items[0] {
+        UserInput::Text { text, .. } => text.clone(),
+        other => panic!("expected UserInput::Text, got {other:?}"),
+    };
+    assert!(
+        text.contains("Continuation context packet"),
+        "expected post-compaction handoff packet prefix, got: {text}"
+    );
+    assert!(
+        text.contains("next user message"),
+        "expected queued user message appended after handoff, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_preflight_does_not_run_for_local_shell_commands() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_core::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        approval_policy: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::ReadOnly,
+        cwd: PathBuf::from("/home/user/project"),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "configured".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    while rx.try_recv().is_ok() {}
+
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::TurnComplete];
+
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings);
+    assert!(chat.rawr_preflight_compaction_pending.is_some());
+
+    // Local shell commands should not trigger preflight compaction.
+    chat.queue_user_message(UserMessage::from("!echo hello"));
+    assert_eq!(drain_for_compact(&mut rx), false);
+    assert!(chat.rawr_preflight_compaction_pending.is_some());
+    loop {
+        match op_rx.try_recv() {
+            Ok(Op::RunUserShellCommand { command }) => {
+                assert_eq!(command, "echo hello");
+                break;
+            }
+            Ok(_) => continue,
+            Err(TryRecvError::Empty) => panic!("expected Op::RunUserShellCommand"),
+            Err(TryRecvError::Disconnected) => panic!("expected Op::RunUserShellCommand"),
+        }
+    }
+
+    // Next normal user message should trigger preflight compaction.
+    chat.queue_user_message(UserMessage::from("hello"));
+    assert_eq!(drain_for_compact(&mut rx), true);
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_auto_agent_packet_e2e() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.rawr_saw_commit_this_turn = true;
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Agent,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+    settings.agent_packet_prompt = "PLEASE WRITE PACKET".to_string();
+
+    // First pass injects the prompt to ask the agent for a packet.
+    chat.maybe_rawr_auto_compact_with_settings(Some("ignored"), settings.clone());
+    let prompt_turn = next_submit_op(&mut op_rx);
+    let Op::UserTurn { items, .. } = prompt_turn else {
+        panic!("expected Op::UserTurn");
+    };
+    let prompt = match &items[0] {
+        UserInput::Text { text, .. } => text.clone(),
+        other => panic!("expected UserInput::Text, got {other:?}"),
+    };
+    assert_eq!(prompt, "PLEASE WRITE PACKET");
+
+    // Second pass: agent responded with packet; watcher triggers compaction.
+    chat.maybe_rawr_auto_compact_with_settings(Some("PACKET CONTENTS"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // Compaction finished event + next completion => inject the exact packet.
+    inject_context_compacted(&mut chat);
+    chat.maybe_rawr_auto_compact_with_settings(None, settings);
+    let injected = next_submit_op(&mut op_rx);
+    let Op::UserTurn { items, .. } = injected else {
+        panic!("expected Op::UserTurn");
+    };
+    let text = match &items[0] {
+        UserInput::Text { text, .. } => text.clone(),
+        other => panic!("expected UserInput::Text, got {other:?}"),
+    };
+    assert_eq!(text, "PACKET CONTENTS");
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_scratch_write_is_included_in_agent_packet_prompt_when_enabled() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.rawr_saw_commit_this_turn = true;
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Agent,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+    settings.agent_packet_prompt = "PLEASE WRITE PACKET".to_string();
+    settings.scratch_write_enabled = true;
+    settings.scratch_write_prompt = "SCRATCH TO {scratch_file}".to_string();
+
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings.clone());
+    let prompt_turn = next_submit_op(&mut op_rx);
+    let Op::UserTurn { items, .. } = prompt_turn else {
+        panic!("expected Op::UserTurn");
+    };
+    let prompt = match &items[0] {
+        UserInput::Text { text, .. } => text.clone(),
+        other => panic!("expected UserInput::Text, got {other:?}"),
+    };
+    assert!(
+        prompt.contains(".scratch/agent-") && prompt.contains(".scratch.md"),
+        "expected scratch file path, got: {prompt}"
+    );
+    assert!(
+        prompt.contains("PLEASE WRITE PACKET"),
+        "expected continuation packet prompt, got: {prompt}"
+    );
+
+    // Agent returns the packet; watcher triggers compaction.
+    chat.maybe_rawr_auto_compact_with_settings(Some("PACKET CONTENTS"), settings);
+    assert_eq!(drain_for_compact(&mut rx), true);
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_scratch_write_is_requested_before_compacting_in_watcher_mode() {
+    let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.rawr_saw_commit_this_turn = true;
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+    settings.scratch_write_enabled = true;
+    settings.scratch_write_prompt = "SCRATCH TO {scratch_file}".to_string();
+
+    // First pass requests scratch write (no compaction yet).
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), false);
+    let prompt_turn = next_submit_op(&mut op_rx);
+    let Op::UserTurn { items, .. } = prompt_turn else {
+        panic!("expected Op::UserTurn");
+    };
+    let prompt = match &items[0] {
+        UserInput::Text { text, .. } => text.clone(),
+        other => panic!("expected UserInput::Text, got {other:?}"),
+    };
+    assert!(
+        prompt.contains(".scratch/agent-") && prompt.contains(".scratch.md"),
+        "expected scratch file path, got: {prompt}"
+    );
+
+    // Second pass: scratch write turn completed -> watcher compacts.
+    chat.maybe_rawr_auto_compact_with_settings(Some("scratch done"), settings);
+    assert_eq!(drain_for_compact(&mut rx), true);
+}
+
+#[tokio::test]
+async fn rawr_auto_compaction_compacts_before_queued_user_messages_but_never_in_review() {
+    let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    chat.set_feature_enabled(Feature::RawrAutoCompaction, true);
+    chat.rawr_saw_commit_this_turn = true;
+    chat.set_token_info(Some(make_token_info(16_000, 20_000)));
+
+    let mut settings = make_rawr_settings_for_test(
+        RawrAutoCompactionMode::Auto,
+        RawrAutoCompactionPacketAuthor::Watcher,
+    );
+    settings
+        .prompt_frontmatter
+        .trigger
+        .auto_requires_any_boundary = vec![RawrAutoCompactionBoundary::Commit];
+
+    // If there are queued messages, compaction can still run before sending the queued message.
+    chat.queued_user_messages
+        .push_back(UserMessage::from("queued message"));
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings.clone());
+    assert_eq!(drain_for_compact(&mut rx), true);
+
+    // If in review mode, do nothing.
+    chat.queued_user_messages.clear();
+    chat.is_review_mode = true;
+    chat.maybe_rawr_auto_compact_with_settings(Some("did the thing"), settings);
+    assert_eq!(drain_for_compact(&mut rx), false);
 }
 
 #[tokio::test]

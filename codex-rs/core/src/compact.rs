@@ -95,6 +95,9 @@ async fn run_compact_task_inner(
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
 ) -> CodexResult<()> {
+    let total_tokens_before = sess.get_total_token_usage().await;
+    let compaction_trigger =
+        crate::compaction_audit::take_next_compaction_trigger(sess.conversation_id);
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
@@ -218,9 +221,20 @@ async fn run_compact_task_inner(
     sess.replace_history(new_history).await;
     sess.recompute_token_usage(&turn_context).await;
 
+    let compaction_trigger_for_rawr = compaction_trigger.clone();
+    let total_tokens_after = sess.get_total_token_usage().await;
+    sess.rawr_note_compaction_completed(
+        turn_context.sub_id.as_str(),
+        compaction_trigger_for_rawr,
+        total_tokens_before,
+        total_tokens_after,
+    )
+    .await;
+
     let rollout_item = RolloutItem::Compacted(CompactedItem {
         message: summary_text.clone(),
         replacement_history: None,
+        trigger: compaction_trigger,
     });
     sess.persist_rollout_items(&[rollout_item]).await;
 

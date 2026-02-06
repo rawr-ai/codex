@@ -680,6 +680,9 @@ mod tests {
     async fn host_blocked_requires_allowlist_match() {
         let state = network_proxy_state_for_policy(NetworkProxySettings {
             allowed_domains: vec!["example.com".to_string()],
+            // Avoid reliance on DNS resolution for `example.com` when the local/private-address
+            // guard is enabled.
+            allow_local_binding: true,
             ..NetworkProxySettings::default()
         });
 

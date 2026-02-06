@@ -15,6 +15,7 @@ use crate::config::types::Notifications;
 use crate::config::types::OtelConfig;
 use crate::config::types::OtelConfigToml;
 use crate::config::types::OtelExporterKind;
+use crate::config::types::RawrAutoCompactionToml;
 use crate::config::types::SandboxWorkspaceWrite;
 use crate::config::types::ShellEnvironmentPolicy;
 use crate::config::types::ShellEnvironmentPolicyToml;
@@ -94,6 +95,7 @@ pub mod edit;
 mod network_proxy_spec;
 mod permissions;
 pub mod profile;
+pub mod rawr;
 pub mod schema;
 pub mod service;
 pub mod types;
@@ -236,7 +238,7 @@ pub struct Config {
     /// appends one extra argument containing a JSON payload describing the
     /// event.
     ///
-    /// Example `~/.codex/config.toml` snippet:
+    /// Example `~/.codex-rawr/config.toml` snippet:
     ///
     /// ```toml
     /// notify = ["notify-send", "Codex"]
@@ -340,6 +342,7 @@ pub struct Config {
     pub memories: MemoriesConfig,
 
     /// Directory containing all Codex state (defaults to `~/.codex` but can be
+    /// Directory containing all Codex state (defaults to `~/.codex` but can be
     /// overridden by the `CODEX_HOME` environment variable).
     pub codex_home: PathBuf,
 
@@ -420,9 +423,11 @@ pub struct Config {
 
     /// Centralized feature flags; source of truth for feature gating.
     pub features: Features,
-
     /// When `true`, suppress warnings about unstable (under development) features.
     pub suppress_unstable_features_warning: bool,
+
+    /// Rawr auto-compaction watcher settings (optional).
+    pub rawr_auto_compaction: Option<RawrAutoCompactionToml>,
 
     /// The active profile name used to derive this `Config` (if any).
     pub active_profile: Option<String>,
@@ -937,7 +942,7 @@ pub fn set_default_oss_provider(codex_home: &Path, provider: &str) -> std::io::R
         .map_err(|err| std::io::Error::other(format!("failed to persist config.toml: {err}")))
 }
 
-/// Base config deserialized from ~/.codex/config.toml.
+/// Base config deserialized from ~/.codex-rawr/config.toml.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ConfigToml {
@@ -1078,7 +1083,7 @@ pub struct ConfigToml {
     #[serde(default)]
     pub profiles: HashMap<String, ConfigProfile>,
 
-    /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
+    /// Settings that govern if and what will be written to `~/.codex-rawr/history.jsonl`.
     #[serde(default)]
     pub history: Option<History>,
 
@@ -1144,6 +1149,10 @@ pub struct ConfigToml {
 
     /// Suppress warnings about unstable (under development) features.
     pub suppress_unstable_features_warning: Option<bool>,
+
+    /// Rawr auto-compaction watcher settings.
+    #[serde(default)]
+    pub rawr_auto_compaction: Option<RawrAutoCompactionToml>,
 
     /// Settings for ghost snapshots (used for undo).
     #[serde(default)]
@@ -2054,6 +2063,7 @@ impl Config {
             suppress_unstable_features_warning: cfg
                 .suppress_unstable_features_warning
                 .unwrap_or(false),
+            rawr_auto_compaction: cfg.rawr_auto_compaction,
             active_profile: active_profile_name,
             active_project,
             windows_wsl_setup_acknowledged: cfg.windows_wsl_setup_acknowledged.unwrap_or(false),
@@ -2245,10 +2255,9 @@ fn toml_uses_deprecated_instructions_file(value: &TomlValue) -> bool {
 /// specified by the `CODEX_HOME` environment variable. If not set, defaults to
 /// `~/.codex`.
 ///
-/// - If `CODEX_HOME` is set, the value must exist and be a directory. The
-///   value will be canonicalized and this function will Err otherwise.
-/// - If `CODEX_HOME` is not set, this function does not verify that the
-///   directory exists.
+/// Delegates to `codex_utils_home_dir::find_codex_home` so shared crates follow
+/// a single resolver policy. Fork-specific isolation should be enforced by
+/// launcher/env defaults that set `CODEX_HOME`.
 pub fn find_codex_home() -> std::io::Result<PathBuf> {
     codex_utils_home_dir::find_codex_home()
 }
@@ -2483,6 +2492,70 @@ allowed_domains = ["openai.com"]
         )?;
         assert!(config.permissions.network.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn test_rawr_auto_compaction_config_parses_packet_max_tail_chars_and_repo_observation() {
+        let cfg = r#"
+[features]
+rawr_auto_compaction = true
+
+[rawr_auto_compaction]
+mode = "auto"
+packet_author = "agent"
+scratch_write_enabled = true
+packet_max_tail_chars = 3200
+
+[rawr_auto_compaction.repo_observation]
+graphite_enabled = true
+graphite_max_chars = 4096
+"#;
+
+        let parsed: ConfigToml = toml::from_str(cfg).expect("TOML deserialization should succeed");
+        let rawr = parsed
+            .rawr_auto_compaction
+            .expect("rawr_auto_compaction should be present");
+
+        assert_eq!(rawr.scratch_write_enabled, Some(true));
+        assert_eq!(rawr.packet_max_tail_chars, Some(3200));
+
+        let repo_observation = rawr
+            .repo_observation
+            .expect("repo_observation should be present");
+        assert_eq!(repo_observation.graphite_enabled, Some(true));
+        assert_eq!(repo_observation.graphite_max_chars, Some(4096));
+    }
+
+    #[test]
+    fn test_rawr_auto_compaction_config_rejects_legacy_packet_table() {
+        let cfg = r#"
+[features]
+rawr_auto_compaction = true
+
+[rawr_auto_compaction]
+mode = "auto"
+
+[rawr_auto_compaction.packet]
+max_tail_tokens = 1200
+"#;
+
+        assert!(toml::from_str::<ConfigToml>(cfg).is_err());
+    }
+
+    #[test]
+    fn test_rawr_auto_compaction_config_rejects_legacy_trigger_table() {
+        let cfg = r#"
+[features]
+rawr_auto_compaction = true
+
+[rawr_auto_compaction]
+mode = "auto"
+
+[rawr_auto_compaction.trigger]
+percent_remaining_lt = 75
+"#;
+
+        assert!(toml::from_str::<ConfigToml>(cfg).is_err());
     }
 
     #[test]
@@ -4596,6 +4669,7 @@ model_verbosity = "high"
                 ghost_snapshot: GhostSnapshotConfig::default(),
                 features: Features::with_defaults(),
                 suppress_unstable_features_warning: false,
+                rawr_auto_compaction: None,
                 active_profile: Some("o3".to_string()),
                 active_project: ProjectConfig { trust_level: None },
                 windows_wsl_setup_acknowledged: false,
@@ -4715,6 +4789,7 @@ model_verbosity = "high"
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
             suppress_unstable_features_warning: false,
+            rawr_auto_compaction: None,
             active_profile: Some("gpt3".to_string()),
             active_project: ProjectConfig { trust_level: None },
             windows_wsl_setup_acknowledged: false,
@@ -4832,6 +4907,7 @@ model_verbosity = "high"
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
             suppress_unstable_features_warning: false,
+            rawr_auto_compaction: None,
             active_profile: Some("zdr".to_string()),
             active_project: ProjectConfig { trust_level: None },
             windows_wsl_setup_acknowledged: false,
@@ -4935,6 +5011,7 @@ model_verbosity = "high"
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
             suppress_unstable_features_warning: false,
+            rawr_auto_compaction: None,
             active_profile: Some("gpt5".to_string()),
             active_project: ProjectConfig { trust_level: None },
             windows_wsl_setup_acknowledged: false,

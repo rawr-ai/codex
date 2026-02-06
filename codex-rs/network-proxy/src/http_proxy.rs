@@ -787,6 +787,9 @@ mod tests {
     async fn http_connect_accept_blocks_in_limited_mode() {
         let policy = NetworkProxySettings {
             allowed_domains: vec!["example.com".to_string()],
+            // Avoid DNS-dependent local/private classification for `example.com` so this test
+            // remains focused on limited-mode method policy.
+            allow_local_binding: true,
             ..Default::default()
         };
         let state = Arc::new(network_proxy_state_for_policy(policy));

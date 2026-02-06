@@ -1419,6 +1419,41 @@
           "type": "object"
         },
         {
+          "description": "Result of an internal RAWR auto-compaction judgment request.",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "request_id": {
+              "description": "Correlates this result event with the originating request.",
+              "type": "string"
+            },
+            "should_compact": {
+              "type": "boolean"
+            },
+            "tier": {
+              "description": "Tier name (`early`/`ready`/`asap`/`emergency`).",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "rawr_auto_compaction_judgment_result"
+              ],
+              "title": "RawrAutoCompactionJudgmentResultEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason",
+            "request_id",
+            "should_compact",
+            "tier",
+            "type"
+          ],
+          "title": "RawrAutoCompactionJudgmentResultEventMsg",
+          "type": "object"
+        },
+        {
           "description": "Conversation history was rolled back by dropping the last N user turns.",
           "properties": {
             "num_turns": {

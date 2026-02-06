@@ -78,6 +78,11 @@ if [[ "$apply" -ne 1 ]]; then
   exit 0
 fi
 
+if [[ "$current_version" == "$fork_version" ]]; then
+  echo "Version already up-to-date; no changes needed."
+  exit 0
+fi
+
 python3 - <<PY
 import re
 from pathlib import Path

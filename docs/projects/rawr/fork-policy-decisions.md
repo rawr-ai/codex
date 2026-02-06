@@ -16,6 +16,7 @@ Chosen:
 - Active tracked chain for this cycle is:
   - `codex/integration-upstream-main`
   - `codex/incremental-rebase-2026-02-06`
+- Canonical open fork PR for this cycle is `#18` (`codex/incremental-rebase-2026-02-06`).
 
 Rejected:
 - Treating `main` as the default parent for daily Graphite work.

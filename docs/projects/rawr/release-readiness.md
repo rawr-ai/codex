@@ -2,15 +2,19 @@
 
 ## Scope
 - Phase: `C` (validation + hygiene + rebase-ready stop point)
-- Evidence timestamp (UTC): `2026-02-06T06:39:07Z`
+- Evidence timestamp (UTC): `2026-02-06T07:41:11Z`
 
 ## Trunk / Branch State
-- Trunks in use: `main` and `codex/integration-upstream-main`
+- Operational trunk: `codex/integration-upstream-main`
+- `main` role: upstream mirror branch; not the day-to-day stack base
 - Active tracked chain (`gt ls`): `codex/integration-upstream-main -> codex/incremental-rebase-2026-02-06`
-- Branch at Phase C start: `codex/incremental-rebase-2026-02-06`
-- Phase C start SHA: `cf75b6a632c2` (`docs(rawr): canonicalize Phase B policy runbook`)
-- Remote relation at Phase C start: `ahead 1` vs `origin/codex/incremental-rebase-2026-02-06`
-- Optional future upstream pull is possible and was **not executed** in this phase.
+- Current branch/HEAD: `codex/incremental-rebase-2026-02-06` at `ccfe087da`
+- Remote relation now: in sync with `origin/codex/incremental-rebase-2026-02-06`
+- Canonical fork PR state (`rawr-ai/codex`): only PR `#18` is open (`codex/incremental-rebase-2026-02-06`)
+
+## Optional Next Upstream Checkpoint (Handoff)
+- Next optional checkpoint is to replay `codex/integration-upstream-main` on `upstream/main`, then restack `codex/incremental-rebase-2026-02-06`.
+- This optional checkpoint was **not executed now**; Phase C stopped at validation + hygiene.
 
 ## Validation Evidence (codex-rs)
 Executed from `codex-rs` during Phase C:
@@ -30,4 +34,4 @@ Raw logs:
 
 ## Outcome
 - Phase C validation bar: **PASS**
-- Trunk model and branch chain reflect the current incremental-rebase topology.
+- Trunk model, branch chain, and canonical PR state reflect the current incremental-rebase topology.

@@ -18,6 +18,8 @@ Date: 2026-02-06
 ## Canonical checkpoint drill (this cycle)
 - Verify active tracked chain in Graphite:
   - `gt ls` should show `codex/integration-upstream-main -> codex/incremental-rebase-2026-02-06`.
+- Verify fork PR anchor:
+  - `gh pr list --repo rawr-ai/codex --state open` should show only PR `#18` (`codex/incremental-rebase-2026-02-06`).
 - Rehearse the checkpoint sync explicitly against integration trunk:
   - `DRY_RUN=1 rawr/sync-upstream.sh codex/integration-upstream-main`
 - If dry-run is correct, execute the real checkpoint and then restack descendants:

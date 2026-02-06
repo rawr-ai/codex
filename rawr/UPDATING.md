@@ -4,6 +4,7 @@ The permanent operating model is:
 - Graphite operational trunk: `codex/integration-upstream-main`.
 - Day-to-day fork work stacks above that trunk (current tracked child: `codex/incremental-rebase-2026-02-06`).
 - `main` is not the day-to-day stack base.
+- Canonical open fork PR (`rawr-ai/codex`) is `#18` from `codex/incremental-rebase-2026-02-06`.
 
 Upstream sync is performed only at controlled checkpoints against `codex/integration-upstream-main`.
 

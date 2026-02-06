@@ -12,6 +12,7 @@ Fork-specific rebase workflow for `rawr-ai/codex`, aligned with the permanent mo
   - `codex/integration-upstream-main`
   - `codex/incremental-rebase-2026-02-06`
 - `main`: optional upstream mirror branch only; not the day-to-day stack base.
+- Canonical open fork PR (`rawr-ai/codex`): `#18` from `codex/incremental-rebase-2026-02-06`.
 - Legacy untracked stack branches: ignored unless explicitly resurrected.
 
 ## Operational rules

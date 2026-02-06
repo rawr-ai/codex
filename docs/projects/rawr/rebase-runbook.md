@@ -53,9 +53,21 @@ Fork-specific rebase workflow for `rawr-ai/codex`, aligned with the permanent mo
 
 3. Restack tracked descendants
 - Run `gt sync --no-restack` (never a global restack in parallel workflows).
+- For non-interactive automation, prefer:
+  - `gt sync --no-restack --force --no-interactive`
 - If `gt ls --all` shows tracked descendants above trunk, run `gt restack --upstack`.
 - If `gt ls --all --show-untracked` shows untracked branches after a checkpoint rewrite, repair tracking:
   - `gt track <branch> --parent codex/integration-upstream-main`
+
+## Graphite merge caution
+- `gt merge` can take time to complete.
+- If a merge job is in progress and you are not 100% confident in the git/Graphite operations you’re running, do not run additional Graphite mutating commands (merge/sync/submit/restack). Stick to read-only inspection until the merge finishes.
+
+## Safety note: `gt sync --force`
+- `gt sync` can overwrite local trunk with remote trunk if trunk cannot be fast-forwarded.
+- Only run `gt sync --no-restack --force --no-interactive` after the checkpoint push has succeeded and your local trunk matches `origin/codex/integration-upstream-main`:
+  - `git rev-parse codex/integration-upstream-main`
+  - `git rev-parse origin/codex/integration-upstream-main`
 
 4. Validation
 - `just fmt` in `codex-rs`.
@@ -79,7 +91,7 @@ git fetch --all --prune
 DRY_RUN=1 rawr/sync-upstream.sh codex/integration-upstream-main
 rawr/sync-upstream.sh codex/integration-upstream-main
 
-gt sync --no-restack
+gt sync --no-restack --force --no-interactive
 # If descendants exist:
 gt restack --upstack
 

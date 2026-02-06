@@ -39,3 +39,35 @@ pub(crate) fn take_next_compaction_trigger(thread_id: ThreadId) -> Option<Compac
         .unwrap_or_else(|_| panic!("compaction audit mutex poisoned"))
         .remove(&thread_id)
 }
+
+/// Clear any pending compaction trigger without consuming it as a compaction.
+pub fn clear_next_compaction_trigger(thread_id: ThreadId) {
+    next_compaction_trigger()
+        .lock()
+        .unwrap_or_else(|_| panic!("compaction audit mutex poisoned"))
+        .remove(&thread_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::protocol::CompactionPacketAuthor;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn clear_removes_pending_trigger() {
+        let thread_id = ThreadId::new();
+        let trigger = CompactionTrigger::AutoWatcher {
+            trigger_percent_remaining: 42,
+            saw_commit: true,
+            saw_plan_checkpoint: false,
+            saw_plan_update: false,
+            saw_pr_checkpoint: false,
+            packet_author: CompactionPacketAuthor::Watcher,
+        };
+        set_next_compaction_trigger(thread_id, trigger.clone());
+        assert_eq!(peek_next_compaction_trigger(thread_id), Some(trigger));
+        clear_next_compaction_trigger(thread_id);
+        assert_eq!(take_next_compaction_trigger(thread_id), None);
+    }
+}

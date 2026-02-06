@@ -1832,11 +1832,7 @@ impl ChatWidget {
     }
 
     fn rawr_auto_compaction_packet_author(&self) -> RawrAutoCompactionPacketAuthor {
-        self.config
-            .rawr_auto_compaction
-            .as_ref()
-            .and_then(|config| config.packet_author)
-            .unwrap_or(RawrAutoCompactionPacketAuthor::Watcher)
+        codex_core::config::rawr::packet_author(&self.config)
     }
 
     fn maybe_rawr_auto_compact(&mut self, last_agent_message: Option<&str>) {
@@ -2252,28 +2248,21 @@ impl ChatWidget {
             packet_author,
             ..
         } = &self.rawr_auto_compaction_state
+            && let Some(thread_id) = self.thread_id
         {
-            let packet_author = match packet_author {
-                RawrAutoCompactionPacketAuthor::Watcher => {
-                    codex_core::protocol::CompactionPacketAuthor::Watcher
-                }
-                RawrAutoCompactionPacketAuthor::Agent => {
-                    codex_core::protocol::CompactionPacketAuthor::Agent
-                }
-            };
-            if let Some(thread_id) = self.thread_id {
-                codex_core::compaction_audit::set_next_compaction_trigger(
-                    thread_id,
-                    codex_core::protocol::CompactionTrigger::AutoWatcher {
-                        trigger_percent_remaining: trigger.trigger_percent_remaining,
-                        saw_commit: trigger.saw_commit,
-                        saw_plan_checkpoint: trigger.saw_plan_checkpoint,
-                        saw_plan_update: trigger.saw_plan_update,
-                        saw_pr_checkpoint: trigger.saw_pr_checkpoint,
-                        packet_author,
-                    },
-                );
-            }
+            codex_core::compaction_audit::set_next_compaction_trigger(
+                thread_id,
+                codex_core::rawr_compaction_trigger::auto_watcher_trigger(
+                    trigger.trigger_percent_remaining,
+                    trigger.saw_commit,
+                    trigger.saw_plan_checkpoint,
+                    trigger.saw_plan_update,
+                    trigger.saw_pr_checkpoint,
+                    codex_core::rawr_compaction_trigger::packet_author_from_rawr_config(
+                        *packet_author,
+                    ),
+                ),
+            );
         }
         self.rawr_emit_visibility_info(
             "auto-compaction: triggering compaction (Op::Compact)".to_string(),

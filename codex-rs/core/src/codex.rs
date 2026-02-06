@@ -151,7 +151,6 @@ use crate::protocol::AgentReasoningSectionBreakEvent;
 use crate::protocol::ApplyPatchApprovalRequestEvent;
 use crate::protocol::AskForApproval;
 use crate::protocol::BackgroundEventEvent;
-use crate::protocol::CompactionPacketAuthor;
 use crate::protocol::DeprecationNoticeEvent;
 use crate::protocol::ErrorEvent;
 use crate::protocol::Event;
@@ -4474,15 +4473,16 @@ pub(crate) async fn run_turn(
                                 );
                                 crate::compaction_audit::set_next_compaction_trigger(
                                     sess.conversation_id,
-                                    codex_protocol::protocol::CompactionTrigger::AutoWatcher {
-                                        trigger_percent_remaining: trigger
-                                            .trigger_percent_remaining,
-                                        saw_commit: trigger.saw_commit,
-                                        saw_plan_checkpoint: trigger.saw_plan_checkpoint,
-                                        saw_plan_update: trigger.saw_plan_update,
-                                        saw_pr_checkpoint: trigger.saw_pr_checkpoint,
-                                        packet_author: CompactionPacketAuthor::Agent,
-                                    },
+                                    crate::rawr_compaction_trigger::auto_watcher_trigger(
+                                        trigger.trigger_percent_remaining,
+                                        trigger.saw_commit,
+                                        trigger.saw_plan_checkpoint,
+                                        trigger.saw_plan_update,
+                                        trigger.saw_pr_checkpoint,
+                                        crate::rawr_compaction_trigger::packet_author_from_rawr_config(
+                                            crate::config::types::RawrAutoCompactionPacketAuthor::Agent,
+                                        ),
+                                    ),
                                 );
                                 run_rawr_auto_compact(&sess, &turn_context).await;
                                 let total_usage_tokens = sess.get_total_token_usage().await;

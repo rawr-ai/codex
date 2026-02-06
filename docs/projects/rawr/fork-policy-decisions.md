@@ -13,10 +13,7 @@ Chosen:
 - `codex/integration-upstream-main` is the Graphite operational trunk.
 - `main` is not the day-to-day stack base.
 - Upstream sync is checkpointed on the integration trunk, then descendants are restacked.
-- Active tracked chain for this cycle is:
-  - `codex/integration-upstream-main`
-  - `codex/incremental-rebase-2026-02-06`
-- Canonical open fork PR for this cycle is `#18` (`codex/incremental-rebase-2026-02-06`).
+- Tracked descendants are discovered via `gt ls --all` (trunk-only is a valid steady state).
 
 Rejected:
 - Treating `main` as the default parent for daily Graphite work.
@@ -69,6 +66,10 @@ Chosen:
 - Branch governance prevents repeating the "stale main as implicit base" failure mode.
 - Isolation and additive protocol policy keep fork delta small, reducing future conflict radius.
 - Deterministic lifecycle cleanup avoids latent state drift that only surfaces during large rebases.
+
+## Daily schedule policy (agent-first)
+- “Daily schedule” means the orchestrator agent is launched on a schedule and runs the mechanical tools/scripts.
+- We do not assume deterministic rebasing; conflict resolution and semantic decisions are owned by the agent.
 
 ## Implementation mapping
 - Branch governance model: Phase B canonicalization (this update).

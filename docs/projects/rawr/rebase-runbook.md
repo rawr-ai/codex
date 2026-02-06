@@ -8,11 +8,8 @@ Fork-specific rebase workflow for `rawr-ai/codex`, aligned with the permanent mo
 
 ## Permanent branch model
 - Graphite operational trunk: `codex/integration-upstream-main`.
-- Active tracked chain (current cycle):
-  - `codex/integration-upstream-main`
-  - `codex/incremental-rebase-2026-02-06`
+- Tracked descendants (if any): discovered via `gt ls --all` (trunk-only is a valid steady state).
 - `main`: optional upstream mirror branch only; not the day-to-day stack base.
-- Canonical open fork PR (`rawr-ai/codex`): `#18` from `codex/incremental-rebase-2026-02-06`.
 - Legacy untracked stack branches: ignored unless explicitly resurrected.
 
 ## Operational rules
@@ -31,29 +28,36 @@ Fork-specific rebase workflow for `rawr-ai/codex`, aligned with the permanent mo
 
 3. Full-suite gate
 - Run crate-scoped tests first.
-- Request explicit go/no-go before `cargo test --all-features`.
+- Scheduled daily runs: auto-run `cargo test --all-features`.
+- Interactive/manual runs: request explicit go/no-go before `cargo test --all-features`.
+
+## Automation boundaries (agent-first)
+- Tools/scripts automate mechanical, idempotent, atomic steps (locks, snapshots, verify attempts, lease-safe pushes, reports, restacks, tests).
+- Conflict resolution and semantic decisions are owned by the orchestrator agent (and escalated to a human only at explicit gates).
+- “Daily schedule” means a scheduler launches the orchestrator agent (with the dedicated prompt) and the agent runs these tools; it does not assume deterministic rebases.
 
 ## Mechanical steps
 1. Preflight
 - Clean tree required.
 - Verify remotes (`origin`, `upstream`).
-- Verify active tracked chain with `gt ls`.
+- Verify tracked chain with `gt ls --all` (may be trunk-only).
 
 2. Checkpoint sync on integration trunk
-- Fetch/prune remotes.
-- Checkout `codex/integration-upstream-main`.
-- Rebase onto `upstream/main`.
-- Push integration trunk with `--force-with-lease`.
+- Prefer the daily orchestrator wrapper:
+  - `bash rawr/rebase-daily.sh`
+- Or run the checkpoint script directly (verify-first, apply-second):
+  - `DRY_RUN=1 rawr/sync-upstream.sh codex/integration-upstream-main`
+  - `rawr/sync-upstream.sh codex/integration-upstream-main`
 
 3. Restack tracked descendants
-- Checkout the active child branch (currently `codex/incremental-rebase-2026-02-06`).
-- Run `gt sync --no-restack`.
-- Run `gt restack --upstack`.
+- Run `gt sync --no-restack` (never a global restack in parallel workflows).
+- If `gt ls --all` shows tracked descendants above trunk, run `gt restack --upstack`.
 
 4. Validation
 - `just fmt` in `codex-rs`.
 - Run changed-crate tests.
-- If common/core/protocol touched, full suite only after explicit go/no-go.
+- Scheduled daily runs: run full suite (`cargo test --all-features`).
+- Interactive/manual runs: full suite only after explicit go/no-go.
 
 5. Publish descendants
 - Push any rewritten descendant branches with `--force-with-lease`.
@@ -65,15 +69,14 @@ Fork-specific rebase workflow for `rawr-ai/codex`, aligned with the permanent mo
 ## Command skeleton
 ```bash
 git status --porcelain
-gt ls
+gt ls --all
 git fetch --all --prune
 
-git checkout codex/integration-upstream-main
-git rebase upstream/main
-git push --force-with-lease origin codex/integration-upstream-main
+DRY_RUN=1 rawr/sync-upstream.sh codex/integration-upstream-main
+rawr/sync-upstream.sh codex/integration-upstream-main
 
-git checkout codex/incremental-rebase-2026-02-06
 gt sync --no-restack
+# If descendants exist:
 gt restack --upstack
 
 cd codex-rs
@@ -81,7 +84,8 @@ just fmt
 cargo test -p codex-core
 cargo test -p codex-tui
 cargo test -p codex-app-server-protocol
-# ask before: cargo test --all-features
+# Scheduled daily: cargo test --all-features
+# Interactive/manual: ask before cargo test --all-features
 ```
 
 ## Known hotspot files during conflicts

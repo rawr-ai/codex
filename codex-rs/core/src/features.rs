@@ -131,6 +131,8 @@ pub enum Feature {
     ResponsesWebsockets,
     /// Enable Responses API websocket v2 mode.
     ResponsesWebsocketsV2,
+    /// rawr-ai fork: enable in-TUI auto-compaction watcher (feature-flagged).
+    RawrAutoCompaction,
 }
 
 impl Feature {
@@ -578,6 +580,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ResponsesWebsocketsV2,
         key: "responses_websockets_v2",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::RawrAutoCompaction,
+        key: "rawr_auto_compaction",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

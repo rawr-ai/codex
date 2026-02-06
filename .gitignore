@@ -68,6 +68,9 @@ coverage/
 # personal files
 personal/
 
+# rawr scratchpad files (auto-compaction pre-compact requests)
+.scratch/
+
 # os
 .DS_Store
 Thumbs.db
@@ -90,4 +93,3 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
-

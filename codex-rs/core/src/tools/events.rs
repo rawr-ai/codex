@@ -465,6 +465,13 @@ async fn emit_exec_end(
     exec_result: ExecCommandResult,
 ) {
     ctx.session
+        .rawr_note_exec_boundary(
+            ctx.turn.sub_id.as_str(),
+            exec_input.command,
+            exec_result.exit_code,
+        )
+        .await;
+    ctx.session
         .send_event(
             ctx.turn,
             EventMsg::ExecCommandEnd(ExecCommandEndEvent {

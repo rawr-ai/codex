@@ -871,7 +871,9 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             | EventMsg::RealtimeConversationRealtime(_)
             | EventMsg::RealtimeConversationClosed(_)
             | EventMsg::DynamicToolCallRequest(_)
-            | EventMsg::DynamicToolCallResponse(_) => {}
+            | EventMsg::DynamicToolCallResponse(_)
+            | EventMsg::SkillRequestApproval(_)
+            | EventMsg::RawrAutoCompactionJudgmentResult(_) => {}
         }
         CodexStatus::Running
     }

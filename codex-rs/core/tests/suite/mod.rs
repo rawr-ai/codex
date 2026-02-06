@@ -98,6 +98,7 @@ mod personality_migration;
 mod plugins;
 mod prompt_caching;
 mod quota_exceeded;
+mod rawr_auto_compaction_judgment;
 mod read_file;
 mod realtime_conversation;
 mod remote_models;

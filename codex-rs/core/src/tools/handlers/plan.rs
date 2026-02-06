@@ -111,6 +111,9 @@ pub(crate) async fn handle_update_plan(
     }
     let args = parse_update_plan_arguments(&arguments)?;
     session
+        .rawr_note_plan_update(turn_context.sub_id.as_str(), &args)
+        .await;
+    session
         .send_event(turn_context, EventMsg::PlanUpdate(args))
         .await;
     Ok("Plan updated".to_string())

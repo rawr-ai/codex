@@ -57,4 +57,22 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 - [**Installing & building**](./docs/install.md)
 - [**Open source fund**](./docs/open-source-fund.md)
 
+---
+
+## Fork release (rawr)
+
+If you are using the rawr fork locally, use a release-only publish flow:
+
+```shell
+bash rawr/release-local.sh
+```
+
+Optional tagged release:
+
+```shell
+bash rawr/release-local.sh --tag rawr-local-YYYYMMDD-HHMM
+```
+
+This keeps `codex --version` ahead of upstream so Happy selects the correct MCP server entrypoint.
+
 This repository is licensed under the [Apache-2.0 License](LICENSE).

@@ -80,6 +80,7 @@ use toml_edit::DocumentMut;
 mod constraint;
 pub mod edit;
 pub mod profile;
+pub mod rawr;
 pub mod schema;
 pub mod service;
 pub mod types;

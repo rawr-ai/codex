@@ -41,6 +41,8 @@ Fork-specific rebase workflow for `rawr-ai/codex`, aligned with the permanent mo
 - Clean tree required.
 - Verify remotes (`origin`, `upstream`).
 - Verify tracked chain with `gt ls --all` (may be trunk-only).
+- Optional (recommended) rollback anchor before rewriting trunk:
+  - `git branch codex/rollback-checkpoint-YYYY-MM-DD HEAD`
 
 2. Checkpoint sync on integration trunk
 - Prefer the daily orchestrator wrapper:
@@ -52,6 +54,8 @@ Fork-specific rebase workflow for `rawr-ai/codex`, aligned with the permanent mo
 3. Restack tracked descendants
 - Run `gt sync --no-restack` (never a global restack in parallel workflows).
 - If `gt ls --all` shows tracked descendants above trunk, run `gt restack --upstack`.
+- If `gt ls --all --show-untracked` shows untracked branches after a checkpoint rewrite, repair tracking:
+  - `gt track <branch> --parent codex/integration-upstream-main`
 
 4. Validation
 - `just fmt` in `codex-rs`.

@@ -1,11 +1,27 @@
 # rawr Codex fork: upstream updates
 
-The intent is to keep `origin/main` tracking upstream (no fork changes) and keep all rawr-specific changes on `origin/rawr/main` as a small, rebased patch series.
+The intent is to keep `origin/main` tracking upstream (no fork changes) and keep fork-specific changes on an explicit patch branch as a small, rebased patch series.
+
+Patch branch options:
+- long-lived branch (for example `rawr/main`), or
+- cycle branch (for example `codex/rebase-upstream-YYYY-MM-DD`).
+
+The runbook and script require the patch branch to be explicit and never equal to `main`.
 
 ## One-liner (preferred)
 Run:
 ```bash
-codex/rawr/sync-upstream.sh
+rawr/sync-upstream.sh
+```
+
+To target a non-current patch branch:
+```bash
+rawr/sync-upstream.sh codex/rebase-upstream-2026-02-05
+```
+
+Dry-run rehearsal:
+```bash
+DRY_RUN=1 rawr/sync-upstream.sh codex/rebase-upstream-2026-02-05
 ```
 
 ## Manual steps
@@ -15,14 +31,16 @@ git checkout main
 git pull --ff-only upstream main
 git push origin main
 
-git checkout rawr/main
+git checkout <patch-branch>
 git rebase upstream/main
-git push --force-with-lease origin rawr/main
+git push --force-with-lease origin <patch-branch>
 ```
 
 Notes:
 - Use `--force-with-lease` (not `--force`) so you don’t accidentally overwrite someone else’s work.
 - If rebases get painful, the fork delta is too big: split features into smaller commits and/or remove experimental changes.
+- Keep branch selection explicit and require a clean tree before syncing.
+- For large rebases, run `git range-diff` before push.
 
 ## Fork versioning
 

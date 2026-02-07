@@ -1,0 +1,41 @@
+# RAWR: Codex daily rebase automation
+#
+# These rules are intentionally permissive for git/Graphite operations so
+# scheduled (non-interactive) runs are not blocked by sandbox restrictions
+# such as read-only .git or disabled network.
+
+prefix_rule(
+  pattern = ["bash", "rawr/rebase-daily.sh"],
+  decision = "allow",
+  justification = "Daily rebase automation needs git/gt/cargo/just, .git writes, and network; run the orchestrator script outside the sandbox.",
+  match = ["bash rawr/rebase-daily.sh"],
+)
+
+prefix_rule(
+  pattern = ["rawr/sync-upstream.sh"],
+  decision = "allow",
+  justification = "Conflict-resolution flow runs sync-upstream directly; requires git worktrees, rebases, pushes, and network.",
+  match = ["rawr/sync-upstream.sh codex/integration-upstream-main"],
+)
+
+prefix_rule(
+  pattern = ["git"],
+  decision = "allow",
+  justification = "Allow git outside sandbox for automation and debug; avoids .git sandbox restrictions and allows network fetch/push.",
+  match = [
+    "git status",
+    "git fetch upstream --prune",
+    "git push --force-with-lease origin HEAD:refs/heads/tmp",
+  ],
+)
+
+prefix_rule(
+  pattern = ["gt"],
+  decision = "allow",
+  justification = "Allow Graphite operations outside sandbox; gt sync/restack must not be blocked.",
+  match = [
+    "gt ls --all",
+    "gt sync --no-restack --force --no-interactive",
+    "gt restack --upstack",
+  ],
+)

@@ -26,7 +26,11 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
       fi
 
       local identities
-      identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+      # NOTE: We intentionally do NOT pass -v here. `security find-identity -v` only lists
+      # identities that are trusted by the system. Self-signed/local identities are often
+      # untrusted (e.g. CSSMERR_TP_NOT_TRUSTED) but still usable for codesign, and they
+      # are sufficient to give the binary a stable identity for Keychain ACL persistence.
+      identities="$(security find-identity -p codesigning 2>/dev/null || true)"
 
       local id
       id="$(printf '%s\n' "$identities" | sed -n 's/^.*"\\(Developer ID Application:.*\\)".*$/\\1/p' | head -n 1)"

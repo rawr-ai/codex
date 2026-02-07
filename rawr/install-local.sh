@@ -33,19 +33,19 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
       identities="$(security find-identity -p codesigning 2>/dev/null || true)"
 
       local id
-      id="$(printf '%s\n' "$identities" | sed -n 's/^.*"\\(Developer ID Application:.*\\)".*$/\\1/p' | head -n 1)"
+      id="$(printf '%s\n' "$identities" | awk -F'"' '/"Developer ID Application:/{print $2; exit}')"
       if [[ -n "$id" ]]; then
         echo "$id"
         return 0
       fi
 
-      id="$(printf '%s\n' "$identities" | sed -n 's/^.*"\\(Apple Development:.*\\)".*$/\\1/p' | head -n 1)"
+      id="$(printf '%s\n' "$identities" | awk -F'"' '/"Apple Development:/{print $2; exit}')"
       if [[ -n "$id" ]]; then
         echo "$id"
         return 0
       fi
 
-      id="$(printf '%s\n' "$identities" | sed -n 's/^.*"\\(Codex Rawr Local Codesigning\\)".*$/\\1/p' | head -n 1)"
+      id="$(printf '%s\n' "$identities" | awk -F'"' '/"Codex Rawr Local Codesigning"/{print $2; exit}')"
       if [[ -n "$id" ]]; then
         echo "$id"
         return 0

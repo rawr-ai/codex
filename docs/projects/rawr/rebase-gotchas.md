@@ -33,6 +33,12 @@ Date: 2026-02-06
 - Avoid global Graphite restacks in parallel environments; default to `gt sync --no-restack`.
 - Do not run `gt sync` while a checkpoint rewrite is in progress (it may overwrite local trunk if it cannot fast-forward).
 - After any plain `git rebase` checkpoint on trunk, run `gt ls --all --show-untracked` and repair tracking with `gt track` if needed.
+- In non-interactive automation, `gt sync` may still require confirmations unless you add `--force`:
+  - Prefer `gt sync --no-restack --force --no-interactive` (only after the trunk push is complete).
+
+## Merge caution (Graphite)
+- `gt merge` can take time.
+- While a merge job is running, avoid other Graphite mutating commands unless you are 100% confident they are safe and isolated; it’s easy to create confusing metadata drift.
 
 ## Why this prevents recurrence
 - The canonical parent branch is explicit and stable.

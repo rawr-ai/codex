@@ -5609,7 +5609,7 @@ async fn rawr_compaction_turn_context(
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &model_info,
         features: &per_turn_config.features,
-        web_search_mode: per_turn_config.web_search_mode,
+        web_search_mode: Some(per_turn_config.web_search_mode.value()),
     });
     let otel_manager = turn_context
         .otel_manager

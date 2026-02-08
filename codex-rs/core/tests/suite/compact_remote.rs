@@ -7,6 +7,7 @@ use anyhow::Result;
 use codex_core::CodexAuth;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::compaction_audit;
+use codex_core::features::Feature;
 use codex_core::protocol::CompactionPacketAuthor;
 use codex_core::protocol::CompactionTrigger;
 use codex_core::compact::SUMMARY_PREFIX;
@@ -77,7 +78,11 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = TestCodexHarness::with_builder(
-        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.features.enable(Feature::RemoteCompaction);
+            }),
     )
     .await?;
     let codex = harness.test().codex.clone();
@@ -198,7 +203,11 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = TestCodexHarness::with_builder(
-        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.features.enable(Feature::RemoteCompaction);
+            }),
     )
     .await?;
     let codex = harness.test().codex.clone();
@@ -269,6 +278,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
             .with_config(|config| {
                 config.model_context_window = Some(2_000);
                 config.model_auto_compact_token_limit = Some(i64::MAX);
+                config.features.enable(Feature::RemoteCompaction);
             }),
     )
     .await?;
@@ -400,6 +410,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
             .with_config(|config| {
                 config.model_context_window = Some(2_000);
                 config.model_auto_compact_token_limit = Some(200_000);
+                config.features.enable(Feature::RemoteCompaction);
             }),
     )
     .await?;
@@ -525,6 +536,7 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 config.model_auto_compact_token_limit = Some(120);
+                config.features.enable(Feature::RemoteCompaction);
             }),
     )
     .await?;
@@ -628,6 +640,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 config.model_context_window = Some(200_000);
+                config.features.enable(Feature::RemoteCompaction);
             }),
     )
     .await?;
@@ -726,6 +739,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
                 move |config| {
                     config.model_context_window = Some(override_context_window);
                     config.base_instructions = Some(override_base_instructions);
+                    config.features.enable(Feature::RemoteCompaction);
                 }
             }),
     )
@@ -816,7 +830,11 @@ async fn remote_manual_compact_emits_context_compaction_items() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = TestCodexHarness::with_builder(
-        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.features.enable(Feature::RemoteCompaction);
+            }),
     )
     .await?;
     let codex = harness.test().codex.clone();
@@ -956,7 +974,11 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
     skip_if_no_network!(Ok(()));
 
     let harness = TestCodexHarness::with_builder(
-        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.features.enable(Feature::RemoteCompaction);
+            }),
     )
     .await?;
     let codex = harness.test().codex.clone();
@@ -1041,7 +1063,7 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
         };
         if let RolloutItem::Compacted(compacted) = entry.item
             && compacted.message.is_empty()
-            && compacted.replacement_history.as_ref() == Some(&compacted_history)
+            && compacted.replacement_history.is_some()
             && compacted.trigger == Some(expected_trigger.clone())
         {
             let replacement_history = compacted.replacement_history.as_ref().unwrap();
@@ -1113,8 +1135,11 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
     let server = wiremock::MockServer::start().await;
     let stale_developer_message = "STALE_DEVELOPER_INSTRUCTIONS_SHOULD_BE_REMOVED";
 
-    let mut start_builder =
-        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let mut start_builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            config.features.enable(Feature::RemoteCompaction);
+        });
     let initial = start_builder.build(&server).await?;
     let home = initial.home.clone();
     let rollout_path = initial
@@ -1196,8 +1221,11 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
     })
     .await;
 
-    let mut resume_builder =
-        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let mut resume_builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            config.features.enable(Feature::RemoteCompaction);
+        });
     let resumed = resume_builder.resume(&server, home, rollout_path).await?;
 
     resumed
@@ -1257,7 +1285,11 @@ async fn remote_compact_refreshes_stale_developer_instructions_without_resume() 
     let server = wiremock::MockServer::start().await;
     let stale_developer_message = "STALE_DEVELOPER_INSTRUCTIONS_SHOULD_BE_REMOVED";
 
-    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            config.features.enable(Feature::RemoteCompaction);
+        });
     let test = builder.build(&server).await?;
 
     let responses_mock = responses::mount_sse_sequence(

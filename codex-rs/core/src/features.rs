@@ -438,7 +438,7 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::RemoteCompaction,
         key: "remote_compaction",
         stage: Stage::Stable,
-        default_enabled: true,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::UnifiedExec,

@@ -5560,7 +5560,11 @@ async fn run_auto_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
 ) -> CodexResult<i64> {
-    let use_remote = should_use_remote_compact_task(&turn_context.provider);
+    let use_remote = should_use_remote_compact_task(&turn_context.provider)
+        && turn_context
+            .config
+            .features
+            .enabled(Feature::RemoteCompaction);
     if use_remote {
         run_inline_remote_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await?;
     } else {

@@ -76,6 +76,8 @@ pub enum Feature {
     GhostCommit,
     /// Enable the default shell tool.
     ShellTool,
+    /// Use remote compaction when the provider supports it.
+    RemoteCompaction,
 
     // Experimental
     /// Use the single unified PTY-backed exec tool.
@@ -409,6 +411,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ShellTool,
         key: "shell_tool",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::RemoteCompaction,
+        key: "remote_compaction",
         stage: Stage::Stable,
         default_enabled: true,
     },

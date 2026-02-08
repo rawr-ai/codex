@@ -32,6 +32,17 @@ This is an **agent-first** workflow: you own judgment, conflict resolution, and 
 - Update doc:
   - `/Users/mateicanavra/Documents/.nosync/DEV/rawr-ai/codex/rawr/UPDATING.md`
 
+## Skills to consult (for understanding, not to supersede the runbook)
+
+Read these at the start of a daily run so you understand the intended fork model and Graphite safety invariants:
+
+- [$fork-rebase-maintenance](/Users/mateicanavra/.codex-rawr/skills/fork-rebase-maintenance/SKILL.md)
+- [$graphite](/Users/mateicanavra/.codex-rawr/skills/graphite/SKILL.md)
+
+If you are operating in parallel worktrees/multi-agent mode, also read:
+
+- [$parallel-development-workflow](/Users/mateicanavra/.codex-rawr/skills/parallel-development-workflow/SKILL.md)
+
 ## Tools available (mechanical automation)
 
 - Daily wrapper (verify + apply + graphite alignment + validation + report):
@@ -91,7 +102,10 @@ Use this when you choose to complete the checkpoint despite conflicts.
    - If you need an explicit expected SHA, fetch it and use the explicit lease form.
 
 6. Graphite alignment:
-   - `gt sync --no-restack --no-interactive`
+   - Only after the checkpoint push succeeds and local trunk matches remote:
+     - `git rev-parse codex/integration-upstream-main`
+     - `git rev-parse origin/codex/integration-upstream-main`
+   - `gt sync --no-restack --force --no-interactive`
    - If `gt ls --all` shows descendants above trunk: `gt restack --upstack`
    - Verify tracking health:
      - `gt ls --all --show-untracked`

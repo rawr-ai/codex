@@ -39,12 +39,19 @@ pub async fn run_shell_escalation_execve_wrapper(
         .send_with_fds(&HANDSHAKE_MESSAGE, &[server.into_inner().into()])
         .await
         .context("failed to send handshake datagram")?;
-    let env = std::env::vars()
-        .filter(|(k, _)| {
-            !matches!(
-                k.as_str(),
+    // `std::env::vars()` can panic when the process environment contains non-UTF8 values.
+    // Our wire format is UTF-8 anyway, so we defensively drop non-UTF8 entries.
+    let env = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            if matches!(
+                key.as_str(),
                 ESCALATE_SOCKET_ENV_VAR | EXEC_WRAPPER_ENV_VAR | LEGACY_BASH_EXEC_WRAPPER_ENV_VAR
-            )
+            ) {
+                return None;
+            }
+            let value = value.into_string().ok()?;
+            Some((key, value))
         })
         .collect();
     client

@@ -8486,6 +8486,7 @@ mod tests {
         let rollout_items = vec![RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(replacement_history.clone()),
+            trigger: None,
         })];
 
         let reconstructed = session

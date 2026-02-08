@@ -651,6 +651,15 @@ fn scenarios() -> Vec<ScenarioSpec> {
         exclude_slash_tmp: false,
     };
 
+    // Some scenarios need to guarantee that "outside workspace" paths are denied even when the
+    // checkout itself is under TMPDIR (e.g., wrapper validation worktrees).
+    let workspace_write_no_tmp = |network_access| SandboxPolicy::WorkspaceWrite {
+        writable_roots: vec![],
+        network_access,
+        exclude_tmpdir_env_var: true,
+        exclude_slash_tmp: true,
+    };
+
     vec![
         ScenarioSpec {
             name: "danger_full_access_on_request_allows_outside_write",
@@ -1379,7 +1388,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "workspace_write_on_failure_escalates_outside_workspace",
             approval_policy: OnFailure,
-            sandbox_policy: workspace_write(false),
+            sandbox_policy: workspace_write_no_tmp(false),
             action: ActionKind::WriteFile {
                 target: TargetPath::OutsideWorkspace("ww_on_failure.txt"),
                 content: "workspace-on-failure",
@@ -1419,7 +1428,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
         ScenarioSpec {
             name: "workspace_write_never_blocks_outside_workspace",
             approval_policy: Never,
-            sandbox_policy: workspace_write(false),
+            sandbox_policy: workspace_write_no_tmp(false),
             action: ActionKind::WriteFile {
                 target: TargetPath::OutsideWorkspace("ww_never.txt"),
                 content: "workspace-never",

@@ -250,8 +250,24 @@ if [[ "$apply_code" -ne 0 ]]; then
 fi
 
 log "graphite: sync --no-restack"
+local_patch="$(git rev-parse "$PATCH_BRANCH")"
+remote_patch="$(git rev-parse "origin/$PATCH_BRANCH" 2>/dev/null || true)"
+if [[ -z "$remote_patch" ]]; then
+  RAWR_REPORT_STATUS="graphite_sync_failed"
+  RAWR_REPORT_EXIT_CODE="$EXIT_GRAPHITE_RESTACK_FAILED"
+  export RAWR_REPORT_NOTES="failed to resolve origin/$PATCH_BRANCH; refusing to run gt sync with --force"
+  exit "$EXIT_GRAPHITE_RESTACK_FAILED"
+fi
+
+if [[ "$local_patch" != "$remote_patch" ]]; then
+  RAWR_REPORT_STATUS="graphite_sync_failed"
+  RAWR_REPORT_EXIT_CODE="$EXIT_GRAPHITE_RESTACK_FAILED"
+  export RAWR_REPORT_NOTES="local $PATCH_BRANCH ($local_patch) does not match origin/$PATCH_BRANCH ($remote_patch); refusing to run gt sync with --force"
+  exit "$EXIT_GRAPHITE_RESTACK_FAILED"
+fi
+
 set +e
-gt_sync_out="$(gt sync --no-restack --no-interactive 2>&1)"
+gt_sync_out="$(gt sync --no-restack --force --no-interactive 2>&1)"
 gt_sync_code=$?
 set -e
 if [[ "$gt_sync_code" -ne 0 ]]; then

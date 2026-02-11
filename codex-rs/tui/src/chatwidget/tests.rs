@@ -2622,6 +2622,7 @@ async fn rawr_auto_compaction_defers_to_next_user_turn_when_turn_complete_bounda
         history_log_id: 0,
         history_entry_count: 0,
         initial_messages: None,
+        network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
     };
     chat.handle_codex_event(Event {
@@ -2691,6 +2692,7 @@ async fn rawr_auto_compaction_preflight_does_not_run_for_local_shell_commands() 
         history_log_id: 0,
         history_entry_count: 0,
         initial_messages: None,
+        network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
     };
     chat.handle_codex_event(Event {

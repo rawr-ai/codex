@@ -78,7 +78,11 @@ pub(crate) fn model_info_from_slug(slug: &str) -> ModelInfo {
         context_window: Some(272_000),
         auto_compact_token_limit: None,
         effective_context_window_percent: 95,
-        experimental_supported_tools: Vec::new(),
+        experimental_supported_tools: if slug.starts_with("test-") {
+            vec!["grep_files".to_string()]
+        } else {
+            Vec::new()
+        },
         input_modalities: default_input_modalities(),
     }
 }

@@ -56,6 +56,7 @@ fn serialize_filtered_rollout_response_items_keeps_response_and_compacted() {
         RolloutItem::Compacted(CompactedItem {
             message: "compacted summary".to_string(),
             replacement_history: None,
+            trigger: None,
         }),
     ];
 
@@ -86,6 +87,7 @@ fn serialize_filtered_rollout_response_items_supports_response_only_filter() {
         RolloutItem::Compacted(CompactedItem {
             message: "compacted summary".to_string(),
             replacement_history: None,
+            trigger: None,
         }),
     ];
 

@@ -20,7 +20,6 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
 use futures::TryFutureExt;
 use tracing::error;
-use tracing::info;
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,

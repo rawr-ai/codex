@@ -5638,6 +5638,7 @@ async fn rawr_compaction_turn_context(
         personality: turn_context.personality,
         approval_policy: turn_context.approval_policy,
         sandbox_policy: turn_context.sandbox_policy.clone(),
+        network: turn_context.network.clone(),
         windows_sandbox_level: turn_context.windows_sandbox_level,
         shell_environment_policy: per_turn_config.shell_environment_policy.clone(),
         tools_config,

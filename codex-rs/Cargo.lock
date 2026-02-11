@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "codex-hooks"
-version = "0.0.0"
+version = "0.101.0-alpha.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2162,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "codex-shell-command"
-version = "0.0.0"
+version = "0.101.0-alpha.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2427,7 +2427,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-rustls-provider"
-version = "0.0.0"
+version = "0.101.0-alpha.3"
 dependencies = [
  "rustls",
 ]

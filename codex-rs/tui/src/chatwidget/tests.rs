@@ -30,6 +30,8 @@ use codex_core::config::types::RawrAutoCompactionMode;
 use codex_core::config::types::RawrAutoCompactionPacketAuthor;
 use codex_core::config::types::RawrAutoCompactionPolicyTierToml;
 use codex_core::config::types::RawrAutoCompactionPolicyToml;
+#[cfg(target_os = "windows")]
+use codex_core::config::types::WindowsSandboxModeToml;
 use codex_core::config_loader::RequirementSource;
 use codex_core::features::FEATURES;
 use codex_core::features::Feature;

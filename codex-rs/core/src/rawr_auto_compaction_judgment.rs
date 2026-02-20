@@ -82,7 +82,7 @@ async fn drain_judgment_stream(
     prompt: &Prompt,
 ) -> Result<RawrAutoCompactionJudgment> {
     let mut client_session = sess.services.model_client.new_session();
-    let turn_metadata_header = turn_context.resolve_turn_metadata_header().await;
+    let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
     let mut stream = client_session
         .stream(
             prompt,

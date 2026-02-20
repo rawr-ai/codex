@@ -655,6 +655,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
     // checkout itself is under TMPDIR (e.g., wrapper validation worktrees).
     let workspace_write_no_tmp = |network_access| SandboxPolicy::WorkspaceWrite {
         writable_roots: vec![],
+        read_only_access: Default::default(),
         network_access,
         exclude_tmpdir_env_var: true,
         exclude_slash_tmp: true,

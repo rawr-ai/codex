@@ -1588,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "codex-config"
-version = "0.0.0"
+version = "0.101.0-alpha.3"
 dependencies = [
  "anyhow",
  "codex-app-server-protocol",
@@ -2316,7 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-approval-presets"
-version = "0.0.0"
+version = "0.101.0-alpha.3"
 dependencies = [
  "codex-core",
 ]
@@ -2341,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-cli"
-version = "0.0.0"
+version = "0.101.0-alpha.3"
 dependencies = [
  "clap",
  "codex-core",
@@ -2353,11 +2353,11 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-elapsed"
-version = "0.0.0"
+version = "0.101.0-alpha.3"
 
 [[package]]
 name = "codex-utils-fuzzy-match"
-version = "0.0.0"
+version = "0.101.0-alpha.3"
 
 [[package]]
 name = "codex-utils-home-dir"
@@ -2391,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-oss"
-version = "0.0.0"
+version = "0.101.0-alpha.3"
 dependencies = [
  "codex-core",
  "codex-lmstudio",
@@ -2434,7 +2434,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-sandbox-summary"
-version = "0.0.0"
+version = "0.101.0-alpha.3"
 dependencies = [
  "codex-core",
  "codex-utils-absolute-path",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-sleep-inhibitor"
-version = "0.0.0"
+version = "0.101.0-alpha.3"
 dependencies = [
  "core-foundation 0.9.4",
  "tracing",

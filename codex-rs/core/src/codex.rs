@@ -5560,6 +5560,10 @@ async fn run_auto_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
 ) -> CodexResult<i64> {
+    let auto_compact_limit = turn_context
+        .model_info
+        .auto_compact_token_limit()
+        .unwrap_or(i64::MAX);
     let use_remote = should_use_remote_compact_task(&turn_context.provider)
         && turn_context
             .config
@@ -5640,7 +5644,7 @@ async fn rawr_compaction_turn_context(
         sandbox_policy: turn_context.sandbox_policy.clone(),
         network: turn_context.network.clone(),
         windows_sandbox_level: turn_context.windows_sandbox_level,
-        shell_environment_policy: per_turn_config.shell_environment_policy.clone(),
+        shell_environment_policy: turn_context.shell_environment_policy.clone(),
         tools_config,
         features: per_turn_config.features.clone(),
         ghost_snapshot: per_turn_config.ghost_snapshot.clone(),
@@ -5648,17 +5652,24 @@ async fn rawr_compaction_turn_context(
         codex_linux_sandbox_exe: per_turn_config.codex_linux_sandbox_exe.clone(),
         tool_call_gate: Arc::new(ReadinessFlag::new()),
         truncation_policy: model_info.truncation_policy.into(),
+        js_repl: Arc::clone(&turn_context.js_repl),
         dynamic_tools: turn_context.dynamic_tools.clone(),
-        turn_metadata_header: turn_context.turn_metadata_header.clone(),
+        turn_metadata_state: turn_context.turn_metadata_state.clone(),
     })
 }
 
 async fn run_rawr_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
-    let _ = run_auto_compact(
-        sess,
-        &rawr_compaction_turn_context(sess, turn_context).await,
-    )
-    .await;
+    let rawr_turn_context = rawr_compaction_turn_context(sess, turn_context).await;
+    let use_remote = should_use_remote_compact_task(&rawr_turn_context.provider)
+        && rawr_turn_context
+            .config
+            .features
+            .enabled(Feature::RemoteCompaction);
+    let _ = if use_remote {
+        run_inline_remote_auto_compact_task(Arc::clone(sess), Arc::clone(&rawr_turn_context)).await
+    } else {
+        run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(&rawr_turn_context)).await
+    };
 }
 
 fn collect_explicit_app_ids_from_skill_items(

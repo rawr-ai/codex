@@ -611,9 +611,27 @@ mod tests {
     async fn get_snapshot(shell_type: ShellType) -> Result<String> {
         let dir = tempdir()?;
         let path = dir.path().join("snapshot.sh");
+        if shell_type == ShellType::Zsh {
+            // Use an isolated HOME/ZDOTDIR so local user zsh configs do not block test execution.
+            let shell = get_shell(ShellType::Zsh, None)
+                .with_context(|| format!("No available shell for {shell_type:?}"))?;
+            let home = dir.path().join("home");
+            fs::create_dir_all(&home).await?;
+            let home_escaped = home.display().to_string().replace('\'', "'\"'\"'");
+            let script = format!(
+                "HOME='{home_escaped}'; export HOME; ZDOTDIR='{home_escaped}'; export ZDOTDIR; {}",
+                zsh_snapshot_script()
+            );
+            let raw_snapshot =
+                run_script_with_timeout(&shell, &script, SNAPSHOT_TIMEOUT, true, dir.path())
+                    .await?;
+            let snapshot = strip_snapshot_preamble(&raw_snapshot)?;
+            fs::write(&path, &snapshot).await?;
+            return Ok(snapshot);
+        }
+
         write_shell_snapshot(shell_type, &path, dir.path()).await?;
-        let content = fs::read_to_string(&path).await?;
-        Ok(content)
+        fs::read_to_string(&path).await.map_err(Into::into)
     }
 
     #[test]

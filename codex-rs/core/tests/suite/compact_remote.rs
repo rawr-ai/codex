@@ -10,7 +10,6 @@ use codex_core::compaction_audit;
 use codex_core::features::Feature;
 use codex_core::protocol::CompactionPacketAuthor;
 use codex_core::protocol::CompactionTrigger;
-use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::ItemCompletedEvent;
 use codex_core::protocol::ItemStartedEvent;

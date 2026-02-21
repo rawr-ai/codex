@@ -1277,6 +1277,15 @@ fn write_connectors_config(codex_home: &std::path::Path, base_url: &str) -> std:
             r#"
 chatgpt_base_url = "{base_url}"
 mcp_oauth_credentials_store = "file"
+model = "mock-model"
+model_provider = "mock_provider"
+
+[model_providers.mock_provider]
+name = "Mock provider for app/list tests"
+base_url = "{base_url}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
 
 [features]
 connectors = true

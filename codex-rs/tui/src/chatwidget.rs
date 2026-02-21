@@ -2463,8 +2463,8 @@ impl ChatWidget {
         let op = Op::UserTurn {
             items,
             cwd: self.config.cwd.clone(),
-            approval_policy: self.config.approval_policy.value(),
-            sandbox_policy: self.config.sandbox_policy.get().clone(),
+            approval_policy: self.config.permissions.approval_policy.value(),
+            sandbox_policy: self.config.permissions.sandbox_policy.get().clone(),
             model: effective_mode.model().to_string(),
             effort: effective_mode.reasoning_effort(),
             summary: self.config.model_reasoning_summary,
@@ -2477,7 +2477,12 @@ impl ChatWidget {
             tracing::error!("failed to send injected message: {e}");
         });
 
-        self.add_to_history(history_cell::new_user_prompt(text, Vec::new(), Vec::new()));
+        self.add_to_history(history_cell::new_user_prompt(
+            text,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
     }
 
     fn rawr_request_packet_from_agent(&mut self, prompt: String) {

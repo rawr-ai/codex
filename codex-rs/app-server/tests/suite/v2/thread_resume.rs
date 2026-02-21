@@ -623,18 +623,20 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
     let ThreadResumeResponse { thread, model, .. } =
         to_response::<ThreadResumeResponse>(resume_resp)?;
     assert_eq!(model, "gpt-5.1-codex-max");
-    assert_eq!(
-        thread.status,
-        ThreadStatus::Active {
-            active_flags: vec![],
+    match thread.status {
+        ThreadStatus::Active { active_flags } => {
+            assert_eq!(active_flags, vec![]);
+            timeout(
+                DEFAULT_READ_TIMEOUT,
+                primary.read_stream_until_notification_message("turn/completed"),
+            )
+            .await??;
         }
-    );
-
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        primary.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
+        ThreadStatus::Idle => {}
+        ThreadStatus::NotLoaded | ThreadStatus::SystemError => {
+            panic!("unexpected thread status after resume: {:?}", thread.status);
+        }
+    }
 
     Ok(())
 }

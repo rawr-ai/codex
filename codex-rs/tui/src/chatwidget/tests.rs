@@ -30,8 +30,6 @@ use codex_core::config::types::RawrAutoCompactionMode;
 use codex_core::config::types::RawrAutoCompactionPacketAuthor;
 use codex_core::config::types::RawrAutoCompactionPolicyTierToml;
 use codex_core::config::types::RawrAutoCompactionPolicyToml;
-#[cfg(target_os = "windows")]
-use codex_core::config::types::WindowsSandboxModeToml;
 use codex_core::config_loader::RequirementSource;
 use codex_core::features::FEATURES;
 use codex_core::features::Feature;
@@ -2618,7 +2616,7 @@ async fn rawr_auto_compaction_defers_to_next_user_turn_when_turn_complete_bounda
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
         approval_policy: AskForApproval::Never,
-        sandbox_policy: SandboxPolicy::ReadOnly,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
         cwd: PathBuf::from("/home/user/project"),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -2688,7 +2686,7 @@ async fn rawr_auto_compaction_preflight_does_not_run_for_local_shell_commands() 
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
         approval_policy: AskForApproval::Never,
-        sandbox_policy: SandboxPolicy::ReadOnly,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
         cwd: PathBuf::from("/home/user/project"),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,

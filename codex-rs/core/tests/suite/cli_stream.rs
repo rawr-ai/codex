@@ -27,7 +27,6 @@ async fn responses_mode_stream_cli() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
-    let repo_root = repo_root();
     let sse = responses::sse(vec![
         responses::ev_response_created("resp-1"),
         responses::ev_assistant_message("msg-1", "hi"),
@@ -36,21 +35,26 @@ async fn responses_mode_stream_cli() {
     let resp_mock = responses::mount_sse_once(&server, sse).await;
 
     let home = TempDir::new().unwrap();
+    // Use a tiny workspace to keep CLI startup fast and deterministic.
+    let workspace = TempDir::new().unwrap();
     let provider_override = format!(
-        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\" }}",
+        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"OPENAI_API_KEY\", wire_api = \"responses\", stream_idle_timeout_ms = 10000 }}",
         server.uri()
     );
     let bin = codex_cli_bin().unwrap();
     let mut cmd = AssertCommand::new(bin);
-    cmd.timeout(Duration::from_secs(30));
+    // This test shells out to the CLI and may also build the `codex` binary on-demand
+    // (when it's not already present in target/). Be tolerant of transient load.
+    cmd.timeout(Duration::from_secs(300));
     cmd.arg("exec")
+        .arg("--ephemeral")
         .arg("--skip-git-repo-check")
         .arg("-c")
         .arg(&provider_override)
         .arg("-c")
         .arg("model_provider=\"mock\"")
         .arg("-C")
-        .arg(&repo_root)
+        .arg(workspace.path())
         .arg("hello?");
     cmd.env("CODEX_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy")

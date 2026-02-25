@@ -90,6 +90,7 @@ async fn drain_judgment_stream(
             &turn_context.otel_manager,
             turn_context.reasoning_effort,
             turn_context.reasoning_summary,
+            turn_context.config.service_tier,
             turn_metadata_header.as_deref(),
         )
         .await?;

@@ -296,13 +296,7 @@ fn excluded_exports_regex() -> String {
 
 fn zsh_snapshot_script() -> String {
     let excluded = excluded_exports_regex();
-    let script = r##"if [[ -n "$ZDOTDIR" ]]; then
-  rc="$ZDOTDIR/.zshrc"
-else
-  rc="$HOME/.zshrc"
-fi
-[[ -r "$rc" ]] && . "$rc"
-print '# Snapshot file'
+    let script = r##"print '# Snapshot file'
 print '# Unset all aliases to avoid conflicts with functions'
 print 'unalias -a 2>/dev/null || true'
 print '# Functions'
@@ -340,10 +334,7 @@ fi
 
 fn bash_snapshot_script() -> String {
     let excluded = excluded_exports_regex();
-    let script = r##"if [ -z "$BASH_ENV" ] && [ -r "$HOME/.bashrc" ]; then
-  . "$HOME/.bashrc"
-fi
-echo '# Snapshot file'
+    let script = r##"echo '# Snapshot file'
 echo '# Unset all aliases to avoid conflicts with functions'
 unalias -a 2>/dev/null || true
 echo '# Functions'
@@ -382,10 +373,7 @@ fi
 
 fn sh_snapshot_script() -> String {
     let excluded = excluded_exports_regex();
-    let script = r##"if [ -n "$ENV" ] && [ -r "$ENV" ]; then
-  . "$ENV"
-fi
-echo '# Snapshot file'
+    let script = r##"echo '# Snapshot file'
 echo '# Unset all aliases to avoid conflicts with functions'
 unalias -a 2>/dev/null || true
 echo '# Functions'

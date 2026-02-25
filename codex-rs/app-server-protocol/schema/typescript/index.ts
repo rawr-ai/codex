@@ -135,6 +135,7 @@ export type { PlanType } from "./PlanType";
 export type { RateLimitSnapshot } from "./RateLimitSnapshot";
 export type { RateLimitWindow } from "./RateLimitWindow";
 export type { RawResponseItemEvent } from "./RawResponseItemEvent";
+export type { RawrAutoCompactionJudgmentResultEvent } from "./RawrAutoCompactionJudgmentResultEvent";
 export type { ReadOnlyAccess } from "./ReadOnlyAccess";
 export type { RealtimeAudioFrame } from "./RealtimeAudioFrame";
 export type { RealtimeConversationClosedEvent } from "./RealtimeConversationClosedEvent";

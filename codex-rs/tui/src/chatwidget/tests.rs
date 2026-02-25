@@ -66,6 +66,7 @@ use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::BackgroundEventEvent;
 use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::ContextCompactedEvent;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -2359,7 +2360,7 @@ async fn rawr_auto_compaction_judgment_veto_prevents_compaction() {
     chat.handle_codex_event(Event {
         id: "rawr-judge".into(),
         msg: EventMsg::RawrAutoCompactionJudgmentResult(
-            codex_core::protocol::RawrAutoCompactionJudgmentResultEvent {
+            codex_protocol::protocol::RawrAutoCompactionJudgmentResultEvent {
                 request_id,
                 tier: "early".to_string(),
                 should_compact: false,
@@ -2427,7 +2428,7 @@ async fn rawr_auto_compaction_judgment_approval_triggers_compaction() {
     chat.handle_codex_event(Event {
         id: "rawr-judge".into(),
         msg: EventMsg::RawrAutoCompactionJudgmentResult(
-            codex_core::protocol::RawrAutoCompactionJudgmentResultEvent {
+            codex_protocol::protocol::RawrAutoCompactionJudgmentResultEvent {
                 request_id,
                 tier: "early".to_string(),
                 should_compact: true,
@@ -2492,7 +2493,7 @@ async fn rawr_auto_compaction_judgment_ignores_mismatched_request_id() {
     chat.handle_codex_event(Event {
         id: "rawr-judge-wrong".into(),
         msg: EventMsg::RawrAutoCompactionJudgmentResult(
-            codex_core::protocol::RawrAutoCompactionJudgmentResultEvent {
+            codex_protocol::protocol::RawrAutoCompactionJudgmentResultEvent {
                 request_id: "wrong".to_string(),
                 tier: "early".to_string(),
                 should_compact: true,
@@ -2510,7 +2511,7 @@ async fn rawr_auto_compaction_judgment_ignores_mismatched_request_id() {
     chat.handle_codex_event(Event {
         id: "rawr-judge-right".into(),
         msg: EventMsg::RawrAutoCompactionJudgmentResult(
-            codex_core::protocol::RawrAutoCompactionJudgmentResultEvent {
+            codex_protocol::protocol::RawrAutoCompactionJudgmentResultEvent {
                 request_id,
                 tier: "early".to_string(),
                 should_compact: true,
@@ -2609,7 +2610,7 @@ async fn rawr_auto_compaction_defers_to_next_user_turn_when_turn_complete_bounda
     let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
     let conversation_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
-    let configured = codex_core::protocol::SessionConfiguredEvent {
+    let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
         thread_name: None,
@@ -2679,7 +2680,7 @@ async fn rawr_auto_compaction_preflight_does_not_run_for_local_shell_commands() 
     let (mut chat, _app_event_tx, mut rx, mut op_rx) = make_chatwidget_manual_with_sender().await;
     let conversation_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
-    let configured = codex_core::protocol::SessionConfiguredEvent {
+    let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
         thread_name: None,

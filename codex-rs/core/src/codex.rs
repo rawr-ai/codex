@@ -22,7 +22,6 @@ use crate::commit_attribution::commit_message_trailer_instruction;
 use crate::compact;
 use crate::compact::InitialContextInjection;
 use crate::compact::run_inline_auto_compact_task;
-use crate::compact::should_use_remote_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::config::ManagedFeatures;
 use crate::connectors;
@@ -5996,8 +5995,15 @@ pub(crate) async fn run_turn(
                     }
                 }
 
-                // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
+                // For non-RAWR auto-compaction, gate repeated compactions until token usage
+                // grows enough after the previous compaction.
                 if token_limit_reached && needs_follow_up && !rawr_auto_compaction_enabled {
+                    let can_rearm = sess
+                        .auto_compaction_can_rearm(total_usage_tokens, min_tokens_since_compaction)
+                        .await;
+                    if !can_rearm {
+                        continue;
+                    }
                     if run_auto_compact(
                         &sess,
                         &turn_context,
@@ -6008,6 +6014,11 @@ pub(crate) async fn run_turn(
                     {
                         return None;
                     }
+                    let total_usage_after_compaction = sess.get_total_token_usage().await;
+                    sess.auto_compaction_record_compaction(
+                        total_usage_tokens.min(total_usage_after_compaction),
+                    )
+                    .await;
                     continue;
                 }
 
@@ -6181,12 +6192,7 @@ async fn run_auto_compact(
     turn_context: &Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
-    let auto_compact_limit = turn_context
-        .model_info
-        .auto_compact_token_limit()
-        .unwrap_or(i64::MAX);
-    let use_remote = turn_context.config.features.enabled(Feature::RemoteCompaction)
-        && should_use_remote_compact_task(&turn_context.provider);
+    let use_remote = crate::compact::remote_compaction_enabled(turn_context);
     if use_remote {
         run_inline_remote_auto_compact_task(
             Arc::clone(sess),
@@ -6201,17 +6207,6 @@ async fn run_auto_compact(
             initial_context_injection,
         )
         .await?;
-    }
-    if use_remote {
-        let total_usage_tokens = sess.get_total_token_usage().await;
-        if total_usage_tokens >= auto_compact_limit {
-            run_inline_auto_compact_task(
-                Arc::clone(sess),
-                Arc::clone(turn_context),
-                initial_context_injection,
-            )
-            .await?;
-        }
     }
     Ok(())
 }
@@ -6245,13 +6240,16 @@ async fn rawr_compaction_turn_context(
     per_turn_config.model_verbosity = Some(compaction_verbosity);
     per_turn_config.model_reasoning_effort = Some(compaction_effort);
     let reasoning_effort = per_turn_config.model_reasoning_effort;
-    let reasoning_summary = per_turn_config.model_reasoning_summary;
+    let reasoning_summary = per_turn_config
+        .model_reasoning_summary
+        .unwrap_or(model_info.default_reasoning_summary);
     let per_turn_config = Arc::new(per_turn_config);
 
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &model_info,
         features: &per_turn_config.features,
         web_search_mode: Some(per_turn_config.web_search_mode.value()),
+        session_source: turn_context.session_source.clone(),
     });
     let otel_manager = turn_context
         .otel_manager
@@ -6260,6 +6258,7 @@ async fn rawr_compaction_turn_context(
 
     Arc::new(TurnContext {
         sub_id: turn_context.sub_id.clone(),
+        realtime_active: turn_context.realtime_active,
         config: Arc::clone(&per_turn_config),
         auth_manager: turn_context.auth_manager.clone(),
         model_info: model_info.clone(),
@@ -6269,12 +6268,15 @@ async fn rawr_compaction_turn_context(
         reasoning_summary,
         session_source: turn_context.session_source.clone(),
         cwd: turn_context.cwd.clone(),
+        current_date: turn_context.current_date.clone(),
+        timezone: turn_context.timezone.clone(),
+        app_server_client_name: turn_context.app_server_client_name.clone(),
         developer_instructions: turn_context.developer_instructions.clone(),
         compact_prompt: turn_context.compact_prompt.clone(),
         user_instructions: turn_context.user_instructions.clone(),
         collaboration_mode: turn_context.collaboration_mode.clone(),
         personality: turn_context.personality,
-        approval_policy: turn_context.approval_policy,
+        approval_policy: turn_context.approval_policy.clone(),
         sandbox_policy: turn_context.sandbox_policy.clone(),
         network: turn_context.network.clone(),
         windows_sandbox_level: turn_context.windows_sandbox_level,
@@ -6289,21 +6291,20 @@ async fn rawr_compaction_turn_context(
         js_repl: Arc::clone(&turn_context.js_repl),
         dynamic_tools: turn_context.dynamic_tools.clone(),
         turn_metadata_state: turn_context.turn_metadata_state.clone(),
+        turn_skills: turn_context.turn_skills.clone(),
     })
 }
 
 async fn run_rawr_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
     let rawr_turn_context = rawr_compaction_turn_context(sess, turn_context).await;
-    let use_remote = should_use_remote_compact_task(&rawr_turn_context.provider)
-        && rawr_turn_context
-            .config
-            .features
-            .enabled(Feature::RemoteCompaction);
-    let _ = if use_remote {
-        run_inline_remote_auto_compact_task(Arc::clone(sess), Arc::clone(&rawr_turn_context)).await
-    } else {
-        run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(&rawr_turn_context)).await
-    };
+    // This compaction happens mid-turn (we're about to continue sampling), so we must inject
+    // initial context above the last user message for the replacement history.
+    let _ = run_auto_compact(
+        sess,
+        &rawr_turn_context,
+        InitialContextInjection::BeforeLastUserMessage,
+    )
+    .await;
 }
 
 fn collect_explicit_app_ids_from_skill_items(
@@ -6877,6 +6878,7 @@ fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
         | EventMsg::RealtimeConversationClosed(_)
         | EventMsg::ModelReroute(_)
         | EventMsg::ContextCompacted(_)
+        | EventMsg::RawrAutoCompactionJudgmentResult(_)
         | EventMsg::ThreadRolledBack(_)
         | EventMsg::TurnStarted(_)
         | EventMsg::TurnComplete(_)
@@ -8534,6 +8536,218 @@ mod tests {
 
         let history = session.state.lock().await.clone_history();
         assert_eq!(expected, history.raw_items());
+    }
+
+    #[tokio::test]
+    async fn record_initial_history_resumed_hydrates_previous_model() {
+        let (session, turn_context) = make_session_and_context().await;
+        let previous_model = "previous-rollout-model";
+        let previous_context_item = TurnContextItem {
+            turn_id: Some(turn_context.sub_id.clone()),
+            cwd: turn_context.cwd.clone(),
+            approval_policy: turn_context.approval_policy.value(),
+            sandbox_policy: turn_context.sandbox_policy.get().clone(),
+            network: None,
+            model: previous_model.to_string(),
+            personality: turn_context.personality,
+            collaboration_mode: Some(turn_context.collaboration_mode.clone()),
+            effort: turn_context.reasoning_effort,
+            summary: turn_context.reasoning_summary,
+            user_instructions: None,
+            developer_instructions: None,
+            final_output_json_schema: None,
+            truncation_policy: Some(turn_context.truncation_policy.into()),
+        };
+        let rollout_items = vec![RolloutItem::TurnContext(previous_context_item)];
+
+        session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ThreadId::default(),
+                history: rollout_items,
+                rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+            }))
+            .await;
+
+        assert_eq!(
+            session.previous_model().await,
+            Some(previous_model.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn record_initial_history_resumed_hydrates_previous_model_from_lifecycle_turn_with_missing_turn_context_id()
+     {
+        let (session, turn_context) = make_session_and_context().await;
+        let previous_model = "previous-rollout-model";
+        let mut previous_context_item = TurnContextItem {
+            turn_id: Some(turn_context.sub_id.clone()),
+            cwd: turn_context.cwd.clone(),
+            approval_policy: turn_context.approval_policy.value(),
+            sandbox_policy: turn_context.sandbox_policy.get().clone(),
+            network: None,
+            model: previous_model.to_string(),
+            personality: turn_context.personality,
+            collaboration_mode: Some(turn_context.collaboration_mode.clone()),
+            effort: turn_context.reasoning_effort,
+            summary: turn_context.reasoning_summary,
+            user_instructions: None,
+            developer_instructions: None,
+            final_output_json_schema: None,
+            truncation_policy: Some(turn_context.truncation_policy.into()),
+        };
+        let turn_id = previous_context_item
+            .turn_id
+            .clone()
+            .expect("turn context should have turn_id");
+        previous_context_item.turn_id = None;
+
+        let rollout_items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: turn_id.clone(),
+                    model_context_window: Some(128_000),
+                    collaboration_mode_kind: ModeKind::Default,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: "seed".to_string(),
+                    images: None,
+                    local_images: Vec::new(),
+                    text_elements: Vec::new(),
+                },
+            )),
+            RolloutItem::TurnContext(previous_context_item),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(
+                codex_protocol::protocol::TurnCompleteEvent {
+                    turn_id,
+                    last_agent_message: None,
+                },
+            )),
+        ];
+
+        session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ThreadId::default(),
+                history: rollout_items,
+                rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+            }))
+            .await;
+
+        assert_eq!(
+            session.previous_model().await,
+            Some(previous_model.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn record_initial_history_resumed_rollback_skips_only_user_turns() {
+        let (session, turn_context) = make_session_and_context().await;
+        let previous_context_item = turn_context.to_turn_context_item();
+        let user_turn_id = previous_context_item
+            .turn_id
+            .clone()
+            .expect("turn context should have turn_id");
+        let standalone_turn_id = "standalone-task-turn".to_string();
+        let rollout_items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: user_turn_id.clone(),
+                    model_context_window: Some(128_000),
+                    collaboration_mode_kind: ModeKind::Default,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: "seed".to_string(),
+                    images: None,
+                    local_images: Vec::new(),
+                    text_elements: Vec::new(),
+                },
+            )),
+            RolloutItem::TurnContext(previous_context_item),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(
+                codex_protocol::protocol::TurnCompleteEvent {
+                    turn_id: user_turn_id,
+                    last_agent_message: None,
+                },
+            )),
+            // Standalone task turn (no UserMessage) should not consume rollback skips.
+            RolloutItem::EventMsg(EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: standalone_turn_id.clone(),
+                    model_context_window: Some(128_000),
+                    collaboration_mode_kind: ModeKind::Default,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(
+                codex_protocol::protocol::TurnCompleteEvent {
+                    turn_id: standalone_turn_id,
+                    last_agent_message: None,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+            )),
+        ];
+
+        session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ThreadId::default(),
+                history: rollout_items,
+                rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+            }))
+            .await;
+
+        assert_eq!(session.previous_model().await, None);
+        assert!(session.reference_context_item().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn record_initial_history_resumed_seeds_reference_context_item_without_compaction() {
+        let (session, turn_context) = make_session_and_context().await;
+        let previous_context_item = turn_context.to_turn_context_item();
+        let rollout_items = vec![RolloutItem::TurnContext(previous_context_item.clone())];
+
+        session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ThreadId::default(),
+                history: rollout_items,
+                rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+            }))
+            .await;
+
+        assert_eq!(
+            serde_json::to_value(session.reference_context_item().await)
+                .expect("serialize seeded reference context item"),
+            serde_json::to_value(Some(previous_context_item))
+                .expect("serialize expected reference context item")
+        );
+    }
+
+    #[tokio::test]
+    async fn record_initial_history_resumed_does_not_seed_reference_context_item_after_compaction()
+    {
+        let (session, turn_context) = make_session_and_context().await;
+        let previous_context_item = turn_context.to_turn_context_item();
+        let rollout_items = vec![
+            RolloutItem::TurnContext(previous_context_item),
+            RolloutItem::Compacted(CompactedItem {
+                message: String::new(),
+                replacement_history: Some(Vec::new()),
+                trigger: None,
+            }),
+        ];
+
+        session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ThreadId::default(),
+                history: rollout_items,
+                rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+            }))
+            .await;
+
+        assert!(session.reference_context_item().await.is_none());
     }
 
     #[tokio::test]

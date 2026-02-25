@@ -4,6 +4,7 @@ use crate::ModelProviderInfo;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
+use crate::context_manager::ContextManager;
 #[cfg(test)]
 use crate::codex::PreviousTurnSettings;
 use crate::codex::Session;
@@ -11,14 +12,17 @@ use crate::codex::TurnContext;
 use crate::codex::get_last_assistant_message_from_turn;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
+use crate::features::Feature;
 use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
+use crate::protocol::RolloutItem;
 use crate::protocol::TurnStartedEvent;
 use crate::protocol::WarningEvent;
 use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;
 use crate::truncate::truncate_text;
 use crate::util::backoff;
+use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
@@ -51,6 +55,67 @@ pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bo
     provider.is_openai()
 }
 
+/// Remote compaction is available only for certain providers, but can be enabled via feature flags
+/// or implicitly for ChatGPT-auth sessions.
+pub(crate) fn remote_compaction_enabled(turn_context: &TurnContext) -> bool {
+    if !should_use_remote_compact_task(&turn_context.provider) {
+        return false;
+    }
+    if turn_context
+        .config
+        .features
+        .enabled(Feature::RemoteCompaction)
+    {
+        return true;
+    }
+    let Some(auth_manager) = turn_context.auth_manager.as_ref() else {
+        return false;
+    };
+    let Some(auth) = auth_manager.auth_cached() else {
+        return false;
+    };
+    matches!(
+        auth.api_auth_mode(),
+        ApiAuthMode::Chatgpt | ApiAuthMode::ChatgptAuthTokens
+    )
+}
+
+fn is_model_switch_developer_message(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message { role, content, .. } if role == "developer" => {
+            matches!(
+                content.as_slice(),
+                [ContentItem::InputText { text }] if text.starts_with("<model_switch>\n")
+            )
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn extract_trailing_model_switch_update_for_compaction_request(
+    history: &mut ContextManager,
+) -> Option<ResponseItem> {
+    let history_items = history.raw_items();
+    let last_user_turn_boundary_index = history_items
+        .iter()
+        .rposition(crate::context_manager::is_user_turn_boundary);
+    let model_switch_index = history_items
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, item)| {
+            let is_trailing = last_user_turn_boundary_index.is_none_or(|boundary| i > boundary);
+            if is_trailing && is_model_switch_developer_message(item) {
+                Some(i)
+            } else {
+                None
+            }
+        })?;
+    let mut replacement = history_items.to_vec();
+    let model_switch_item = replacement.remove(model_switch_index);
+    history.replace(replacement);
+    Some(model_switch_item)
+}
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,

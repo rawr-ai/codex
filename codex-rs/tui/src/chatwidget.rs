@@ -122,6 +122,7 @@ use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::ImageGenerationBeginEvent;
 use codex_protocol::protocol::ImageGenerationEndEvent;
+use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::ListCustomPromptsResponseEvent;
 use codex_protocol::protocol::ListSkillsResponseEvent;
 use codex_protocol::protocol::McpListToolsResponseEvent;
@@ -3979,7 +3980,12 @@ impl ChatWidget {
             })
             .unwrap_or((message.trim().to_string(), None));
 
-        self.set_status(header, details);
+        self.set_status(
+            header,
+            details,
+            StatusDetailsCapitalization::CapitalizeFirst,
+            STATUS_DETAILS_DEFAULT_MAX_LINES,
+        );
     }
 
     fn on_undo_started(&mut self, event: UndoStartedEvent) {
@@ -4219,7 +4225,9 @@ impl ChatWidget {
                 {
                     ExecEndTarget::ActiveTracked
                 }
-                Some(exec_cell) if exec_cell.is_active() => ExecEndTarget::OrphanHistoryWhileActiveExec,
+                Some(exec_cell) if exec_cell.is_active() => {
+                    ExecEndTarget::OrphanHistoryWhileActiveExec
+                }
                 Some(_) | None => ExecEndTarget::NewCell,
             },
             None => ExecEndTarget::NewCell,

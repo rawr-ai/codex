@@ -1,5 +1,5 @@
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::Op;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
 use pretty_assertions::assert_eq;
 use tokio::time::Duration;
 use tokio::time::timeout;

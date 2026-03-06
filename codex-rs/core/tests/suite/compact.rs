@@ -11,7 +11,6 @@ use codex_core::config::types::RawrAutoCompactionPolicyTierToml;
 use codex_core::config::types::RawrAutoCompactionPolicyToml;
 use codex_core::config::types::RawrAutoCompactionToml;
 use codex_core::features::Feature;
-use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -248,7 +247,7 @@ async fn summarize_context_three_requests_and_instructions() {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
         config.model_auto_compact_token_limit = Some(200_000);
-        config.features.disable(Feature::RemoteCompaction);
+        let _ = config.features.disable(Feature::RemoteCompaction);
     });
     let test = builder.build(&server).await.unwrap();
     let codex = test.codex.clone();
@@ -446,7 +445,7 @@ async fn manual_compact_uses_custom_prompt() {
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         config.compact_prompt = Some(custom_prompt.to_string());
-        config.features.disable(Feature::RemoteCompaction);
+        let _ = config.features.disable(Feature::RemoteCompaction);
     });
     let test = builder.build(&server).await.expect("create conversation");
     let codex = test.codex.clone();
@@ -576,7 +575,7 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
-        config.features.disable(Feature::RemoteCompaction);
+        let _ = config.features.disable(Feature::RemoteCompaction);
     });
     let test = builder.build(&server).await.unwrap();
     let codex = test.codex.clone();
@@ -637,7 +636,7 @@ async fn manual_compact_emits_context_compaction_items() {
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
-        config.features.disable(Feature::RemoteCompaction);
+        let _ = config.features.disable(Feature::RemoteCompaction);
     });
     let test = builder.build(&server).await.unwrap();
     let codex = test.codex.clone();
@@ -1667,7 +1666,7 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
     let mut builder = test_codex().with_config(move |config| {
         set_test_compact_prompt(config);
         config.model_auto_compact_token_limit = Some(limit);
-        config.features.enable(Feature::RemoteCompaction);
+        let _ = config.features.enable(Feature::RemoteCompaction);
     });
     let initial = builder.build(&server).await.unwrap();
     let home = initial.home.clone();
@@ -1696,7 +1695,7 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
     let mut resume_builder = test_codex().with_config(move |config| {
         set_test_compact_prompt(config);
         config.model_auto_compact_token_limit = Some(limit);
-        config.features.enable(Feature::RemoteCompaction);
+        let _ = config.features.enable(Feature::RemoteCompaction);
     });
     let resumed = resume_builder
         .resume(&server, home, rollout_path)
@@ -2697,7 +2696,7 @@ async fn auto_compact_skips_repeat_when_tokens_do_not_rearm() {
         set_test_compact_prompt(config);
         config.model_context_window = Some(10_000);
         config.model_auto_compact_token_limit = Some(1);
-        config.features.enable(Feature::RemoteCompaction);
+        let _ = config.features.enable(Feature::RemoteCompaction);
     });
     let codex = builder.build(&server).await.unwrap().codex;
 
@@ -2921,8 +2920,8 @@ async fn rawr_mid_turn_compaction_injects_packet_and_handoff() {
             set_test_compact_prompt(config);
             config.model_context_window = Some(100);
             config.model_auto_compact_token_limit = Some(10_000);
-            config.features.enable(Feature::RawrAutoCompaction);
-            config.features.enable(Feature::RemoteCompaction);
+            let _ = config.features.enable(Feature::RawrAutoCompaction);
+            let _ = config.features.enable(Feature::RemoteCompaction);
             config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
                 packet_author: Some(RawrAutoCompactionPacketAuthor::Agent),
                 scratch_write_enabled: Some(false),
@@ -3026,8 +3025,8 @@ async fn rawr_mid_turn_compaction_rearms_after_token_growth() {
         set_test_compact_prompt(config);
         config.model_context_window = Some(200);
         config.model_auto_compact_token_limit = Some(10_000);
-        config.features.enable(Feature::RawrAutoCompaction);
-        config.features.enable(Feature::RemoteCompaction);
+        let _ = config.features.enable(Feature::RawrAutoCompaction);
+        let _ = config.features.enable(Feature::RemoteCompaction);
         config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
             packet_author: Some(RawrAutoCompactionPacketAuthor::Agent),
             scratch_write_enabled: Some(false),
@@ -3113,8 +3112,8 @@ async fn rawr_mid_turn_compaction_includes_scratch_prompt_and_handoff() {
             set_test_compact_prompt(config);
             config.model_context_window = Some(100);
             config.model_auto_compact_token_limit = Some(10_000);
-            config.features.enable(Feature::RawrAutoCompaction);
-            config.features.enable(Feature::RemoteCompaction);
+            let _ = config.features.enable(Feature::RawrAutoCompaction);
+            let _ = config.features.enable(Feature::RemoteCompaction);
             config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
                 packet_author: Some(RawrAutoCompactionPacketAuthor::Agent),
                 scratch_write_enabled: Some(true),
@@ -3206,8 +3205,8 @@ async fn rawr_mid_turn_compaction_judgment_veto_skips_packet_injection() {
             set_test_compact_prompt(config);
             config.model_context_window = Some(100);
             config.model_auto_compact_token_limit = Some(10_000);
-            config.features.enable(Feature::RawrAutoCompaction);
-            config.features.enable(Feature::RemoteCompaction);
+            let _ = config.features.enable(Feature::RawrAutoCompaction);
+            let _ = config.features.enable(Feature::RemoteCompaction);
             config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
                 packet_author: Some(RawrAutoCompactionPacketAuthor::Agent),
                 scratch_write_enabled: Some(false),
@@ -3310,8 +3309,8 @@ async fn rawr_mid_turn_compaction_judgment_approval_injects_packet() {
             set_test_compact_prompt(config);
             config.model_context_window = Some(100);
             config.model_auto_compact_token_limit = Some(10_000);
-            config.features.enable(Feature::RawrAutoCompaction);
-            config.features.enable(Feature::RemoteCompaction);
+            let _ = config.features.enable(Feature::RawrAutoCompaction);
+            let _ = config.features.enable(Feature::RemoteCompaction);
             config.rawr_auto_compaction = Some(RawrAutoCompactionToml {
                 packet_author: Some(RawrAutoCompactionPacketAuthor::Agent),
                 scratch_write_enabled: Some(false),
@@ -3427,7 +3426,7 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
         .with_config(|config| {
             set_test_compact_prompt(config);
             config.model_auto_compact_token_limit = Some(300);
-            config.features.enable(Feature::RemoteCompaction);
+            let _ = config.features.enable(Feature::RemoteCompaction);
         })
         .build(&server)
         .await
@@ -3548,7 +3547,7 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
         .with_config(|config| {
             set_test_compact_prompt(config);
             config.model_auto_compact_token_limit = Some(300);
-            config.features.enable(Feature::RemoteCompaction);
+            let _ = config.features.enable(Feature::RemoteCompaction);
         })
         .build(&server)
         .await

@@ -8539,18 +8539,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_initial_history_resumed_hydrates_previous_model() {
+    async fn record_initial_history_resumed_bare_turn_context_does_not_hydrate_previous_model() {
         let (session, turn_context) = make_session_and_context().await;
         let previous_model = "previous-rollout-model";
         let previous_context_item = TurnContextItem {
             turn_id: Some(turn_context.sub_id.clone()),
             cwd: turn_context.cwd.clone(),
+            current_date: turn_context.current_date.clone(),
+            timezone: turn_context.timezone.clone(),
             approval_policy: turn_context.approval_policy.value(),
             sandbox_policy: turn_context.sandbox_policy.get().clone(),
             network: None,
             model: previous_model.to_string(),
             personality: turn_context.personality,
             collaboration_mode: Some(turn_context.collaboration_mode.clone()),
+            realtime_active: Some(turn_context.realtime_active),
             effort: turn_context.reasoning_effort,
             summary: turn_context.reasoning_summary,
             user_instructions: None,
@@ -8568,10 +8571,7 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(
-            session.previous_model().await,
-            Some(previous_model.to_string())
-        );
+        assert_eq!(session.previous_turn_settings().await, None);
     }
 
     #[tokio::test]
@@ -8582,12 +8582,15 @@ mod tests {
         let mut previous_context_item = TurnContextItem {
             turn_id: Some(turn_context.sub_id.clone()),
             cwd: turn_context.cwd.clone(),
+            current_date: turn_context.current_date.clone(),
+            timezone: turn_context.timezone.clone(),
             approval_policy: turn_context.approval_policy.value(),
             sandbox_policy: turn_context.sandbox_policy.get().clone(),
             network: None,
             model: previous_model.to_string(),
             personality: turn_context.personality,
             collaboration_mode: Some(turn_context.collaboration_mode.clone()),
+            realtime_active: Some(turn_context.realtime_active),
             effort: turn_context.reasoning_effort,
             summary: turn_context.reasoning_summary,
             user_instructions: None,
@@ -8635,8 +8638,11 @@ mod tests {
             .await;
 
         assert_eq!(
-            session.previous_model().await,
-            Some(previous_model.to_string())
+            session.previous_turn_settings().await,
+            Some(PreviousTurnSettings {
+                model: previous_model.to_string(),
+                realtime_active: Some(turn_context.realtime_active),
+            })
         );
     }
 
@@ -8699,12 +8705,13 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(session.previous_model().await, None);
+        assert_eq!(session.previous_turn_settings().await, None);
         assert!(session.reference_context_item().await.is_none());
     }
 
     #[tokio::test]
-    async fn record_initial_history_resumed_seeds_reference_context_item_without_compaction() {
+    async fn record_initial_history_resumed_bare_turn_context_does_not_seed_reference_context_item()
+    {
         let (session, turn_context) = make_session_and_context().await;
         let previous_context_item = turn_context.to_turn_context_item();
         let rollout_items = vec![RolloutItem::TurnContext(previous_context_item.clone())];
@@ -8717,12 +8724,7 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(
-            serde_json::to_value(session.reference_context_item().await)
-                .expect("serialize seeded reference context item"),
-            serde_json::to_value(Some(previous_context_item))
-                .expect("serialize expected reference context item")
-        );
+        assert!(session.reference_context_item().await.is_none());
     }
 
     #[tokio::test]
@@ -11366,7 +11368,7 @@ mod tests {
             std::iter::once(&user1),
             reconstruction_turn.truncation_policy,
         );
-        rollout_items.push(RolloutItem::ResponseItem(user1.clone()));
+        rollout_items.push(RolloutItem::ResponseItem(user1));
 
         let assistant1 = ResponseItem::Message {
             id: None,
@@ -11381,7 +11383,7 @@ mod tests {
             std::iter::once(&assistant1),
             reconstruction_turn.truncation_policy,
         );
-        rollout_items.push(RolloutItem::ResponseItem(assistant1.clone()));
+        rollout_items.push(RolloutItem::ResponseItem(assistant1));
 
         let summary1 = "summary one";
         let snapshot1 = live_history
@@ -11409,7 +11411,7 @@ mod tests {
             std::iter::once(&user2),
             reconstruction_turn.truncation_policy,
         );
-        rollout_items.push(RolloutItem::ResponseItem(user2.clone()));
+        rollout_items.push(RolloutItem::ResponseItem(user2));
 
         let assistant2 = ResponseItem::Message {
             id: None,
@@ -11424,7 +11426,7 @@ mod tests {
             std::iter::once(&assistant2),
             reconstruction_turn.truncation_policy,
         );
-        rollout_items.push(RolloutItem::ResponseItem(assistant2.clone()));
+        rollout_items.push(RolloutItem::ResponseItem(assistant2));
 
         let summary2 = "summary two";
         let snapshot2 = live_history

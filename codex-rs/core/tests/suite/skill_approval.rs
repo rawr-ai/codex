@@ -230,12 +230,18 @@ permissions:
         Some(PermissionProfile {
             file_system: Some(FileSystemPermissions {
                 read: Some(vec![absolute_path(
-                    &test.codex_home_path().join("skills/mbolin-test-skill/data"),
+                    &test
+                        .codex_home_path()
+                        .join("skills/mbolin-test-skill")
+                        .canonicalize()?
+                        .join("data"),
                 )]),
                 write: Some(vec![absolute_path(
                     &test
                         .codex_home_path()
-                        .join("skills/mbolin-test-skill/output"),
+                        .join("skills/mbolin-test-skill")
+                        .canonicalize()?
+                        .join("output"),
                 )]),
             }),
             ..Default::default()

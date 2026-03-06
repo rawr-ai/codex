@@ -140,13 +140,14 @@ async fn turn_interrupt_resolves_pending_command_approval_request() -> Result<()
     let working_directory = tmp.path().join("workdir");
     std::fs::create_dir(&working_directory)?;
 
-    let server = create_mock_responses_server_sequence(vec![create_shell_command_sse_response(
-        shell_command.clone(),
-        Some(&working_directory),
-        Some(10_000),
-        "call_sleep_approval",
-    )?])
-    .await;
+    let server =
+        create_mock_responses_server_sequence_unchecked(vec![create_shell_command_sse_response(
+            shell_command.clone(),
+            Some(&working_directory),
+            Some(10_000),
+            "call_sleep_approval",
+        )?])
+        .await;
     create_config_toml(&codex_home, &server.uri(), "untrusted")?;
 
     let mut mcp = McpProcess::new(&codex_home).await?;

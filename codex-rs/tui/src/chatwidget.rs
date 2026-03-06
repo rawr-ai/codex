@@ -2675,6 +2675,7 @@ impl ChatWidget {
         } else {
             None
         };
+        let service_tier = self.config.service_tier.map(Some);
         let op = Op::UserTurn {
             items,
             cwd: self.config.cwd.clone(),
@@ -2683,6 +2684,7 @@ impl ChatWidget {
             model: effective_mode.model().to_string(),
             effort: effective_mode.reasoning_effort(),
             summary: self.config.model_reasoning_summary,
+            service_tier,
             final_output_json_schema: None,
             collaboration_mode,
             personality: None,
@@ -5864,7 +5866,7 @@ impl ChatWidget {
         {
             if let Some(trigger) = self.rawr_preflight_compaction_pending.take() {
                 self.queued_user_messages.push_front(user_message);
-                self.refresh_queued_user_messages();
+                self.refresh_pending_input_preview();
                 let settings = self.rawr_load_auto_compaction_settings();
                 self.rawr_begin_auto_compaction_from_trigger(trigger, settings);
                 return;

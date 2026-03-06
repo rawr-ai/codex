@@ -23,13 +23,13 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintError;
 use codex_core::config::types::Notifications;
-#[cfg(target_os = "windows")]
-use codex_core::config::types::WindowsSandboxModeToml;
 use codex_core::config::types::RawrAutoCompactionBoundary;
 use codex_core::config::types::RawrAutoCompactionMode;
 use codex_core::config::types::RawrAutoCompactionPacketAuthor;
 use codex_core::config::types::RawrAutoCompactionPolicyTierToml;
 use codex_core::config::types::RawrAutoCompactionPolicyToml;
+#[cfg(target_os = "windows")]
+use codex_core::config::types::WindowsSandboxModeToml;
 use codex_core::config_loader::RequirementSource;
 use codex_core::features::FEATURES;
 use codex_core::features::Feature;
@@ -2616,6 +2616,7 @@ async fn rawr_auto_compaction_defers_to_next_user_turn_when_turn_complete_bounda
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
+        service_tier: None,
         approval_policy: AskForApproval::Never,
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         cwd: PathBuf::from("/home/user/project"),
@@ -2686,6 +2687,7 @@ async fn rawr_auto_compaction_preflight_does_not_run_for_local_shell_commands() 
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
+        service_tier: None,
         approval_policy: AskForApproval::Never,
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         cwd: PathBuf::from("/home/user/project"),

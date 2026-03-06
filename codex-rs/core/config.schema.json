@@ -1244,18 +1244,6 @@
       },
       "type": "object"
     },
-    "RealtimeAudioToml": {
-      "additionalProperties": false,
-      "properties": {
-        "microphone": {
-          "type": "string"
-        },
-        "speaker": {
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
     "RawrAutoCompactionBoundary": {
       "enum": [
         "commit",
@@ -1399,6 +1387,18 @@
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "RealtimeAudioToml": {
+      "additionalProperties": false,
+      "properties": {
+        "microphone": {
+          "type": "string"
+        },
+        "speaker": {
+          "type": "string"
         }
       },
       "type": "object"

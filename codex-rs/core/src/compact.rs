@@ -4,12 +4,12 @@ use crate::ModelProviderInfo;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
-use crate::context_manager::ContextManager;
 #[cfg(test)]
 use crate::codex::PreviousTurnSettings;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::codex::get_last_assistant_message_from_turn;
+use crate::context_manager::ContextManager;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::features::Feature;

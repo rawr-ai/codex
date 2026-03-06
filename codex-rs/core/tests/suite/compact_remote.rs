@@ -11,10 +11,10 @@ use codex_core::features::Feature;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::ConversationStartParams;
-use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::CompactionPacketAuthor;
 use codex_protocol::protocol::CompactionTrigger;
+use codex_protocol::protocol::ConversationStartParams;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
@@ -93,6 +93,7 @@ fn remote_realtime_test_codex_builder(
         .with_auth(CodexAuth::from_api_key("dummy"))
         .with_config(move |config| {
             config.experimental_realtime_ws_base_url = Some(realtime_base_url);
+            let _ = config.features.enable(Feature::RemoteCompaction);
         })
 }
 
@@ -157,11 +158,11 @@ fn assert_request_contains_realtime_start(request: &responses::ResponsesRequest)
     let body = request.body_json().to_string();
     assert!(
         body.contains("<realtime_conversation>"),
-        "expected request to restate realtime instructions"
+        "expected request to restate realtime instructions; body={body}"
     );
     assert!(
         !body.contains("Reason: inactive"),
-        "expected request to use realtime start instructions"
+        "expected request to use realtime start instructions; body={body}"
     );
 }
 
@@ -169,11 +170,11 @@ fn assert_request_contains_realtime_end(request: &responses::ResponsesRequest) {
     let body = request.body_json().to_string();
     assert!(
         body.contains("<realtime_conversation>"),
-        "expected request to restate realtime instructions"
+        "expected request to restate realtime instructions; body={body}"
     );
     assert!(
         body.contains("Reason: inactive"),
-        "expected request to use realtime end instructions"
+        "expected request to use realtime end instructions; body={body}"
     );
 }
 
@@ -185,7 +186,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.features.enable(Feature::RemoteCompaction);
+                let _ = config.features.enable(Feature::RemoteCompaction);
             }),
     )
     .await?;
@@ -312,7 +313,7 @@ async fn remote_compact_runs_automatically() -> Result<()> {
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.features.enable(Feature::RemoteCompaction);
+                let _ = config.features.enable(Feature::RemoteCompaction);
             }),
     )
     .await?;
@@ -392,7 +393,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
             .with_config(|config| {
                 config.model_context_window = Some(2_000);
                 config.model_auto_compact_token_limit = Some(i64::MAX);
-                config.features.enable(Feature::RemoteCompaction);
+                let _ = config.features.enable(Feature::RemoteCompaction);
             }),
     )
     .await?;
@@ -524,7 +525,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
             .with_config(|config| {
                 config.model_context_window = Some(2_000);
                 config.model_auto_compact_token_limit = Some(200_000);
-                config.features.enable(Feature::RemoteCompaction);
+                let _ = config.features.enable(Feature::RemoteCompaction);
             }),
     )
     .await?;
@@ -650,7 +651,7 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 config.model_auto_compact_token_limit = Some(120);
-                config.features.enable(Feature::RemoteCompaction);
+                let _ = config.features.enable(Feature::RemoteCompaction);
             }),
     )
     .await?;
@@ -754,7 +755,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 config.model_context_window = Some(200_000);
-                config.features.enable(Feature::RemoteCompaction);
+                let _ = config.features.enable(Feature::RemoteCompaction);
             }),
     )
     .await?;
@@ -853,7 +854,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
                 move |config| {
                     config.model_context_window = Some(override_context_window);
                     config.base_instructions = Some(override_base_instructions);
-                    config.features.enable(Feature::RemoteCompaction);
+                    let _ = config.features.enable(Feature::RemoteCompaction);
                 }
             }),
     )
@@ -947,7 +948,7 @@ async fn remote_manual_compact_emits_context_compaction_items() -> Result<()> {
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.features.enable(Feature::RemoteCompaction);
+                let _ = config.features.enable(Feature::RemoteCompaction);
             }),
     )
     .await?;
@@ -1091,7 +1092,7 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.features.enable(Feature::RemoteCompaction);
+                let _ = config.features.enable(Feature::RemoteCompaction);
             }),
     )
     .await?;
@@ -1245,7 +1246,7 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
     let mut start_builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
-            config.features.enable(Feature::RemoteCompaction);
+            let _ = config.features.enable(Feature::RemoteCompaction);
         });
     let initial = start_builder.build(&server).await?;
     let home = initial.home.clone();
@@ -1330,7 +1331,7 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
     let mut resume_builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
-            config.features.enable(Feature::RemoteCompaction);
+            let _ = config.features.enable(Feature::RemoteCompaction);
         });
     let resumed = resume_builder.resume(&server, home, rollout_path).await?;
 
@@ -1394,7 +1395,7 @@ async fn remote_compact_refreshes_stale_developer_instructions_without_resume() 
     let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
-            config.features.enable(Feature::RemoteCompaction);
+            let _ = config.features.enable(Feature::RemoteCompaction);
         });
     let test = builder.build(&server).await?;
 

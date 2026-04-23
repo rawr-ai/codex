@@ -57,4 +57,28 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 - [**Installing & building**](./docs/install.md)
 - [**Open source fund**](./docs/open-source-fund.md)
 
+---
+
+## Fork Release (rawr)
+
+If you are using the rawr fork locally, use a release-only publish flow:
+
+```shell
+bash rawr/release-local.sh
+```
+
+Optional tagged release:
+
+```shell
+bash rawr/release-local.sh --tag rawr-local-YYYYMMDD-HHMM
+```
+
+This keeps `codex --version` ahead of upstream so local launcher surfaces select the
+correct fork binary.
+
+Terminal, Happy, IDE extensions, and Codex Desktop are separate launch surfaces.
+`rawr/release-local.sh` wires the terminal/Happy path; Codex Desktop uses its bundled
+helper binary and must be patched or rolled back separately. See
+[rawr/INSTALL.md](./rawr/INSTALL.md) for the launcher matrix and Desktop workflow.
+
 This repository is licensed under the [Apache-2.0 License](LICENSE).

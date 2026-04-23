@@ -116,9 +116,21 @@ If this is `false`, RAWR watcher and mid-turn logic do not run (and built-in aut
 mode = "auto"          # tag | suggest | auto
 packet_author = "agent" # watcher | agent
 scratch_write_enabled = true
+packet_max_tail_chars = 1200
 
 # Optional overrides used for watcher-triggered compaction tasks
 # compaction_model = "gpt-5.2"
+auto_compact_prompt_path = "auto-compact.md"
+scratch_write_prompt_path = "scratch-write.md"
+watcher_packet_prompt_path = "watcher-packet.md"
+judgment_context_prompt_path = "judgment-context.md"
+scratch_file_template = ".scratch/agent-{agentName}.scratch.md"
+
+[rawr_auto_compaction.semantic_signals]
+agent_done_phrases = ["done", "completed", "finished", "shipped", "pushed"]
+agent_done_negative_phrases = ["not done", "not completed", "not finished"]
+topic_shift_phrases = ["moving on", "switching to", "next:", "next up"]
+concluding_thought_phrases = ["in summary", "final thoughts", "next steps"]
 
 [rawr_auto_compaction.policy.early]
 percent_remaining_lt = 85
@@ -200,7 +212,25 @@ do not exist, Codex seeds them from embedded defaults in
 | `codex_home/auto-compact/scratch-write.md` | Core | Pre-compact request: scratch write | Template with `{scratchFile}` / `{scratch_file}` and `{threadId}` used for internal scratch generation before compaction. |
 | `codex_home/auto-compact/judgment.md` | Core | Optional decision step before compaction | Base instructions for the schema-constrained internal judgment call. |
 | `codex_home/auto-compact/judgment-context.md` | Core | Decision context template | Human-editable template expanded with runtime placeholders (see below). |
+| `codex_home/auto-compact/watcher-packet.md` | Core | Watcher-authored fallback packet | Template used for code-authored handoff packets. Supports `{triggerPercentRemaining}`, `{trigger_percent_remaining}`, `{boundarySignals}`, `{boundary_signals}`, `{lastAgentMessage}`, and `{last_agent_message}`. |
 | `rawr/prompts/rawr-auto-compact-heads-up.md` | Currently unused (spec only) | Proposed UX: heads-up before packet/compact | Exists as an artifact for a future “heads-up banner” UX. Not referenced by current code paths. |
+
+Each prompt path can be overridden in `config.toml` with:
+
+- `rawr_auto_compaction.auto_compact_prompt_path`
+- `rawr_auto_compaction.scratch_write_prompt_path`
+- `rawr_auto_compaction.watcher_packet_prompt_path`
+- `rawr_auto_compaction.judgment_context_prompt_path`
+
+Relative prompt paths resolve under `codex_home/auto-compact/`; absolute paths are read as given.
+
+Other externally tunable behavior controls:
+
+- `rawr_auto_compaction.semantic_signals.*` overrides the phrase lists used for `agent_done`,
+  `topic_shift`, and `concluding_thought` signal derivation.
+- `rawr_auto_compaction.scratch_file_template` controls the relative scratchpad path. It supports
+  `{agentName}`, `{agent_name}`, and `{threadId}`. Unsafe absolute or parent-traversing paths fall
+  back to `.scratch/agent-{agentName}.scratch.md`.
 
 ### Inline fallbacks (only if prompt files cannot be read)
 

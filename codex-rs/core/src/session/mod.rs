@@ -1515,6 +1515,7 @@ impl Session {
             EventMsg::TurnComplete(event) => {
                 crate::rawr_auto_compaction::rawr_note_completion_message(
                     turn_state.rawr_auto_compaction_signals_mut(),
+                    turn_context.config.as_ref(),
                     event.last_agent_message.as_deref(),
                 );
             }

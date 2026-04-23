@@ -236,6 +236,20 @@ pub struct RawrAutoCompactionPolicyTierToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionSemanticSignalsToml {
+    /// Phrases that mark finalized assistant output as an agent-done boundary.
+    pub agent_done_phrases: Option<Vec<String>>,
+    /// Phrases that prevent finalized assistant output from being treated as agent-done.
+    pub agent_done_negative_phrases: Option<Vec<String>>,
+    /// Phrases that mark finalized assistant output as a topic-shift boundary.
+    pub topic_shift_phrases: Option<Vec<String>>,
+    /// Phrases that mark finalized assistant output as a concluding-thought boundary.
+    pub concluding_thought_phrases: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct RawrAutoCompactionSettingsToml {
     pub enabled: Option<bool>,
     pub mode: Option<RawrAutoCompactionMode>,
@@ -247,6 +261,18 @@ pub struct RawrAutoCompactionSettingsToml {
     pub packet_max_tail_chars: Option<usize>,
     /// Optional model override used for watcher-triggered compactions.
     pub compaction_model: Option<String>,
+    /// Optional override for the agent-authored packet prompt path.
+    pub auto_compact_prompt_path: Option<String>,
+    /// Optional override for the scratch-write prompt path.
+    pub scratch_write_prompt_path: Option<String>,
+    /// Optional override for the watcher-authored packet prompt path.
+    pub watcher_packet_prompt_path: Option<String>,
+    /// Optional override for the judgment context template path.
+    pub judgment_context_prompt_path: Option<String>,
+    /// Relative scratch path template. Supports `{agentName}`, `{agent_name}`, and `{threadId}`.
+    pub scratch_file_template: Option<String>,
+    /// Phrase lists used to derive semantic natural-boundary signals from finalized output.
+    pub semantic_signals: Option<RawrAutoCompactionSemanticSignalsToml>,
     /// Per-tier thresholds, boundary requirements, and optional judgment prompts.
     pub policy: Option<RawrAutoCompactionPolicyToml>,
 }

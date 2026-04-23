@@ -1917,15 +1917,57 @@
       },
       "type": "object"
     },
+    "RawrAutoCompactionSemanticSignalsToml": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_done_negative_phrases": {
+          "description": "Phrases that prevent finalized assistant output from being treated as agent-done.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "agent_done_phrases": {
+          "description": "Phrases that mark finalized assistant output as an agent-done boundary.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "concluding_thought_phrases": {
+          "description": "Phrases that mark finalized assistant output as a concluding-thought boundary.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "topic_shift_phrases": {
+          "description": "Phrases that mark finalized assistant output as a topic-shift boundary.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "RawrAutoCompactionSettingsToml": {
       "additionalProperties": false,
       "properties": {
+        "auto_compact_prompt_path": {
+          "description": "Optional override for the agent-authored packet prompt path.",
+          "type": "string"
+        },
         "compaction_model": {
           "description": "Optional model override used for watcher-triggered compactions.",
           "type": "string"
         },
         "enabled": {
           "type": "boolean"
+        },
+        "judgment_context_prompt_path": {
+          "description": "Optional override for the judgment context template path.",
+          "type": "string"
         },
         "mode": {
           "$ref": "#/definitions/RawrAutoCompactionMode"
@@ -1947,9 +1989,29 @@
           ],
           "description": "Per-tier thresholds, boundary requirements, and optional judgment prompts."
         },
+        "scratch_file_template": {
+          "description": "Relative scratch path template. Supports `{agentName}`, `{agent_name}`, and `{threadId}`.",
+          "type": "string"
+        },
         "scratch_write_enabled": {
           "description": "When enabled, the watcher may ask the in-session agent to write a scratchpad file before compaction so verbatim research notes survive history rewrite.",
           "type": "boolean"
+        },
+        "scratch_write_prompt_path": {
+          "description": "Optional override for the scratch-write prompt path.",
+          "type": "string"
+        },
+        "semantic_signals": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RawrAutoCompactionSemanticSignalsToml"
+            }
+          ],
+          "description": "Phrase lists used to derive semantic natural-boundary signals from finalized output."
+        },
+        "watcher_packet_prompt_path": {
+          "description": "Optional override for the watcher-authored packet prompt path.",
+          "type": "string"
         }
       },
       "type": "object"

@@ -53,8 +53,11 @@ pub(crate) async fn request_rawr_auto_compaction_judgment(
 
     let excerpt = build_recent_transcript_excerpt(sess, 12, 800).await;
     let context = build_decision_context(
-        &rawr_prompts::read_prompt_or_default(
+        &rawr_prompts::read_prompt_path_or_default(
             &codex_home,
+            crate::rawr_auto_compaction::rawr_judgment_context_prompt_path(
+                turn_context.config.as_ref(),
+            ),
             rawr_prompts::RawrPromptKind::JudgmentContext,
         ),
         tier,

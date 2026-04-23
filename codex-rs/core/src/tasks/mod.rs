@@ -856,6 +856,7 @@ impl Session {
         );
         let configured_scratch_file = do_scratch.then(|| {
             crate::rawr_auto_compaction::rawr_scratch_file_rel_path(
+                turn_context.config.as_ref(),
                 &turn_context.session_source,
                 &self.conversation_id,
             )
@@ -868,11 +869,11 @@ impl Session {
         {
             let packet_prompt = if packet_author == RawrAutoCompactionPacketAuthor::Agent {
                 let raw_packet_prompt = crate::rawr_auto_compaction::rawr_load_agent_packet_prompt(
-                    &turn_context.config.codex_home,
+                    turn_context.config.as_ref(),
                 );
                 let raw_scratch_prompt = do_scratch.then(|| {
                     crate::rawr_auto_compaction::rawr_load_scratch_write_prompt(
-                        &turn_context.config.codex_home,
+                        turn_context.config.as_ref(),
                     )
                 });
                 Some(
@@ -891,7 +892,7 @@ impl Session {
                 configured_scratch_file.as_deref().map(|scratch_path| {
                     crate::rawr_auto_compaction::rawr_build_scratch_write_prompt(
                         crate::rawr_auto_compaction::rawr_load_scratch_write_prompt(
-                            &turn_context.config.codex_home,
+                            turn_context.config.as_ref(),
                         )
                         .as_str(),
                         scratch_path,
@@ -960,6 +961,10 @@ impl Session {
         let packet = match packet_author {
             RawrAutoCompactionPacketAuthor::Watcher => {
                 crate::rawr_auto_compaction::rawr_build_watcher_post_compact_packet(
+                    crate::rawr_auto_compaction::rawr_load_watcher_packet_prompt(
+                        turn_context.config.as_ref(),
+                    )
+                    .as_str(),
                     percent_remaining,
                     &signals,
                     last_agent_message.as_deref(),
@@ -976,6 +981,10 @@ impl Session {
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| {
                     crate::rawr_auto_compaction::rawr_build_watcher_post_compact_packet(
+                        crate::rawr_auto_compaction::rawr_load_watcher_packet_prompt(
+                            turn_context.config.as_ref(),
+                        )
+                        .as_str(),
                         percent_remaining,
                         &signals,
                         last_agent_message.as_deref(),

@@ -904,6 +904,17 @@ mode = "auto"
 packet_author = "agent"
 scratch_write_enabled = true
 packet_max_tail_chars = 1200
+auto_compact_prompt_path = "auto-compact.md"
+scratch_write_prompt_path = "scratch-write.md"
+watcher_packet_prompt_path = "watcher-packet.md"
+judgment_context_prompt_path = "judgment-context.md"
+scratch_file_template = ".scratch/agent-{agentName}.scratch.md"
+
+[rawr_auto_compaction.semantic_signals]
+agent_done_phrases = ["wrapped"]
+agent_done_negative_phrases = ["not wrapped"]
+topic_shift_phrases = ["moving next"]
+concluding_thought_phrases = ["carry forward"]
 
 [rawr_auto_compaction.policy.early]
 percent_remaining_lt = 90
@@ -921,6 +932,31 @@ requires_any_boundary = ["turn_complete"]
         );
         assert_eq!(rawr.scratch_write_enabled, Some(true));
         assert_eq!(rawr.packet_max_tail_chars, Some(1200));
+        assert_eq!(
+            rawr.auto_compact_prompt_path.as_deref(),
+            Some("auto-compact.md")
+        );
+        assert_eq!(
+            rawr.scratch_write_prompt_path.as_deref(),
+            Some("scratch-write.md")
+        );
+        assert_eq!(
+            rawr.watcher_packet_prompt_path.as_deref(),
+            Some("watcher-packet.md")
+        );
+        assert_eq!(
+            rawr.judgment_context_prompt_path.as_deref(),
+            Some("judgment-context.md")
+        );
+        assert_eq!(
+            rawr.scratch_file_template.as_deref(),
+            Some(".scratch/agent-{agentName}.scratch.md")
+        );
+        let semantic_signals = rawr.semantic_signals.as_ref().expect("semantic signals");
+        assert_eq!(
+            semantic_signals.agent_done_phrases.as_deref(),
+            Some(&["wrapped".to_string()][..])
+        );
         let early = rawr
             .policy
             .as_ref()

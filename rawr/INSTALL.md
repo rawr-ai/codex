@@ -94,6 +94,18 @@ packet_author = "agent" # watcher | agent
 scratch_write_enabled = true
 packet_max_tail_chars = 1200
 # compaction_model = "gpt-5.2"
+# auto_compact_prompt_path = "auto-compact.md"
+# scratch_write_prompt_path = "scratch-write.md"
+# watcher_packet_prompt_path = "watcher-packet.md"
+# judgment_context_prompt_path = "judgment-context.md"
+# scratch_file_template = ".scratch/agent-{agentName}.scratch.md"
+
+[rawr_auto_compaction.semantic_signals]
+# Override these lists when local workflow language differs from the defaults.
+# agent_done_phrases = ["done", "completed", "finished", "shipped", "pushed"]
+# agent_done_negative_phrases = ["not done", "not completed", "not finished"]
+# topic_shift_phrases = ["moving on", "switching to", "next:", "next up"]
+# concluding_thought_phrases = ["in summary", "final thoughts", "next steps"]
 
 # Preferred: config-driven per-tier policy matrix (overrides thresholds + boundaries).
 [rawr_auto_compaction.policy.early]
@@ -124,11 +136,14 @@ At runtime, editable prompt files live under `CODEX_HOME/auto-compact/`:
 - `scratch-write.md`: scratch-write prompt used for internal scratch generation when `scratch_write_enabled = true`.
 - `judgment.md`: optional judgment gate prompt referenced by `decision_prompt_path`.
 - `judgment-context.md`: template expanded into the judgment call context.
+- `watcher-packet.md`: watcher-authored fallback packet template used when `packet_author = "watcher"` or agent packet generation fails.
 
 If these files are missing, Codex creates them with built-in defaults. Config-driven thresholds and boundaries still live in `config.toml`; config overrides win.
 
 - Compaction decision: code-driven tier policy + boundary gating; plan-based boundaries additionally require a semantic break (agent-done/topic-shift/concluding) in Early/Ready tiers so we don’t compact mid-thought just because the plan tool ran.
 - `packet_author = "watcher"` keeps the continuation packet watcher-authored; `packet_author = "agent"` uses an internal non-transcript model call to generate the continuation packet before compaction.
+- Prompt path overrides are resolved relative to `CODEX_HOME/auto-compact/` unless absolute.
+- `scratch_file_template` is a safe relative path template with `{agentName}`, `{agent_name}`, and `{threadId}` placeholders.
 
 ## Using with Happy Coder
 Happy Coder’s CLI supports `happy codex` (Codex mode). If your `PATH` resolves `codex` to this fork (e.g. via the symlink above), `happy codex` will launch the fork.

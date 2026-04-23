@@ -1,6 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::path::Component;
 use std::path::Path;
 
 use crate::config::Config;
@@ -9,6 +10,7 @@ use codex_config::types::RawrAutoCompactionBoundary;
 use codex_config::types::RawrAutoCompactionMode;
 use codex_config::types::RawrAutoCompactionPacketAuthor;
 use codex_config::types::RawrAutoCompactionPolicyTierToml;
+use codex_config::types::RawrAutoCompactionSemanticSignalsToml;
 use codex_features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::parse_command::ParsedCommand;
@@ -119,18 +121,19 @@ pub(crate) fn rawr_note_exec_command_end(
 
 pub(crate) fn rawr_note_completion_message(
     signals: &mut RawrAutoCompactionSignals,
+    config: &Config,
     last_agent_message: Option<&str>,
 ) {
     let Some(last_agent_message) = last_agent_message else {
         return;
     };
-    if rawr_agent_message_looks_done(last_agent_message) {
+    if rawr_agent_message_looks_done(config, last_agent_message) {
         signals.saw_agent_done = true;
     }
-    if rawr_agent_message_looks_like_topic_shift(last_agent_message) {
+    if rawr_agent_message_looks_like_topic_shift(config, last_agent_message) {
         signals.saw_topic_shift = true;
     }
-    if rawr_agent_message_looks_like_concluding_thought(last_agent_message) {
+    if rawr_agent_message_looks_like_concluding_thought(config, last_agent_message) {
         signals.saw_concluding_thought = true;
     }
 }
@@ -140,6 +143,29 @@ const RAWR_SCRATCH_FALLBACK_AGENT_NAMES: [&str; 24] = [
     "Pax", "Quinn", "Reid", "Remy", "Rhea", "Rory", "Sage", "Skye", "Toby", "Vera", "Wren", "Zane",
     "Zoe",
 ];
+const DEFAULT_AGENT_DONE_PHRASES: &[&str] = &["done", "completed", "finished", "shipped", "pushed"];
+const DEFAULT_AGENT_DONE_NEGATIVE_PHRASES: &[&str] = &["not done", "not completed", "not finished"];
+const DEFAULT_TOPIC_SHIFT_PHRASES: &[&str] = &[
+    "moving on",
+    "switching to",
+    "next,",
+    "next:",
+    "next up",
+    "now, let's",
+    "now let's",
+    "we'll now",
+];
+const DEFAULT_CONCLUDING_THOUGHT_PHRASES: &[&str] = &[
+    "in summary",
+    "to summarize",
+    "to wrap up",
+    "wrapping up",
+    "conclusion",
+    "concluding",
+    "final thoughts",
+    "next steps",
+];
+const DEFAULT_SCRATCH_FILE_TEMPLATE: &str = ".scratch/agent-{agentName}.scratch.md";
 
 pub(crate) fn rawr_pick_tier(
     thresholds: RawrAutoCompactionThresholds,
@@ -214,6 +240,46 @@ pub(crate) fn rawr_scratch_write_enabled(config: &Config) -> bool {
         .and_then(|rawr| rawr.settings())
         .and_then(|settings| settings.scratch_write_enabled)
         .unwrap_or(false)
+}
+
+fn rawr_auto_compact_prompt_path(config: &Config) -> Option<&str> {
+    config
+        .rawr_auto_compaction
+        .as_ref()
+        .and_then(|rawr| rawr.settings())
+        .and_then(|settings| settings.auto_compact_prompt_path.as_deref())
+}
+
+fn rawr_scratch_write_prompt_path(config: &Config) -> Option<&str> {
+    config
+        .rawr_auto_compaction
+        .as_ref()
+        .and_then(|rawr| rawr.settings())
+        .and_then(|settings| settings.scratch_write_prompt_path.as_deref())
+}
+
+pub(crate) fn rawr_watcher_packet_prompt_path(config: &Config) -> Option<&str> {
+    config
+        .rawr_auto_compaction
+        .as_ref()
+        .and_then(|rawr| rawr.settings())
+        .and_then(|settings| settings.watcher_packet_prompt_path.as_deref())
+}
+
+pub(crate) fn rawr_judgment_context_prompt_path(config: &Config) -> Option<&str> {
+    config
+        .rawr_auto_compaction
+        .as_ref()
+        .and_then(|rawr| rawr.settings())
+        .and_then(|settings| settings.judgment_context_prompt_path.as_deref())
+}
+
+fn rawr_semantic_signals_config(config: &Config) -> Option<&RawrAutoCompactionSemanticSignalsToml> {
+    config
+        .rawr_auto_compaction
+        .as_ref()
+        .and_then(|rawr| rawr.settings())
+        .and_then(|settings| settings.semantic_signals.as_ref())
 }
 
 pub(crate) fn rawr_should_compact_at_turn_complete(
@@ -443,63 +509,79 @@ pub(crate) fn rawr_command_looks_like_pr_checkpoint(command: &[String]) -> bool 
     false
 }
 
-pub(crate) fn rawr_agent_message_looks_done(message: &str) -> bool {
+pub(crate) fn rawr_agent_message_looks_done(config: &Config, message: &str) -> bool {
     let lower = message.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return false;
     }
-    if lower.contains("not done")
-        || lower.contains("not completed")
-        || lower.contains("not finished")
-    {
+    let semantic_config = rawr_semantic_signals_config(config);
+    let negative_phrases =
+        semantic_config.and_then(|signals| signals.agent_done_negative_phrases.as_ref());
+    if rawr_message_contains_any(
+        &lower,
+        negative_phrases,
+        DEFAULT_AGENT_DONE_NEGATIVE_PHRASES,
+    ) {
         return false;
     }
-    ["done", "completed", "finished", "shipped", "pushed"]
-        .into_iter()
-        .any(|needle| lower.contains(needle))
+    rawr_message_contains_any(
+        &lower,
+        semantic_config.and_then(|signals| signals.agent_done_phrases.as_ref()),
+        DEFAULT_AGENT_DONE_PHRASES,
+    )
 }
 
-pub(crate) fn rawr_agent_message_looks_like_topic_shift(message: &str) -> bool {
+pub(crate) fn rawr_agent_message_looks_like_topic_shift(config: &Config, message: &str) -> bool {
     let lower = message.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return false;
     }
-    [
-        "moving on",
-        "switching to",
-        "next,",
-        "next:",
-        "next up",
-        "now, let's",
-        "now let's",
-        "we'll now",
-    ]
-    .into_iter()
-    .any(|needle| lower.contains(needle))
+    rawr_message_contains_any(
+        &lower,
+        rawr_semantic_signals_config(config)
+            .and_then(|signals| signals.topic_shift_phrases.as_ref()),
+        DEFAULT_TOPIC_SHIFT_PHRASES,
+    )
 }
 
-pub(crate) fn rawr_agent_message_looks_like_concluding_thought(message: &str) -> bool {
+pub(crate) fn rawr_agent_message_looks_like_concluding_thought(
+    config: &Config,
+    message: &str,
+) -> bool {
     let lower = message.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return false;
     }
-    [
-        "in summary",
-        "to summarize",
-        "to wrap up",
-        "wrapping up",
-        "conclusion",
-        "concluding",
-        "final thoughts",
-        "next steps",
-    ]
-    .into_iter()
-    .any(|needle| lower.contains(needle))
+    rawr_message_contains_any(
+        &lower,
+        rawr_semantic_signals_config(config)
+            .and_then(|signals| signals.concluding_thought_phrases.as_ref()),
+        DEFAULT_CONCLUDING_THOUGHT_PHRASES,
+    )
 }
 
-pub(crate) fn rawr_load_agent_packet_prompt(codex_home: &Path) -> String {
-    let prompt =
-        rawr_prompts::read_prompt_or_default(codex_home, rawr_prompts::RawrPromptKind::AutoCompact);
+fn rawr_message_contains_any(
+    lower_message: &str,
+    configured_phrases: Option<&Vec<String>>,
+    default_phrases: &[&str],
+) -> bool {
+    if let Some(configured_phrases) = configured_phrases {
+        return configured_phrases.iter().any(|phrase| {
+            let phrase = phrase.trim().to_ascii_lowercase();
+            !phrase.is_empty() && lower_message.contains(&phrase)
+        });
+    }
+    default_phrases
+        .iter()
+        .any(|phrase| lower_message.contains(phrase))
+}
+
+pub(crate) fn rawr_load_agent_packet_prompt(config: &Config) -> String {
+    let prompt = rawr_prompts::read_prompt_path_or_default(
+        &config.codex_home,
+        rawr_auto_compact_prompt_path(config),
+        rawr_prompts::RawrPromptKind::AutoCompact,
+    );
     let prompt = strip_yaml_frontmatter(&prompt).trim();
     if prompt.is_empty() {
         return default_rawr_agent_packet_prompt();
@@ -507,14 +589,28 @@ pub(crate) fn rawr_load_agent_packet_prompt(codex_home: &Path) -> String {
     prompt.to_string()
 }
 
-pub(crate) fn rawr_load_scratch_write_prompt(codex_home: &Path) -> String {
-    let prompt = rawr_prompts::read_prompt_or_default(
-        codex_home,
+pub(crate) fn rawr_load_scratch_write_prompt(config: &Config) -> String {
+    let prompt = rawr_prompts::read_prompt_path_or_default(
+        &config.codex_home,
+        rawr_scratch_write_prompt_path(config),
         rawr_prompts::RawrPromptKind::ScratchWrite,
     );
     let prompt = strip_yaml_frontmatter(&prompt).trim();
     if prompt.is_empty() {
         return default_rawr_scratch_write_prompt();
+    }
+    prompt.to_string()
+}
+
+pub(crate) fn rawr_load_watcher_packet_prompt(config: &Config) -> String {
+    let prompt = rawr_prompts::read_prompt_path_or_default(
+        &config.codex_home,
+        rawr_watcher_packet_prompt_path(config),
+        rawr_prompts::RawrPromptKind::WatcherPacket,
+    );
+    let prompt = strip_yaml_frontmatter(&prompt).trim();
+    if prompt.is_empty() {
+        return default_rawr_watcher_packet_prompt();
     }
     prompt.to_string()
 }
@@ -553,6 +649,7 @@ pub(crate) fn rawr_build_agent_continuation_packet_prompt(
 }
 
 pub(crate) fn rawr_build_watcher_post_compact_packet(
+    prompt_template: &str,
     trigger_percent_remaining: i64,
     signals: &RawrAutoCompactionSignals,
     last_agent_message: Option<&str>,
@@ -565,32 +662,41 @@ pub(crate) fn rawr_build_watcher_post_compact_packet(
         tail
     };
 
-    [
-        "**Continuation context packet (post-compaction injection)**".to_string(),
-        String::new(),
-        "Overarching goal".to_string(),
-        "- Continue the work you were doing immediately before compaction.".to_string(),
-        String::new(),
-        "Why compaction happened".to_string(),
-        format!(
-            "- Triggered by rawr auto-compaction watcher at {trigger_percent_remaining}% context remaining."
-        ),
-        format!(
-            "- Natural boundary signals: commit={}, plan_checkpoint={}, plan_update={}, pr_checkpoint={}, agent_done={}",
-            signals.saw_commit,
-            signals.saw_plan_checkpoint,
-            signals.saw_plan_update,
-            signals.saw_pr_checkpoint,
-            signals.saw_agent_done,
-        ),
-        String::new(),
-        "Last agent output (memory trigger)".to_string(),
-        format!("- {tail}"),
-        String::new(),
-        "Directive".to_string(),
-        "- Continue with the remaining work now; do not restart from scratch.".to_string(),
-    ]
-    .join("\n")
+    let boundary_signals = format!(
+        "commit={}, plan_checkpoint={}, plan_update={}, pr_checkpoint={}, agent_done={}, topic_shift={}, concluding_thought={}",
+        signals.saw_commit,
+        signals.saw_plan_checkpoint,
+        signals.saw_plan_update,
+        signals.saw_pr_checkpoint,
+        signals.saw_agent_done,
+        signals.saw_topic_shift,
+        signals.saw_concluding_thought,
+    );
+    let template = if prompt_template.trim().is_empty() {
+        default_rawr_watcher_packet_prompt()
+    } else {
+        prompt_template.trim().to_string()
+    };
+
+    rawr_prompts::expand_placeholders(
+        &template,
+        &[
+            (
+                "triggerPercentRemaining",
+                trigger_percent_remaining.to_string(),
+            ),
+            (
+                "trigger_percent_remaining",
+                trigger_percent_remaining.to_string(),
+            ),
+            ("boundarySignals", boundary_signals.clone()),
+            ("boundary_signals", boundary_signals),
+            ("lastAgentMessage", tail.clone()),
+            ("last_agent_message", tail),
+        ],
+    )
+    .trim()
+    .to_string()
 }
 
 pub(crate) fn rawr_should_schedule_scratch_write(
@@ -620,11 +726,18 @@ pub(crate) fn rawr_build_post_compact_handoff_message(
 }
 
 pub(crate) fn rawr_scratch_file_rel_path(
+    config: &Config,
     session_source: &SessionSource,
     thread_id: &ThreadId,
 ) -> String {
     let agent_name = rawr_scratch_agent_name(session_source, thread_id);
-    format!(".scratch/agent-{agent_name}.scratch.md")
+    let template = config
+        .rawr_auto_compaction
+        .as_ref()
+        .and_then(|rawr| rawr.settings())
+        .and_then(|settings| settings.scratch_file_template.as_deref())
+        .unwrap_or(DEFAULT_SCRATCH_FILE_TEMPLATE);
+    rawr_expand_scratch_file_template(template, &agent_name, thread_id)
 }
 
 fn rawr_scratch_agent_name(session_source: &SessionSource, thread_id: &ThreadId) -> String {
@@ -660,6 +773,37 @@ fn rawr_sanitize_agent_name(name: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+fn rawr_expand_scratch_file_template(
+    template: &str,
+    agent_name: &str,
+    thread_id: &ThreadId,
+) -> String {
+    let expanded = rawr_prompts::expand_placeholders(
+        template,
+        &[
+            ("agentName", agent_name.to_string()),
+            ("agent_name", agent_name.to_string()),
+            ("threadId", thread_id.to_string()),
+        ],
+    );
+    if rawr_is_safe_relative_path(&expanded) {
+        return expanded;
+    }
+
+    rawr_prompts::expand_placeholders(
+        DEFAULT_SCRATCH_FILE_TEMPLATE,
+        &[("agentName", agent_name.to_string())],
+    )
+}
+
+fn rawr_is_safe_relative_path(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 fn strip_yaml_frontmatter(contents: &str) -> &str {
@@ -721,6 +865,26 @@ fn default_rawr_agent_packet_prompt() -> String {
     .join("\n")
 }
 
+fn default_rawr_watcher_packet_prompt() -> String {
+    [
+        "**Continuation context packet (post-compaction injection)**",
+        "",
+        "Overarching goal",
+        "- Continue the work you were doing immediately before compaction.",
+        "",
+        "Why compaction happened",
+        "- Triggered by rawr auto-compaction watcher at {triggerPercentRemaining}% context remaining.",
+        "- Natural boundary signals: {boundarySignals}",
+        "",
+        "Last agent output (memory trigger)",
+        "- {lastAgentMessage}",
+        "",
+        "Directive",
+        "- Continue with the remaining work now; do not restart from scratch.",
+    ]
+    .join("\n")
+}
+
 fn default_rawr_scratch_write_prompt() -> String {
     [
         "[rawr] Before auto-compaction, write a verbatim scratchpad of the work you just completed so it survives compaction.",
@@ -728,7 +892,7 @@ fn default_rawr_scratch_write_prompt() -> String {
         "Target file: `{scratch_file}`",
         "",
         "Requirements:",
-        "- Create the `.context/` directory if it doesn't exist.",
+        "- Create the `.scratch/` directory if it doesn't exist.",
         "- Append a new section; do not delete prior scratch content.",
         "- Prefer verbatim notes/drafts over summaries.",
         "- Include links/paths to any important files you edited or created.",
@@ -740,6 +904,7 @@ fn default_rawr_scratch_write_prompt() -> String {
 mod tests {
     use super::*;
     use codex_config::types::RawrAutoCompactionPolicyToml;
+    use codex_config::types::RawrAutoCompactionSemanticSignalsToml;
     use codex_config::types::RawrAutoCompactionSettingsToml;
     use codex_config::types::RawrAutoCompactionToml;
     use codex_protocol::plan_tool::PlanItemArg;
@@ -806,6 +971,7 @@ mod tests {
 
         let signals = RawrAutoCompactionSignals::default();
         let packet = rawr_build_watcher_post_compact_packet(
+            default_rawr_watcher_packet_prompt().as_str(),
             42,
             &signals,
             Some("alpha café beta"),
@@ -827,8 +993,9 @@ mod tests {
         assert!(prompt.contains("scratch=.scratch/agent-codex.scratch.md"));
     }
 
-    #[test]
-    fn scratch_handoff_uses_agent_specific_path_when_enabled() {
+    #[tokio::test]
+    async fn scratch_handoff_uses_agent_specific_path_when_enabled() {
+        let config = crate::config::test_config().await;
         let signals = RawrAutoCompactionSignals {
             saw_commit: true,
             ..Default::default()
@@ -842,7 +1009,7 @@ mod tests {
         ));
 
         let thread_id = ThreadId::new();
-        let scratch_file = rawr_scratch_file_rel_path(&SessionSource::Cli, &thread_id);
+        let scratch_file = rawr_scratch_file_rel_path(&config, &SessionSource::Cli, &thread_id);
         let packet = rawr_build_agent_continuation_packet_prompt(
             "continue using {scratchFile}",
             "write notes to {scratch_file}",
@@ -856,6 +1023,31 @@ mod tests {
         assert!(handoff.starts_with(&format!("Scratchpad: `{scratch_file}`")));
         assert!(handoff.contains(&format!("write notes to {scratch_file}")));
         assert!(handoff.contains(&format!("continue using {scratch_file}")));
+    }
+
+    #[tokio::test]
+    async fn scratch_file_template_is_configurable_and_stays_relative() {
+        let mut config = crate::config::test_config().await;
+        let thread_id = ThreadId::new();
+        config.rawr_auto_compaction = Some(RawrAutoCompactionToml::Config(Box::new(
+            RawrAutoCompactionSettingsToml {
+                scratch_file_template: Some(".rawr/{agent_name}/{threadId}.md".to_string()),
+                ..Default::default()
+            },
+        )));
+
+        let configured = rawr_scratch_file_rel_path(&config, &SessionSource::Cli, &thread_id);
+        assert!(configured.starts_with(".rawr/"));
+        assert!(configured.ends_with(&format!("/{thread_id}.md")));
+
+        config.rawr_auto_compaction = Some(RawrAutoCompactionToml::Config(Box::new(
+            RawrAutoCompactionSettingsToml {
+                scratch_file_template: Some("../outside.md".to_string()),
+                ..Default::default()
+            },
+        )));
+        let fallback = rawr_scratch_file_rel_path(&config, &SessionSource::Cli, &thread_id);
+        assert!(fallback.starts_with(".scratch/agent-"));
     }
 
     #[test]
@@ -979,11 +1171,13 @@ mod tests {
         assert!(!push_signals.saw_pr_checkpoint);
     }
 
-    #[test]
-    fn completion_message_sets_semantic_signals() {
+    #[tokio::test]
+    async fn completion_message_sets_semantic_signals() {
+        let config = crate::config::test_config().await;
         let mut signals = RawrAutoCompactionSignals::default();
         rawr_note_completion_message(
             &mut signals,
+            &config,
             Some(
                 "Completed the implementation. Next, let's update the docs. Final thoughts: keep the hook in tasks.",
             ),
@@ -992,5 +1186,42 @@ mod tests {
         assert!(signals.saw_agent_done);
         assert!(signals.saw_topic_shift);
         assert!(signals.saw_concluding_thought);
+    }
+
+    #[tokio::test]
+    async fn completion_message_uses_configured_semantic_signal_phrases() {
+        let mut config = crate::config::test_config().await;
+        config.rawr_auto_compaction = Some(RawrAutoCompactionToml::Config(Box::new(
+            RawrAutoCompactionSettingsToml {
+                semantic_signals: Some(RawrAutoCompactionSemanticSignalsToml {
+                    agent_done_phrases: Some(vec!["wrapped the slice".to_string()]),
+                    agent_done_negative_phrases: Some(vec!["still wrapping".to_string()]),
+                    topic_shift_phrases: Some(vec!["handoff next".to_string()]),
+                    concluding_thought_phrases: Some(vec!["carry forward".to_string()]),
+                }),
+                ..Default::default()
+            },
+        )));
+        let mut signals = RawrAutoCompactionSignals::default();
+        rawr_note_completion_message(
+            &mut signals,
+            &config,
+            Some("Wrapped the slice. Handoff next. Carry forward the branch state."),
+        );
+
+        assert!(signals.saw_agent_done);
+        assert!(signals.saw_topic_shift);
+        assert!(signals.saw_concluding_thought);
+
+        let mut negative_signals = RawrAutoCompactionSignals::default();
+        rawr_note_completion_message(
+            &mut negative_signals,
+            &config,
+            Some("Still wrapping the slice. Handoff next. Carry forward the branch state."),
+        );
+
+        assert!(!negative_signals.saw_agent_done);
+        assert!(negative_signals.saw_topic_shift);
+        assert!(negative_signals.saw_concluding_thought);
     }
 }

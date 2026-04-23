@@ -10,6 +10,7 @@ pub const RAWR_AUTO_COMPACT_PROMPT_FILE: &str = "auto-compact.md";
 pub const RAWR_SCRATCH_WRITE_PROMPT_FILE: &str = "scratch-write.md";
 pub const RAWR_JUDGMENT_PROMPT_FILE: &str = "judgment.md";
 pub const RAWR_JUDGMENT_CONTEXT_PROMPT_FILE: &str = "judgment-context.md";
+pub const RAWR_WATCHER_PACKET_PROMPT_FILE: &str = "watcher-packet.md";
 
 const DEFAULT_AUTO_COMPACT_PROMPT: &str = "\
 [rawr] Agent: before we compact this thread, you must self-reflect and write a continuation context packet for yourself.
@@ -115,11 +116,29 @@ Total usage tokens: {totalUsageTokens}
 Model context window: {modelContextWindow}
 ";
 
+const DEFAULT_WATCHER_PACKET_PROMPT: &str = "\
+**Continuation context packet (post-compaction injection)**
+
+Overarching goal
+- Continue the work you were doing immediately before compaction.
+
+Why compaction happened
+- Triggered by rawr auto-compaction watcher at {triggerPercentRemaining}% context remaining.
+- Natural boundary signals: {boundarySignals}
+
+Last agent output (memory trigger)
+- {lastAgentMessage}
+
+Directive
+- Continue with the remaining work now; do not restart from scratch.
+";
+
 #[derive(Debug, Clone, Copy)]
 pub enum RawrPromptKind {
     AutoCompact,
     ScratchWrite,
     JudgmentContext,
+    WatcherPacket,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +146,7 @@ pub struct RawrPromptPaths {
     pub auto_compact: PathBuf,
     pub scratch_write: PathBuf,
     pub judgment_context: PathBuf,
+    pub watcher_packet: PathBuf,
 }
 
 pub fn rawr_prompt_dir(codex_home: &Path) -> PathBuf {
@@ -141,20 +161,27 @@ pub fn ensure_rawr_prompt_files(codex_home: &Path) -> io::Result<RawrPromptPaths
     let scratch_write = dir.join(RAWR_SCRATCH_WRITE_PROMPT_FILE);
     let judgment = dir.join(RAWR_JUDGMENT_PROMPT_FILE);
     let judgment_context = dir.join(RAWR_JUDGMENT_CONTEXT_PROMPT_FILE);
+    let watcher_packet = dir.join(RAWR_WATCHER_PACKET_PROMPT_FILE);
 
     write_default_if_missing(&auto_compact, DEFAULT_AUTO_COMPACT_PROMPT)?;
     write_default_if_missing(&scratch_write, DEFAULT_SCRATCH_WRITE_PROMPT)?;
     write_default_if_missing(&judgment, DEFAULT_JUDGMENT_PROMPT)?;
     write_default_if_missing(&judgment_context, DEFAULT_JUDGMENT_CONTEXT_PROMPT)?;
+    write_default_if_missing(&watcher_packet, DEFAULT_WATCHER_PACKET_PROMPT)?;
 
     Ok(RawrPromptPaths {
         auto_compact,
         scratch_write,
         judgment_context,
+        watcher_packet,
     })
 }
 
-pub fn read_prompt_or_default(codex_home: &Path, kind: RawrPromptKind) -> String {
+pub fn read_prompt_path_or_default(
+    codex_home: &Path,
+    path_override: Option<&str>,
+    kind: RawrPromptKind,
+) -> String {
     let paths = match ensure_rawr_prompt_files(codex_home) {
         Ok(paths) => paths,
         Err(err) => {
@@ -163,11 +190,14 @@ pub fn read_prompt_or_default(codex_home: &Path, kind: RawrPromptKind) -> String
         }
     };
 
-    let path = match kind {
-        RawrPromptKind::AutoCompact => paths.auto_compact,
-        RawrPromptKind::ScratchWrite => paths.scratch_write,
-        RawrPromptKind::JudgmentContext => paths.judgment_context,
-    };
+    let path = path_override
+        .map(|raw| resolve_prompt_path(codex_home, raw))
+        .unwrap_or_else(|| match kind {
+            RawrPromptKind::AutoCompact => paths.auto_compact,
+            RawrPromptKind::ScratchWrite => paths.scratch_write,
+            RawrPromptKind::JudgmentContext => paths.judgment_context,
+            RawrPromptKind::WatcherPacket => paths.watcher_packet,
+        });
 
     match fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -191,7 +221,16 @@ fn default_prompt(kind: RawrPromptKind) -> &'static str {
         RawrPromptKind::AutoCompact => DEFAULT_AUTO_COMPACT_PROMPT,
         RawrPromptKind::ScratchWrite => DEFAULT_SCRATCH_WRITE_PROMPT,
         RawrPromptKind::JudgmentContext => DEFAULT_JUDGMENT_CONTEXT_PROMPT,
+        RawrPromptKind::WatcherPacket => DEFAULT_WATCHER_PACKET_PROMPT,
     }
+}
+
+fn resolve_prompt_path(codex_home: &Path, raw: &str) -> PathBuf {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    rawr_prompt_dir(codex_home).join(path)
 }
 
 fn write_default_if_missing(path: &Path, contents: &str) -> io::Result<()> {
@@ -213,6 +252,7 @@ mod tests {
         let paths = ensure_rawr_prompt_files(dir.path()).expect("create prompt files");
         assert!(paths.auto_compact.exists());
         assert!(paths.scratch_write.exists());
+        assert!(paths.watcher_packet.exists());
     }
 
     #[test]
@@ -242,5 +282,21 @@ mod tests {
             ],
         );
         assert_eq!(output, "tier=ready percent=42");
+    }
+
+    #[test]
+    fn prompt_path_override_reads_relative_to_prompt_dir() {
+        let dir = tempdir().expect("create temp dir");
+        let prompt_dir = rawr_prompt_dir(dir.path());
+        fs::create_dir_all(&prompt_dir).expect("create prompt dir");
+        fs::write(prompt_dir.join("custom.md"), "custom").expect("write prompt");
+
+        let output = read_prompt_path_or_default(
+            dir.path(),
+            Some("custom.md"),
+            RawrPromptKind::WatcherPacket,
+        );
+
+        assert_eq!(output, "custom");
     }
 }

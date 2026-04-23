@@ -174,17 +174,21 @@ Both TUI watcher and core mid-turn use the same precedence:
 
 This lets you control “fires too often” primarily by adjusting config rather than code.
 
-### Important: `mode` only affects the TUI watcher
+### Important: `mode` affects turn-complete watcher orchestration
 
-`rawr_auto_compaction.mode` (`tag`/`suggest`/`auto`) is a **TUI watcher** behavior knob:
+`rawr_auto_compaction.mode` (`tag`/`suggest`/`auto`) is a watcher-style behavior knob for
+turn-complete orchestration:
 
 - `tag`: print “would compact” informational message
 - `suggest`: print “recommend compact” informational message
 - `auto`: actually run the watcher orchestration (packet/scratch/compact/handoff)
 
-Core mid-turn RAWR compaction **does not consult `mode`**; it is gated by the feature flag and the
-mid-turn decision policy (tiers/boundaries/judgment). This is intentional: mid-turn exists to prevent
-context exhaustion while the agent still needs follow-up inside the sampling loop.
+Core emergency/mid-turn RAWR compaction should not consult `mode`; it is gated by the feature flag
+and the mid-turn decision policy (tiers/boundaries/judgment). This is intentional: mid-turn exists
+to prevent context exhaustion while the agent still needs follow-up inside the sampling loop.
+
+The current session-lifecycle app-server parity hook runs after `TurnComplete`, so it follows the
+turn-complete watcher semantics above.
 
 ---
 

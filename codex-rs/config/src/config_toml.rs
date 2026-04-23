@@ -20,6 +20,7 @@ use crate::types::Notice;
 use crate::types::OAuthCredentialsStoreMode;
 use crate::types::OtelConfigToml;
 use crate::types::PluginConfig;
+use crate::types::RawrAutoCompactionToml;
 use crate::types::SandboxWorkspaceWrite;
 use crate::types::ShellEnvironmentPolicyToml;
 use crate::types::SkillsConfig;
@@ -353,6 +354,9 @@ pub struct ConfigToml {
     // Injects known feature keys into the schema and forbids unknown keys.
     #[schemars(schema_with = "crate::schema::features_schema")]
     pub features: Option<FeaturesToml>,
+
+    /// RAWR fork automatic compaction policy.
+    pub rawr_auto_compaction: Option<RawrAutoCompactionToml>,
 
     /// Suppress warnings about unstable (under development) features.
     pub suppress_unstable_features_warning: Option<bool>,
@@ -870,5 +874,58 @@ pub fn validate_oss_provider(provider: &str) -> std::io::Result<()> {
                 "Invalid OSS provider '{provider}'. Must be one of: {LMSTUDIO_OSS_PROVIDER_ID}, {OLLAMA_OSS_PROVIDER_ID}"
             ),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::RawrAutoCompactionMode;
+    use crate::types::RawrAutoCompactionPacketAuthor;
+    use crate::types::RawrAutoCompactionToml;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn rawr_auto_compaction_accepts_legacy_bool() {
+        let config: ConfigToml =
+            toml::from_str("rawr_auto_compaction = true\n").expect("config should parse");
+        assert_eq!(
+            config.rawr_auto_compaction,
+            Some(RawrAutoCompactionToml::Enabled(true))
+        );
+    }
+
+    #[test]
+    fn rawr_auto_compaction_accepts_structured_policy() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+[rawr_auto_compaction]
+mode = "auto"
+packet_author = "agent"
+scratch_write_enabled = true
+packet_max_tail_chars = 1200
+
+[rawr_auto_compaction.policy.early]
+percent_remaining_lt = 90
+requires_any_boundary = ["turn_complete"]
+"#,
+        )
+        .expect("config should parse");
+        let Some(RawrAutoCompactionToml::Config(rawr)) = config.rawr_auto_compaction else {
+            panic!("expected structured rawr config");
+        };
+        assert_eq!(rawr.mode, Some(RawrAutoCompactionMode::Auto));
+        assert_eq!(
+            rawr.packet_author,
+            Some(RawrAutoCompactionPacketAuthor::Agent)
+        );
+        assert_eq!(rawr.scratch_write_enabled, Some(true));
+        assert_eq!(rawr.packet_max_tail_chars, Some(1200));
+        let early = rawr
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.early.as_ref())
+            .expect("early policy");
+        assert_eq!(early.percent_remaining_lt, Some(90));
     }
 }

@@ -3186,6 +3186,18 @@ impl Session {
         idle_pending_input.extend(items);
     }
 
+    /// Queue response items ahead of any pending next-turn input.
+    pub(crate) async fn prepend_response_items_for_next_turn(&self, items: Vec<ResponseInputItem>) {
+        if items.is_empty() {
+            return;
+        }
+
+        let mut idle_pending_input = self.idle_pending_input.lock().await;
+        let mut next_items = items;
+        next_items.extend(std::mem::take(&mut *idle_pending_input));
+        *idle_pending_input = next_items;
+    }
+
     pub(crate) async fn take_queued_response_items_for_next_turn(&self) -> Vec<ResponseInputItem> {
         std::mem::take(&mut *self.idle_pending_input.lock().await)
     }

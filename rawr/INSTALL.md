@@ -126,12 +126,14 @@ percent_remaining_lt = 15
 ```
 
 ## Packet prompt + defaults (auditable/editable)
-The prompt lives in-repo at `rawr/prompts/rawr-auto-compact.md` and is embedded into the binary at build time.
+At runtime, editable prompt files live under `CODEX_HOME/auto-compact/`:
 
-- YAML frontmatter: default thresholds/boundaries (config overrides win).
-- Markdown body: continuation packet prompt when `packet_author = "agent"`.
+- `auto-compact.md`: continuation packet prompt when `packet_author = "agent"`.
+- `scratch-write.md`: scratch-write prompt when `scratch_write_enabled = true`.
+
+If these files are missing, Codex creates them with built-in defaults. Config-driven thresholds and boundaries still live in `config.toml`; config overrides win.
+
 - Compaction decision: code-driven tier policy + boundary gating; plan-based boundaries additionally require a semantic break (agent-done/topic-shift/concluding) in Early/Ready tiers so we don’t compact mid-thought just because the plan tool ran.
-- Scratch write prompt: `rawr/prompts/rawr-scratch-write.md` (enabled by `scratch_write_enabled = true`).
 
 ## Using with Happy Coder
 Happy Coder’s CLI supports `happy codex` (Codex mode). If your `PATH` resolves `codex` to this fork (e.g. via the symlink above), `happy codex` will launch the fork.

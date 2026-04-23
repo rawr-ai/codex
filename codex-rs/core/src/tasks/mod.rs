@@ -15,6 +15,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
+use tracing::debug;
 use tracing::info_span;
 use tracing::trace;
 use tracing::warn;
@@ -50,6 +51,10 @@ use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 
+use codex_analytics::CompactionPhase;
+use codex_analytics::CompactionReason;
+use codex_config::types::RawrAutoCompactionMode;
+use codex_config::types::RawrAutoCompactionPacketAuthor;
 use codex_features::Feature;
 use codex_protocol::models::ContentItem;
 pub(crate) use compact::CompactTask;
@@ -378,8 +383,16 @@ impl Session {
                 }
                 if !task_cancellation_token.is_cancelled() {
                     // Emit completion uniformly from spawn site so all tasks share the same lifecycle.
-                    sess.on_task_finished(Arc::clone(&ctx_for_finish), last_agent_message)
+                    let finished_task = sess
+                        .on_task_finished(
+                            Arc::clone(&ctx_for_finish),
+                            last_agent_message,
+                            task_kind,
+                        )
                         .await;
+                    done_clone.notify_waiters();
+                    drop(finished_task);
+                    return;
                 }
                 done_clone.notify_waiters();
             }
@@ -495,27 +508,23 @@ impl Session {
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         last_agent_message: Option<String>,
-    ) {
+        task_kind: TaskKind,
+    ) -> Option<RunningTask> {
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
 
+        let last_agent_message_for_rawr = last_agent_message.clone();
         let mut pending_input = Vec::<ResponseInputItem>::new();
-        let mut should_clear_active_turn = false;
         let mut token_usage_at_turn_start = None;
         let mut turn_had_memory_citation = false;
         let mut turn_tool_calls = 0_u64;
         let turn_state = {
-            let mut active = self.active_turn.lock().await;
-            if let Some(at) = active.as_mut()
-                && at.remove_task(&turn_context.sub_id)
+            let active = self.active_turn.lock().await;
+            if let Some(at) = active.as_ref()
+                && at.tasks.contains_key(&turn_context.sub_id)
             {
-                should_clear_active_turn = true;
-                let turn_state = Arc::clone(&at.turn_state);
-                if should_clear_active_turn {
-                    *active = None;
-                }
-                Some(turn_state)
+                Some(Arc::clone(&at.turn_state))
             } else {
                 None
             }
@@ -655,6 +664,33 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
+        let (finished_task, should_clear_active_turn) = {
+            let mut active = self.active_turn.lock().await;
+            if let Some(at) = active.as_mut()
+                && at.tasks.contains_key(&turn_context.sub_id)
+            {
+                let (finished_task, should_clear) = at.detach_task(&turn_context.sub_id);
+                if should_clear {
+                    *active = None;
+                }
+                (finished_task, should_clear)
+            } else {
+                (None, false)
+            }
+        };
+
+        if task_kind == TaskKind::Regular {
+            debug!(
+                turn_id = %turn_context.sub_id,
+                "checking rawr post-turn auto-compaction"
+            );
+            self.maybe_run_rawr_post_turn_auto_compaction(
+                Arc::clone(&turn_context),
+                last_agent_message_for_rawr,
+            )
+            .await;
+        }
+
         if should_clear_active_turn {
             let session = Arc::clone(self);
             let _scheduler = tokio::task::spawn_blocking(move || {
@@ -663,6 +699,200 @@ impl Session {
                 });
             });
         }
+
+        finished_task
+    }
+
+    async fn maybe_run_rawr_post_turn_auto_compaction(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        last_agent_message: Option<String>,
+    ) {
+        if !turn_context.features.enabled(Feature::RawrAutoCompaction) {
+            debug!(
+                turn_id = %turn_context.sub_id,
+                "rawr auto-compaction skipped: feature disabled"
+            );
+            return;
+        }
+
+        let Some(model_context_window) = turn_context.model_context_window() else {
+            debug!(
+                turn_id = %turn_context.sub_id,
+                "rawr auto-compaction skipped: model context window missing"
+            );
+            return;
+        };
+        if model_context_window <= 0 {
+            debug!(
+                turn_id = %turn_context.sub_id,
+                model_context_window,
+                "rawr auto-compaction skipped: invalid model context window"
+            );
+            return;
+        }
+
+        let total_usage_tokens = self.get_total_token_usage().await;
+        let remaining = model_context_window.saturating_sub(total_usage_tokens);
+        let percent_remaining =
+            (remaining.saturating_mul(100) / model_context_window).clamp(0, 100);
+        let signals = crate::rawr_auto_compaction::RawrAutoCompactionSignals::default();
+        if !crate::rawr_auto_compaction::rawr_should_compact_at_turn_complete(
+            turn_context.config.as_ref(),
+            percent_remaining,
+            &signals,
+        ) {
+            debug!(
+                turn_id = %turn_context.sub_id,
+                total_usage_tokens,
+                model_context_window,
+                percent_remaining,
+                "rawr auto-compaction skipped: policy not eligible"
+            );
+            return;
+        }
+        debug!(
+            turn_id = %turn_context.sub_id,
+            total_usage_tokens,
+            model_context_window,
+            percent_remaining,
+            "rawr auto-compaction eligible"
+        );
+        let tier = crate::rawr_auto_compaction::rawr_compaction_tier(
+            turn_context.config.as_ref(),
+            percent_remaining,
+        );
+
+        match crate::rawr_auto_compaction::rawr_auto_compaction_mode(turn_context.config.as_ref()) {
+            RawrAutoCompactionMode::Tag | RawrAutoCompactionMode::Suggest => {
+                self.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::Warning(WarningEvent {
+                        message: format!(
+                            "rawr auto-compaction is eligible at {percent_remaining}% context remaining."
+                        ),
+                    }),
+                )
+                .await;
+                return;
+            }
+            RawrAutoCompactionMode::Auto => {}
+        }
+
+        let compaction_context = if let Some(model) =
+            crate::rawr_auto_compaction::rawr_compaction_model(turn_context.config.as_ref())
+        {
+            Arc::new(
+                turn_context
+                    .with_model(model, self.services.models_manager.as_ref())
+                    .await,
+            )
+        } else {
+            Arc::clone(&turn_context)
+        };
+
+        let compaction_result =
+            if crate::compact::should_use_remote_compact_task(compaction_context.provider.info()) {
+                crate::compact_remote::run_inline_remote_auto_compact_task(
+                    Arc::clone(self),
+                    Arc::clone(&compaction_context),
+                    crate::compact::InitialContextInjection::BeforeLastUserMessage,
+                    CompactionReason::ContextLimit,
+                    CompactionPhase::MidTurn,
+                )
+                .await
+            } else {
+                crate::compact::run_inline_auto_compact_task(
+                    Arc::clone(self),
+                    Arc::clone(&compaction_context),
+                    crate::compact::InitialContextInjection::BeforeLastUserMessage,
+                    CompactionReason::ContextLimit,
+                    CompactionPhase::MidTurn,
+                )
+                .await
+            };
+
+        if let Err(err) = compaction_result {
+            self.send_event(
+                turn_context.as_ref(),
+                EventMsg::Warning(WarningEvent {
+                    message: format!("rawr auto-compaction failed: {err}"),
+                }),
+            )
+            .await;
+            return;
+        }
+
+        let do_scratch = crate::rawr_auto_compaction::rawr_should_schedule_scratch_write(
+            crate::rawr_auto_compaction::rawr_scratch_write_enabled(turn_context.config.as_ref()),
+            matches!(
+                tier,
+                Some(crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency)
+            ),
+            &signals,
+        );
+        let scratch_file = do_scratch.then(|| {
+            crate::rawr_auto_compaction::rawr_scratch_file_rel_path(
+                &turn_context.session_source,
+                &self.conversation_id,
+            )
+        });
+        let packet = match crate::rawr_auto_compaction::rawr_auto_compaction_packet_author(
+            turn_context.config.as_ref(),
+        ) {
+            RawrAutoCompactionPacketAuthor::Watcher => {
+                let watcher_packet =
+                    crate::rawr_auto_compaction::rawr_build_watcher_post_compact_packet(
+                        percent_remaining,
+                        &signals,
+                        last_agent_message.as_deref(),
+                        crate::rawr_auto_compaction::rawr_packet_max_tail_chars(
+                            turn_context.config.as_ref(),
+                        ),
+                    );
+                if do_scratch {
+                    let scratch_prompt =
+                        crate::rawr_auto_compaction::rawr_load_scratch_write_prompt(
+                            &turn_context.config.codex_home,
+                        );
+                    crate::rawr_auto_compaction::rawr_build_agent_continuation_packet_prompt(
+                        watcher_packet.as_str(),
+                        scratch_prompt.as_str(),
+                        true,
+                        scratch_file.as_deref(),
+                        Some(self.conversation_id),
+                    )
+                } else {
+                    watcher_packet
+                }
+            }
+            RawrAutoCompactionPacketAuthor::Agent => {
+                let packet_prompt = crate::rawr_auto_compaction::rawr_load_agent_packet_prompt(
+                    &turn_context.config.codex_home,
+                );
+                let scratch_prompt = crate::rawr_auto_compaction::rawr_load_scratch_write_prompt(
+                    &turn_context.config.codex_home,
+                );
+                crate::rawr_auto_compaction::rawr_build_agent_continuation_packet_prompt(
+                    packet_prompt.as_str(),
+                    scratch_prompt.as_str(),
+                    do_scratch,
+                    scratch_file.as_deref(),
+                    Some(self.conversation_id),
+                )
+            }
+        };
+        let handoff = crate::rawr_auto_compaction::rawr_build_post_compact_handoff_message(
+            packet,
+            scratch_file.as_deref(),
+        );
+        self.prepend_response_items_for_next_turn(vec![ResponseInputItem::from(vec![
+            UserInput::Text {
+                text: handoff,
+                text_elements: Vec::new(),
+            },
+        ])])
+        .await;
     }
 
     async fn take_active_turn(&self) -> Option<ActiveTurn> {

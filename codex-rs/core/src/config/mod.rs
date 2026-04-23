@@ -43,6 +43,7 @@ use codex_config::types::OAuthCredentialsStoreMode;
 use codex_config::types::OtelConfig;
 use codex_config::types::OtelConfigToml;
 use codex_config::types::OtelExporterKind;
+use codex_config::types::RawrAutoCompactionToml;
 use codex_config::types::ShellEnvironmentPolicy;
 use codex_config::types::ToolSuggestConfig;
 use codex_config::types::ToolSuggestDiscoverable;
@@ -584,6 +585,9 @@ pub struct Config {
 
     /// Centralized feature flags; source of truth for feature gating.
     pub features: ManagedFeatures,
+
+    /// RAWR fork automatic compaction policy.
+    pub rawr_auto_compaction: Option<RawrAutoCompactionToml>,
 
     /// When `true`, suppress warnings about unstable (under development) features.
     pub suppress_unstable_features_warning: bool,
@@ -1658,7 +1662,7 @@ impl Config {
             web_search_request: override_tools_web_search_request,
         };
 
-        let configured_features = Features::from_sources(
+        let mut configured_features = Features::from_sources(
             FeatureConfigSource {
                 features: cfg.features.as_ref(),
                 include_apply_patch_tool: None,
@@ -1675,6 +1679,13 @@ impl Config {
             },
             feature_overrides,
         );
+        if cfg
+            .rawr_auto_compaction
+            .as_ref()
+            .is_some_and(RawrAutoCompactionToml::enabled)
+        {
+            configured_features.enable(Feature::RawrAutoCompaction);
+        }
         let features = ManagedFeatures::from_configured_with_warnings(
             configured_features,
             feature_requirements,
@@ -2445,6 +2456,7 @@ impl Config {
             ghost_snapshot,
             multi_agent_v2,
             features,
+            rawr_auto_compaction: cfg.rawr_auto_compaction,
             suppress_unstable_features_warning: cfg
                 .suppress_unstable_features_warning
                 .unwrap_or(false),

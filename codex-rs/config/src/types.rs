@@ -179,6 +179,117 @@ pub struct ToolSuggestConfig {
     pub discoverables: Vec<ToolSuggestDiscoverable>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionMode {
+    Tag,
+    Suggest,
+    Auto,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionPacketAuthor {
+    Watcher,
+    Agent,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionBoundary {
+    Commit,
+    PlanCheckpoint,
+    PlanUpdate,
+    PrCheckpoint,
+    AgentDone,
+    TopicShift,
+    ConcludingThought,
+    TurnComplete,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionPolicyToml {
+    pub early: Option<RawrAutoCompactionPolicyTierToml>,
+    pub ready: Option<RawrAutoCompactionPolicyTierToml>,
+    pub asap: Option<RawrAutoCompactionPolicyTierToml>,
+    pub emergency: Option<RawrAutoCompactionPolicyTierToml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionPolicyTierToml {
+    /// Trigger threshold for this tier. When `percent_remaining < percent_remaining_lt`,
+    /// this tier is eligible.
+    pub percent_remaining_lt: Option<i64>,
+    /// Boundaries that may trigger compaction for this tier. If unset, defaults are used.
+    pub requires_any_boundary: Option<Vec<RawrAutoCompactionBoundary>>,
+    /// When enabled, plan boundaries only count when there is a semantic break unless
+    /// a non-plan boundary is also present.
+    pub plan_boundaries_require_semantic_break: Option<bool>,
+    /// Optional prompt file used to make a judgment call before compaction triggers.
+    pub decision_prompt_path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrRepoObservationToml {
+    /// When enabled, Codex attempts to collect lightweight Graphite context for RAWR state.
+    pub graphite_enabled: Option<bool>,
+    /// Max chars of Graphite output to persist per observation.
+    pub graphite_max_chars: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionSettingsToml {
+    pub enabled: Option<bool>,
+    pub mode: Option<RawrAutoCompactionMode>,
+    pub packet_author: Option<RawrAutoCompactionPacketAuthor>,
+    /// When enabled, the watcher may ask the in-session agent to write a scratchpad file
+    /// before compaction so verbatim research notes survive history rewrite.
+    pub scratch_write_enabled: Option<bool>,
+    /// Max chars of tail context included in watcher-side packet prompts.
+    pub packet_max_tail_chars: Option<usize>,
+    /// Optional model override used for watcher-triggered compactions.
+    pub compaction_model: Option<String>,
+    /// Optional reasoning effort override used for watcher-triggered compactions.
+    pub compaction_reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+    /// Optional verbosity override used for watcher-triggered compactions.
+    pub compaction_verbosity: Option<codex_protocol::config_types::Verbosity>,
+    /// Per-tier thresholds, boundary requirements, and optional judgment prompts.
+    pub policy: Option<RawrAutoCompactionPolicyToml>,
+    #[serde(default)]
+    pub repo_observation: Option<RawrRepoObservationToml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(untagged)]
+pub enum RawrAutoCompactionToml {
+    Enabled(bool),
+    Config(Box<RawrAutoCompactionSettingsToml>),
+}
+
+impl RawrAutoCompactionToml {
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::Enabled(enabled) => *enabled,
+            Self::Config(settings) => settings.enabled.unwrap_or(true),
+        }
+    }
+
+    pub fn settings(&self) -> Option<&RawrAutoCompactionSettingsToml> {
+        match self {
+            Self::Enabled(_) => None,
+            Self::Config(settings) => Some(settings),
+        }
+    }
+}
+
 /// Memories settings loaded from config.toml.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]

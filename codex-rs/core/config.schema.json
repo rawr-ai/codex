@@ -466,6 +466,9 @@
             "prevent_idle_sleep": {
               "type": "boolean"
             },
+            "rawr_auto_compaction": {
+              "type": "boolean"
+            },
             "realtime_conversation": {
               "type": "boolean"
             },
@@ -1842,6 +1845,165 @@
       },
       "type": "object"
     },
+    "RawrAutoCompactionBoundary": {
+      "enum": [
+        "commit",
+        "plan_checkpoint",
+        "plan_update",
+        "pr_checkpoint",
+        "agent_done",
+        "topic_shift",
+        "concluding_thought",
+        "turn_complete"
+      ],
+      "type": "string"
+    },
+    "RawrAutoCompactionMode": {
+      "enum": [
+        "tag",
+        "suggest",
+        "auto"
+      ],
+      "type": "string"
+    },
+    "RawrAutoCompactionPacketAuthor": {
+      "enum": [
+        "watcher",
+        "agent"
+      ],
+      "type": "string"
+    },
+    "RawrAutoCompactionPolicyTierToml": {
+      "additionalProperties": false,
+      "properties": {
+        "decision_prompt_path": {
+          "description": "Optional prompt file used to make a judgment call before compaction triggers.",
+          "type": "string"
+        },
+        "percent_remaining_lt": {
+          "description": "Trigger threshold for this tier. When `percent_remaining < percent_remaining_lt`, this tier is eligible.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "plan_boundaries_require_semantic_break": {
+          "description": "When enabled, plan boundaries only count when there is a semantic break unless a non-plan boundary is also present.",
+          "type": "boolean"
+        },
+        "requires_any_boundary": {
+          "description": "Boundaries that may trigger compaction for this tier. If unset, defaults are used.",
+          "items": {
+            "$ref": "#/definitions/RawrAutoCompactionBoundary"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "RawrAutoCompactionPolicyToml": {
+      "additionalProperties": false,
+      "properties": {
+        "asap": {
+          "$ref": "#/definitions/RawrAutoCompactionPolicyTierToml"
+        },
+        "early": {
+          "$ref": "#/definitions/RawrAutoCompactionPolicyTierToml"
+        },
+        "emergency": {
+          "$ref": "#/definitions/RawrAutoCompactionPolicyTierToml"
+        },
+        "ready": {
+          "$ref": "#/definitions/RawrAutoCompactionPolicyTierToml"
+        }
+      },
+      "type": "object"
+    },
+    "RawrAutoCompactionSettingsToml": {
+      "additionalProperties": false,
+      "properties": {
+        "compaction_model": {
+          "description": "Optional model override used for watcher-triggered compactions.",
+          "type": "string"
+        },
+        "compaction_reasoning_effort": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            }
+          ],
+          "description": "Optional reasoning effort override used for watcher-triggered compactions."
+        },
+        "compaction_verbosity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Verbosity"
+            }
+          ],
+          "description": "Optional verbosity override used for watcher-triggered compactions."
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "mode": {
+          "$ref": "#/definitions/RawrAutoCompactionMode"
+        },
+        "packet_author": {
+          "$ref": "#/definitions/RawrAutoCompactionPacketAuthor"
+        },
+        "packet_max_tail_chars": {
+          "description": "Max chars of tail context included in watcher-side packet prompts.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "policy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RawrAutoCompactionPolicyToml"
+            }
+          ],
+          "description": "Per-tier thresholds, boundary requirements, and optional judgment prompts."
+        },
+        "repo_observation": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RawrRepoObservationToml"
+            }
+          ],
+          "default": null
+        },
+        "scratch_write_enabled": {
+          "description": "When enabled, the watcher may ask the in-session agent to write a scratchpad file before compaction so verbatim research notes survive history rewrite.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "RawrAutoCompactionToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/RawrAutoCompactionSettingsToml"
+        }
+      ]
+    },
+    "RawrRepoObservationToml": {
+      "additionalProperties": false,
+      "properties": {
+        "graphite_enabled": {
+          "description": "When enabled, Codex attempts to collect lightweight Graphite context for RAWR state.",
+          "type": "boolean"
+        },
+        "graphite_max_chars": {
+          "description": "Max chars of Graphite output to persist per observation.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "RealtimeAudioToml": {
       "additionalProperties": false,
       "properties": {
@@ -2624,6 +2786,9 @@
         "prevent_idle_sleep": {
           "type": "boolean"
         },
+        "rawr_auto_compaction": {
+          "type": "boolean"
+        },
         "realtime_conversation": {
           "type": "boolean"
         },
@@ -3029,6 +3194,14 @@
         "$ref": "#/definitions/ProjectConfig"
       },
       "type": "object"
+    },
+    "rawr_auto_compaction": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RawrAutoCompactionToml"
+        }
+      ],
+      "description": "RAWR fork automatic compaction policy."
     },
     "realtime": {
       "allOf": [

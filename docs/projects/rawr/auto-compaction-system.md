@@ -2,12 +2,14 @@
 
 Status: living spec, but mixed history. The current durable branch uses core session/task lifecycle ownership for turn-complete RAWR plus internal non-transcript judgment/artifact calls. Older sections below that describe TUI watcher-owned orchestration or `Op::RawrAutoCompactionJudgment` are historical reference, not current implementation truth.
 
-This document is the **canonical packet** describing how RAWR auto-compaction works end-to-end in this fork:
+This document is the **canonical packet** describing how RAWR auto-compaction works end-to-end in this fork.
+Current implementation truth is the core session/task lifecycle path; older watcher-oriented sections are retained
+only as design history until this spec is fully collapsed:
 
-- **Actors / systems** (TUI watcher, core sampling loop, compaction task, model provider)
+- **Actors / systems** (core session/task lifecycle, compaction task, model provider)
 - **Config + prompts** (what exists, where it is loaded from, when it is used)
-- **State machines** (TUI watcher and core mid-turn), and the **decision policy** (tiers/boundaries/judgment)
-- **All major paths** (watcher auto, watcher suggest/tag, watcher preflight, core mid-turn, built-in auto-compact)
+- **State machines** (turn-complete lifecycle and mid-turn), and the **decision policy** (tiers/boundaries/judgment)
+- **All major paths** (turn-complete auto-compaction, mid-turn compaction, built-in auto-compact)
 - **Constraints + rationale** (what we optimized for, what we explicitly avoided)
 
 If the UX still feels bad (too eager, confusing, brittle), this doc is intended to make it obvious whether the root cause is:
@@ -26,18 +28,19 @@ If the UX still feels bad (too eager, confusing, brittle), this doc is intended 
 
 Fork-specific RAWR features (guarded behind `Feature::RawrAutoCompaction`):
 
-- TUI watcher compaction orchestration (turn-complete + preflight)
-  - `codex-rs/tui/src/chatwidget.rs`
+- Core session/task compaction orchestration after `EventMsg::TurnComplete`
+  - `codex-rs/core/src/session/mod.rs`
+  - `codex-rs/core/src/tasks/mod.rs`
 - Core mid-turn RAWR compaction orchestration (inside one user turn)
-  - `codex-rs/core/src/codex.rs`
   - `codex-rs/core/src/rawr_auto_compaction.rs`
 - Scratch-write pre-compact request (`.scratch/agent-<name>.scratch.md`)
-  - core + TUI
+  - core internal non-transcript model calls
 - Config-driven tier policy matrix: `rawr_auto_compaction.policy.<tier>`
-  - core + TUI
+  - core
 - Optional **internal / non-transcript** judgment decision step
-  - protocol `Op::RawrAutoCompactionJudgment` + `EventMsg::RawrAutoCompactionJudgmentResult`
-  - core implementation in `codex-rs/core/src/rawr_auto_compaction_judgment.rs`
+  - `codex-rs/core/src/rawr_auto_compaction_model.rs`
+- Prompt/config/path helpers
+  - `codex-rs/core/src/rawr_prompts.rs`
 
 ### What we do not alter (Codex-native / upstream behaviors)
 
@@ -54,24 +57,23 @@ Fork-specific RAWR features (guarded behind `Feature::RawrAutoCompaction`):
 
 - **User**: human driving the CLI.
 - **In-session agent**: the assistant responding to the user (model sampling loop).
-- **Watcher (TUI)**: deterministic orchestrator in the TUI that decides *when* to compact at turn completion.
+- **Core session/task lifecycle**: deterministic orchestrator that evaluates turn-complete signals and decides *when* to compact.
 - **Core**: the engine that runs sampling loops, executes tasks, and mutates session state/history.
 - **Model provider / backend**: OpenAI (or other providers) handling model requests.
 - **Filesystem**: scratchpad persistence under `.scratch/`.
 
 ### Components (where to look in code)
 
-- TUI watcher and injection:
-  - `codex-rs/tui/src/chatwidget.rs`
+- Turn-complete lifecycle hook and injection:
+  - `codex-rs/core/src/session/mod.rs`
+  - `codex-rs/core/src/tasks/mod.rs`
 - Core mid-turn RAWR compaction:
-  - `codex-rs/core/src/codex.rs` (sampling loop)
   - `codex-rs/core/src/rawr_auto_compaction.rs` (tier policy + prompt building)
 - Compaction task (history rewrite):
   - `codex-rs/core/src/compact.rs`
   - `codex-rs/core/src/compaction_audit.rs`
 - Judgment (internal model call, non-transcript):
-  - `codex-rs/core/src/rawr_auto_compaction_judgment.rs`
-  - protocol definitions in `codex-rs/protocol/src/protocol.rs`
+  - `codex-rs/core/src/rawr_auto_compaction_model.rs`
 
 ---
 

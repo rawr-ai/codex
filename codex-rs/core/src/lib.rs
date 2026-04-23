@@ -11,6 +11,7 @@ mod arc_monitor;
 mod client;
 mod client_common;
 mod rawr_auto_compaction;
+mod rawr_auto_compaction_model;
 mod rawr_prompts;
 mod realtime_context;
 mod realtime_conversation;

@@ -10,6 +10,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use futures::future::BoxFuture;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 use tokio::select;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -663,6 +665,14 @@ impl Session {
             .lock()
             .await
             .clear_turn(&turn_context.sub_id);
+        let rawr_signals = if task_kind == TaskKind::Regular {
+            Some(
+                self.rawr_auto_compaction_signals_for_turn(&turn_context.sub_id)
+                    .await,
+            )
+        } else {
+            None
+        };
 
         let (finished_task, should_clear_active_turn) = {
             let mut active = self.active_turn.lock().await;
@@ -687,6 +697,7 @@ impl Session {
             self.maybe_run_rawr_post_turn_auto_compaction(
                 Arc::clone(&turn_context),
                 last_agent_message_for_rawr,
+                rawr_signals.unwrap_or_default(),
             )
             .await;
         }
@@ -707,6 +718,7 @@ impl Session {
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         last_agent_message: Option<String>,
+        signals: crate::rawr_auto_compaction::RawrAutoCompactionSignals,
     ) {
         if !turn_context.features.enabled(Feature::RawrAutoCompaction) {
             debug!(
@@ -736,7 +748,6 @@ impl Session {
         let remaining = model_context_window.saturating_sub(total_usage_tokens);
         let percent_remaining =
             (remaining.saturating_mul(100) / model_context_window).clamp(0, 100);
-        let signals = crate::rawr_auto_compaction::RawrAutoCompactionSignals::default();
         if !crate::rawr_auto_compaction::rawr_should_compact_at_turn_complete(
             turn_context.config.as_ref(),
             percent_remaining,
@@ -758,10 +769,23 @@ impl Session {
             percent_remaining,
             "rawr auto-compaction eligible"
         );
-        let tier = crate::rawr_auto_compaction::rawr_compaction_tier(
+        let Some(tier) = crate::rawr_auto_compaction::rawr_compaction_tier(
             turn_context.config.as_ref(),
             percent_remaining,
+        ) else {
+            debug!(
+                turn_id = %turn_context.sub_id,
+                percent_remaining,
+                "rawr auto-compaction skipped: eligible state had no tier"
+            );
+            return;
+        };
+        let is_emergency = matches!(
+            tier,
+            crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency
         );
+        let boundaries_present =
+            crate::rawr_auto_compaction::rawr_boundaries_present(&signals, true);
 
         match crate::rawr_auto_compaction::rawr_auto_compaction_mode(turn_context.config.as_ref()) {
             RawrAutoCompactionMode::Tag | RawrAutoCompactionMode::Suggest => {
@@ -778,6 +802,189 @@ impl Session {
             }
             RawrAutoCompactionMode::Auto => {}
         }
+
+        if !is_emergency
+            && let Some(decision_prompt_path) =
+                crate::rawr_auto_compaction::rawr_policy_decision_prompt_path(
+                    turn_context.config.as_ref(),
+                    tier,
+                )
+        {
+            match crate::rawr_auto_compaction_model::request_rawr_auto_compaction_judgment(
+                self,
+                turn_context.as_ref(),
+                decision_prompt_path.as_str(),
+                rawr_tier_name(tier),
+                percent_remaining,
+                &boundaries_present,
+                last_agent_message.as_deref().unwrap_or(""),
+            )
+            .await
+            {
+                Ok(judgment) if !judgment.should_compact => {
+                    self.send_event(
+                        turn_context.as_ref(),
+                        EventMsg::Warning(WarningEvent {
+                            message: format!(
+                                "rawr auto-compaction skipped by judgment: {}",
+                                judgment.reason
+                            ),
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    self.send_event(
+                        turn_context.as_ref(),
+                        EventMsg::Warning(WarningEvent {
+                            message: format!(
+                                "rawr auto-compaction judgment failed; continuing with static policy: {err}"
+                            ),
+                        }),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        let do_scratch = crate::rawr_auto_compaction::rawr_should_schedule_scratch_write(
+            crate::rawr_auto_compaction::rawr_scratch_write_enabled(turn_context.config.as_ref()),
+            is_emergency,
+            &signals,
+        );
+        let configured_scratch_file = do_scratch.then(|| {
+            crate::rawr_auto_compaction::rawr_scratch_file_rel_path(
+                &turn_context.session_source,
+                &self.conversation_id,
+            )
+        });
+        let packet_author = crate::rawr_auto_compaction::rawr_auto_compaction_packet_author(
+            turn_context.config.as_ref(),
+        );
+        let agent_artifacts = if packet_author == RawrAutoCompactionPacketAuthor::Agent
+            || do_scratch
+        {
+            let packet_prompt = if packet_author == RawrAutoCompactionPacketAuthor::Agent {
+                let raw_packet_prompt = crate::rawr_auto_compaction::rawr_load_agent_packet_prompt(
+                    &turn_context.config.codex_home,
+                );
+                let raw_scratch_prompt = do_scratch.then(|| {
+                    crate::rawr_auto_compaction::rawr_load_scratch_write_prompt(
+                        &turn_context.config.codex_home,
+                    )
+                });
+                Some(
+                    crate::rawr_auto_compaction::rawr_build_agent_continuation_packet_prompt(
+                        raw_packet_prompt.as_str(),
+                        raw_scratch_prompt.as_deref().unwrap_or(""),
+                        do_scratch,
+                        configured_scratch_file.as_deref(),
+                        Some(self.conversation_id),
+                    ),
+                )
+            } else {
+                None
+            };
+            let scratch_prompt = if packet_author == RawrAutoCompactionPacketAuthor::Watcher {
+                configured_scratch_file.as_deref().map(|scratch_path| {
+                    crate::rawr_auto_compaction::rawr_build_scratch_write_prompt(
+                        crate::rawr_auto_compaction::rawr_load_scratch_write_prompt(
+                            &turn_context.config.codex_home,
+                        )
+                        .as_str(),
+                        scratch_path,
+                        Some(self.conversation_id),
+                    )
+                })
+            } else {
+                None
+            };
+            match crate::rawr_auto_compaction_model::request_rawr_auto_compaction_agent_artifacts(
+                self,
+                turn_context.as_ref(),
+                packet_prompt.as_deref(),
+                scratch_prompt.as_deref(),
+                rawr_tier_name(tier),
+                percent_remaining,
+                &boundaries_present,
+                last_agent_message.as_deref().unwrap_or(""),
+                configured_scratch_file.as_deref(),
+            )
+            .await
+            {
+                Ok(artifacts) => Some(artifacts),
+                Err(err) => {
+                    self.send_event(
+                        turn_context.as_ref(),
+                        EventMsg::Warning(WarningEvent {
+                            message: format!(
+                                "rawr pre-compact artifact generation failed; falling back: {err}"
+                            ),
+                        }),
+                    )
+                    .await;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let scratch_file = if let (Some(rel_path), Some(contents)) = (
+            configured_scratch_file.as_deref(),
+            agent_artifacts
+                .as_ref()
+                .and_then(|artifacts| artifacts.scratchpad_contents.as_deref())
+                .map(str::trim)
+                .filter(|contents| !contents.is_empty()),
+        ) {
+            match write_rawr_scratchpad(turn_context.as_ref(), rel_path, contents).await {
+                Ok(()) => Some(rel_path.to_string()),
+                Err(err) => {
+                    self.send_event(
+                        turn_context.as_ref(),
+                        EventMsg::Warning(WarningEvent {
+                            message: format!("rawr scratch write failed; continuing without scratch reference: {err}"),
+                        }),
+                    )
+                    .await;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let packet = match packet_author {
+            RawrAutoCompactionPacketAuthor::Watcher => {
+                crate::rawr_auto_compaction::rawr_build_watcher_post_compact_packet(
+                    percent_remaining,
+                    &signals,
+                    last_agent_message.as_deref(),
+                    crate::rawr_auto_compaction::rawr_packet_max_tail_chars(
+                        turn_context.config.as_ref(),
+                    ),
+                )
+            }
+            RawrAutoCompactionPacketAuthor::Agent => agent_artifacts
+                .as_ref()
+                .and_then(|artifacts| artifacts.continuation_packet.as_deref())
+                .map(str::trim)
+                .filter(|packet| !packet.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    crate::rawr_auto_compaction::rawr_build_watcher_post_compact_packet(
+                        percent_remaining,
+                        &signals,
+                        last_agent_message.as_deref(),
+                        crate::rawr_auto_compaction::rawr_packet_max_tail_chars(
+                            turn_context.config.as_ref(),
+                        ),
+                    )
+                }),
+        };
 
         let compaction_context = if let Some(model) =
             crate::rawr_auto_compaction::rawr_compaction_model(turn_context.config.as_ref())
@@ -798,7 +1005,7 @@ impl Session {
                     Arc::clone(&compaction_context),
                     crate::compact::InitialContextInjection::BeforeLastUserMessage,
                     CompactionReason::ContextLimit,
-                    CompactionPhase::MidTurn,
+                    CompactionPhase::StandaloneTurn,
                 )
                 .await
             } else {
@@ -807,7 +1014,7 @@ impl Session {
                     Arc::clone(&compaction_context),
                     crate::compact::InitialContextInjection::BeforeLastUserMessage,
                     CompactionReason::ContextLimit,
-                    CompactionPhase::MidTurn,
+                    CompactionPhase::StandaloneTurn,
                 )
                 .await
             };
@@ -822,66 +1029,6 @@ impl Session {
             .await;
             return;
         }
-
-        let do_scratch = crate::rawr_auto_compaction::rawr_should_schedule_scratch_write(
-            crate::rawr_auto_compaction::rawr_scratch_write_enabled(turn_context.config.as_ref()),
-            matches!(
-                tier,
-                Some(crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency)
-            ),
-            &signals,
-        );
-        let scratch_file = do_scratch.then(|| {
-            crate::rawr_auto_compaction::rawr_scratch_file_rel_path(
-                &turn_context.session_source,
-                &self.conversation_id,
-            )
-        });
-        let packet = match crate::rawr_auto_compaction::rawr_auto_compaction_packet_author(
-            turn_context.config.as_ref(),
-        ) {
-            RawrAutoCompactionPacketAuthor::Watcher => {
-                let watcher_packet =
-                    crate::rawr_auto_compaction::rawr_build_watcher_post_compact_packet(
-                        percent_remaining,
-                        &signals,
-                        last_agent_message.as_deref(),
-                        crate::rawr_auto_compaction::rawr_packet_max_tail_chars(
-                            turn_context.config.as_ref(),
-                        ),
-                    );
-                if do_scratch {
-                    let scratch_prompt =
-                        crate::rawr_auto_compaction::rawr_load_scratch_write_prompt(
-                            &turn_context.config.codex_home,
-                        );
-                    crate::rawr_auto_compaction::rawr_build_agent_continuation_packet_prompt(
-                        watcher_packet.as_str(),
-                        scratch_prompt.as_str(),
-                        true,
-                        scratch_file.as_deref(),
-                        Some(self.conversation_id),
-                    )
-                } else {
-                    watcher_packet
-                }
-            }
-            RawrAutoCompactionPacketAuthor::Agent => {
-                let packet_prompt = crate::rawr_auto_compaction::rawr_load_agent_packet_prompt(
-                    &turn_context.config.codex_home,
-                );
-                let scratch_prompt = crate::rawr_auto_compaction::rawr_load_scratch_write_prompt(
-                    &turn_context.config.codex_home,
-                );
-                crate::rawr_auto_compaction::rawr_build_agent_continuation_packet_prompt(
-                    packet_prompt.as_str(),
-                    scratch_prompt.as_str(),
-                    do_scratch,
-                    scratch_file.as_deref(),
-                    Some(self.conversation_id),
-                )
-            }
-        };
         let handoff = crate::rawr_auto_compaction::rawr_build_post_compact_handoff_message(
             packet,
             scratch_file.as_deref(),
@@ -981,6 +1128,41 @@ impl Session {
             .await
             .clear_turn(&task.turn_context.sub_id);
     }
+}
+
+fn rawr_tier_name(tier: crate::rawr_auto_compaction::RawrAutoCompactionTier) -> &'static str {
+    match tier {
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Early => "early",
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Ready => "ready",
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Asap => "asap",
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency => "emergency",
+    }
+}
+
+async fn write_rawr_scratchpad(
+    turn_context: &TurnContext,
+    rel_path: &str,
+    contents: &str,
+) -> std::io::Result<()> {
+    let path = turn_context.cwd.join(rel_path);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let existing_len = tokio::fs::metadata(&path)
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await?;
+    if existing_len > 0 {
+        file.write_all(b"\n\n").await?;
+    }
+    file.write_all(contents.trim().as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    Ok(())
 }
 
 #[cfg(test)]

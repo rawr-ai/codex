@@ -55,7 +55,10 @@ async fn rawr_turn_complete_auto_compaction_emits_started_and_completed_items() 
 
     let server = responses::start_mock_server().await;
     let sse1 = responses::sse(vec![
-        responses::ev_assistant_message("m1", "FIRST_REPLY"),
+        responses::ev_assistant_message(
+            "m1",
+            "Completed the first step. Final thoughts: continue with the next task.",
+        ),
         responses::ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
     ]);
     let sse2 = responses::sse(vec![

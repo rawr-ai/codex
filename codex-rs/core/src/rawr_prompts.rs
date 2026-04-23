@@ -8,38 +8,125 @@ use tracing::warn;
 pub const RAWR_PROMPT_DIR_NAME: &str = "auto-compact";
 pub const RAWR_AUTO_COMPACT_PROMPT_FILE: &str = "auto-compact.md";
 pub const RAWR_SCRATCH_WRITE_PROMPT_FILE: &str = "scratch-write.md";
+pub const RAWR_JUDGMENT_PROMPT_FILE: &str = "judgment.md";
+pub const RAWR_JUDGMENT_CONTEXT_PROMPT_FILE: &str = "judgment-context.md";
 
 const DEFAULT_AUTO_COMPACT_PROMPT: &str = "\
-[rawr] Before we compact this thread, produce a continuation context packet for yourself.
+[rawr] Agent: before we compact this thread, you must self-reflect and write a continuation context packet for yourself.
 
-Requirements:
-- Keep it short and structured.
-- Include: overarching goal, current state, next steps, invariants/decisions, and a final directive to continue after compaction.
-- Do not include secrets; redact tokens/keys.
+This is not a generic compact. This is your tight, intra-turn handoff: you are responsible for capturing the minimum, precise context you will need to resume smoothly after compaction and continue exactly where you left off (no drift, no restart).
+
+Precedence (important):
+- This continuation context packet is the authoritative source of what to do next after compaction.
+- The generic compacted context is background only and must not override or supersede this packet.
+
+Accountability:
+- You own what gets carried forward. Be deliberate: reflect on your actual goal, state, decisions, and immediate next action.
+- If something is uncertain, name the assumption you are carrying forward rather than hand-waving it.
+
+Write the packet in my voice, as if I (the user) am speaking directly to you (the in-session agent). But the content must come from your self-reflection on this conversation and your work so far.
+
+Keep it short and structured. Do not include secrets; redact tokens/keys.
+
+Include exactly these sections:
+
+1) Overarching goal
+- Briefly restate the overall objective you are trying to accomplish (higher-level than the last message, but still concise).
+
+2) Current state / progress snapshot
+- State the very last thing that just happened (commit, PR checkpoint, plan step completion, etc.).
+- Explain how that action relates to the overarching goal and where it leaves you right now.
+
+3) Invariants and decisions (for this continuation)
+- Enumerate the rules/choices that must continue to hold when you resume (specific to this ongoing effort).
+
+4) Next step / immediate continuation
+- Specify the single next thing to do when you resume.
+- Tie it explicitly to the overarching goal and the just-completed action.
+
+5) Verbatim continuation snippet (programmatically inserted)
+- Include a literal placeholder for a verbatim memory trigger snippet to be inserted later from your most recent messages:
+  - {{RAWR_VERBATIM_CONTINUATION_SNIPPET}}
+
+Final directive:
+- End with one clear directive to immediately continue from Next step / immediate continuation after compaction (do not restart or re-plan from scratch).
+
+Heuristic notes (for auditing)
+- commit: a successful git commit occurred in this turn.
+- pr_checkpoint: a PR lifecycle checkpoint occurred (publish/review/open/close heuristics).
+- plan_checkpoint: the plan was updated and at least one step was marked completed.
+- agent_done: the assistant explicitly indicates completion (for example done, completed, finished).
 ";
 
 const DEFAULT_SCRATCH_WRITE_PROMPT: &str = "\
-[rawr] Before we compact this thread, write a scratchpad file with what you just worked on.
+[rawr] Before auto-compaction, write a verbatim scratchpad of the work you just completed so it survives compaction.
 
 Target file: `{scratch_file}`
 
 Requirements:
 - Create the `.scratch/` directory if it doesn't exist.
-- Append a new section; do not delete prior scratch content.
-- Prefer verbatim notes/drafts over summaries.
+- Create your scratch document if it doesn't exist, in whatever working space you're already keep scratch documents and transient context.
+- Append a new section (do not delete prior scratch content).
+- Prefer verbatim notes/drafts over summaries; include raw details that are useful later.
 - Include links/paths to any important files you edited or created.
+- After writing, confirm in your next message that the scratch file was written and include the exact path.
+
+Overall goal:
+Create (or rewrite) the scratch document to have two sections, optimized for continuity + fast reorientation, not as a status report.
+
+1) Current frame / objective / vision (high level)
+- the user’s communicated frame, objective, vision
+- the overall process/workflow as a short but complete relevant narration
+- the current state of things: what we’re working on and what we’re driving toward
+
+2) Precision references (ground truth)
+- the specific links, file paths, and precise references needed to act
+
+Style constraints:
+- Start high-level, then progressively zoom in until you reach precise links/paths.
+- Don’t be overly verbose; be directional and clear.
+- Preserve the most important invariants.
+- Write it to yourself, with the goal of surviving compaction and making reorientation immediate.
+";
+
+const DEFAULT_JUDGMENT_PROMPT: &str = "\
+[rawr] Decide whether automatic post-turn compaction should run now.
+
+Requirements:
+- Return strict JSON matching the requested schema.
+- Approve compaction only when the supplied context shows a real boundary and compaction would help.
+- Deny compaction when the boundary is weak, the turn is still in the middle of a cohesive thread, or compaction would likely lose important short-term working context.
+- Keep the reason concise and specific.
+";
+
+const DEFAULT_JUDGMENT_CONTEXT_PROMPT: &str = "\
+Tier: {tier}
+Percent remaining: {percentRemaining}
+Boundaries present: {boundariesJson}
+Last agent message:
+{lastAgentMessage}
+
+Recent transcript excerpt:
+{transcriptExcerpt}
+
+Thread: {threadId}
+Turn: {turnId}
+Total usage tokens: {totalUsageTokens}
+Model context window: {modelContextWindow}
 ";
 
 #[derive(Debug, Clone, Copy)]
 pub enum RawrPromptKind {
     AutoCompact,
     ScratchWrite,
+    JudgmentContext,
 }
 
 #[derive(Debug, Clone)]
 pub struct RawrPromptPaths {
     pub auto_compact: PathBuf,
     pub scratch_write: PathBuf,
+    pub judgment_context: PathBuf,
 }
 
 pub fn rawr_prompt_dir(codex_home: &Path) -> PathBuf {
@@ -52,13 +139,18 @@ pub fn ensure_rawr_prompt_files(codex_home: &Path) -> io::Result<RawrPromptPaths
 
     let auto_compact = dir.join(RAWR_AUTO_COMPACT_PROMPT_FILE);
     let scratch_write = dir.join(RAWR_SCRATCH_WRITE_PROMPT_FILE);
+    let judgment = dir.join(RAWR_JUDGMENT_PROMPT_FILE);
+    let judgment_context = dir.join(RAWR_JUDGMENT_CONTEXT_PROMPT_FILE);
 
     write_default_if_missing(&auto_compact, DEFAULT_AUTO_COMPACT_PROMPT)?;
     write_default_if_missing(&scratch_write, DEFAULT_SCRATCH_WRITE_PROMPT)?;
+    write_default_if_missing(&judgment, DEFAULT_JUDGMENT_PROMPT)?;
+    write_default_if_missing(&judgment_context, DEFAULT_JUDGMENT_CONTEXT_PROMPT)?;
 
     Ok(RawrPromptPaths {
         auto_compact,
         scratch_write,
+        judgment_context,
     })
 }
 
@@ -74,6 +166,7 @@ pub fn read_prompt_or_default(codex_home: &Path, kind: RawrPromptKind) -> String
     let path = match kind {
         RawrPromptKind::AutoCompact => paths.auto_compact,
         RawrPromptKind::ScratchWrite => paths.scratch_write,
+        RawrPromptKind::JudgmentContext => paths.judgment_context,
     };
 
     match fs::read_to_string(&path) {
@@ -97,6 +190,7 @@ fn default_prompt(kind: RawrPromptKind) -> &'static str {
     match kind {
         RawrPromptKind::AutoCompact => DEFAULT_AUTO_COMPACT_PROMPT,
         RawrPromptKind::ScratchWrite => DEFAULT_SCRATCH_WRITE_PROMPT,
+        RawrPromptKind::JudgmentContext => DEFAULT_JUDGMENT_CONTEXT_PROMPT,
     }
 }
 

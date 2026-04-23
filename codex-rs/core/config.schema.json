@@ -1924,22 +1924,6 @@
           "description": "Optional model override used for watcher-triggered compactions.",
           "type": "string"
         },
-        "compaction_reasoning_effort": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/ReasoningEffort"
-            }
-          ],
-          "description": "Optional reasoning effort override used for watcher-triggered compactions."
-        },
-        "compaction_verbosity": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/Verbosity"
-            }
-          ],
-          "description": "Optional verbosity override used for watcher-triggered compactions."
-        },
         "enabled": {
           "type": "boolean"
         },
@@ -1963,14 +1947,6 @@
           ],
           "description": "Per-tier thresholds, boundary requirements, and optional judgment prompts."
         },
-        "repo_observation": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/RawrRepoObservationToml"
-            }
-          ],
-          "default": null
-        },
         "scratch_write_enabled": {
           "description": "When enabled, the watcher may ask the in-session agent to write a scratchpad file before compaction so verbatim research notes survive history rewrite.",
           "type": "boolean"
@@ -1987,22 +1963,6 @@
           "$ref": "#/definitions/RawrAutoCompactionSettingsToml"
         }
       ]
-    },
-    "RawrRepoObservationToml": {
-      "additionalProperties": false,
-      "properties": {
-        "graphite_enabled": {
-          "description": "When enabled, Codex attempts to collect lightweight Graphite context for RAWR state.",
-          "type": "boolean"
-        },
-        "graphite_max_chars": {
-          "description": "Max chars of Graphite output to persist per observation.",
-          "format": "uint",
-          "minimum": 0.0,
-          "type": "integer"
-        }
-      },
-      "type": "object"
     },
     "RealtimeAudioToml": {
       "additionalProperties": false,

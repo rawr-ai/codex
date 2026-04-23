@@ -236,16 +236,6 @@ pub struct RawrAutoCompactionPolicyTierToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
-pub struct RawrRepoObservationToml {
-    /// When enabled, Codex attempts to collect lightweight Graphite context for RAWR state.
-    pub graphite_enabled: Option<bool>,
-    /// Max chars of Graphite output to persist per observation.
-    pub graphite_max_chars: Option<usize>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
 pub struct RawrAutoCompactionSettingsToml {
     pub enabled: Option<bool>,
     pub mode: Option<RawrAutoCompactionMode>,
@@ -257,14 +247,8 @@ pub struct RawrAutoCompactionSettingsToml {
     pub packet_max_tail_chars: Option<usize>,
     /// Optional model override used for watcher-triggered compactions.
     pub compaction_model: Option<String>,
-    /// Optional reasoning effort override used for watcher-triggered compactions.
-    pub compaction_reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
-    /// Optional verbosity override used for watcher-triggered compactions.
-    pub compaction_verbosity: Option<codex_protocol::config_types::Verbosity>,
     /// Per-tier thresholds, boundary requirements, and optional judgment prompts.
     pub policy: Option<RawrAutoCompactionPolicyToml>,
-    #[serde(default)]
-    pub repo_observation: Option<RawrRepoObservationToml>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]

@@ -11,6 +11,11 @@ use codex_config::types::RawrAutoCompactionPacketAuthor;
 use codex_config::types::RawrAutoCompactionPolicyTierToml;
 use codex_features::Feature;
 use codex_protocol::ThreadId;
+use codex_protocol::parse_command::ParsedCommand;
+use codex_protocol::plan_tool::StepStatus;
+use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_protocol::protocol::ExecCommandEndEvent;
+use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::protocol::SessionSource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +77,7 @@ impl RawrAutoCompactionThresholds {
     }
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawrAutoCompactionSignals {
     pub saw_commit: bool,
     pub saw_plan_checkpoint: bool,
@@ -81,6 +86,53 @@ pub(crate) struct RawrAutoCompactionSignals {
     pub saw_agent_done: bool,
     pub saw_topic_shift: bool,
     pub saw_concluding_thought: bool,
+}
+
+pub(crate) fn rawr_note_plan_update(
+    signals: &mut RawrAutoCompactionSignals,
+    completed_steps_seen: &mut usize,
+    update: &UpdatePlanArgs,
+) {
+    signals.saw_plan_update = true;
+    let completed_steps = rawr_completed_plan_steps(update);
+    if completed_steps > *completed_steps_seen {
+        signals.saw_plan_checkpoint = true;
+        *completed_steps_seen = completed_steps;
+    }
+}
+
+pub(crate) fn rawr_note_exec_command_end(
+    signals: &mut RawrAutoCompactionSignals,
+    event: &ExecCommandEndEvent,
+) {
+    if event.status != ExecCommandStatus::Completed {
+        return;
+    }
+
+    if rawr_command_looks_like_git_commit(&event.command, &event.parsed_cmd) {
+        signals.saw_commit = true;
+    }
+    if rawr_command_looks_like_pr_checkpoint(&event.command) {
+        signals.saw_pr_checkpoint = true;
+    }
+}
+
+pub(crate) fn rawr_note_completion_message(
+    signals: &mut RawrAutoCompactionSignals,
+    last_agent_message: Option<&str>,
+) {
+    let Some(last_agent_message) = last_agent_message else {
+        return;
+    };
+    if rawr_agent_message_looks_done(last_agent_message) {
+        signals.saw_agent_done = true;
+    }
+    if rawr_agent_message_looks_like_topic_shift(last_agent_message) {
+        signals.saw_topic_shift = true;
+    }
+    if rawr_agent_message_looks_like_concluding_thought(last_agent_message) {
+        signals.saw_concluding_thought = true;
+    }
 }
 
 const RAWR_SCRATCH_FALLBACK_AGENT_NAMES: [&str; 24] = [
@@ -197,7 +249,6 @@ fn rawr_should_compact_with_boundary(
             RawrAutoCompactionBoundary::PlanUpdate,
             RawrAutoCompactionBoundary::PrCheckpoint,
             RawrAutoCompactionBoundary::TopicShift,
-            RawrAutoCompactionBoundary::TurnComplete,
         ][..],
         RawrAutoCompactionTier::Ready => &[
             RawrAutoCompactionBoundary::Commit,
@@ -205,7 +256,6 @@ fn rawr_should_compact_with_boundary(
             RawrAutoCompactionBoundary::PlanUpdate,
             RawrAutoCompactionBoundary::PrCheckpoint,
             RawrAutoCompactionBoundary::TopicShift,
-            RawrAutoCompactionBoundary::TurnComplete,
         ][..],
         RawrAutoCompactionTier::Asap => &[
             RawrAutoCompactionBoundary::Commit,
@@ -215,7 +265,6 @@ fn rawr_should_compact_with_boundary(
             RawrAutoCompactionBoundary::AgentDone,
             RawrAutoCompactionBoundary::TopicShift,
             RawrAutoCompactionBoundary::ConcludingThought,
-            RawrAutoCompactionBoundary::TurnComplete,
         ][..],
         RawrAutoCompactionTier::Emergency => unreachable!(),
     };
@@ -290,6 +339,162 @@ fn rawr_policy_tier(
         RawrAutoCompactionTier::Asap => policy.asap.as_ref(),
         RawrAutoCompactionTier::Emergency => policy.emergency.as_ref(),
     }
+}
+
+pub(crate) fn rawr_policy_decision_prompt_path(
+    config: &Config,
+    tier: RawrAutoCompactionTier,
+) -> Option<String> {
+    rawr_policy_tier(config, tier).and_then(|policy| policy.decision_prompt_path.clone())
+}
+
+pub(crate) fn rawr_boundaries_present(
+    signals: &RawrAutoCompactionSignals,
+    turn_complete: bool,
+) -> Vec<String> {
+    let mut boundaries = Vec::new();
+    if signals.saw_commit {
+        boundaries.push("commit".to_string());
+    }
+    if signals.saw_plan_checkpoint {
+        boundaries.push("plan_checkpoint".to_string());
+    }
+    if signals.saw_plan_update {
+        boundaries.push("plan_update".to_string());
+    }
+    if signals.saw_pr_checkpoint {
+        boundaries.push("pr_checkpoint".to_string());
+    }
+    if signals.saw_agent_done {
+        boundaries.push("agent_done".to_string());
+    }
+    if signals.saw_topic_shift {
+        boundaries.push("topic_shift".to_string());
+    }
+    if signals.saw_concluding_thought {
+        boundaries.push("concluding_thought".to_string());
+    }
+    if turn_complete {
+        boundaries.push("turn_complete".to_string());
+    }
+    boundaries
+}
+
+fn rawr_completed_plan_steps(update: &UpdatePlanArgs) -> usize {
+    update
+        .plan
+        .iter()
+        .filter(|item| matches!(item.status, StepStatus::Completed))
+        .count()
+}
+
+pub(crate) fn rawr_command_looks_like_git_commit(
+    command: &[String],
+    parsed_cmd: &[ParsedCommand],
+) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+    if parsed_cmd.iter().any(|parsed| match parsed {
+        ParsedCommand::Unknown { cmd } => cmd.to_ascii_lowercase().contains("git commit"),
+        _ => false,
+    }) {
+        return true;
+    }
+
+    let joined = command.join(" ").to_ascii_lowercase();
+    if joined.contains("git commit") {
+        return true;
+    }
+
+    fn basename(s: &str) -> &str {
+        std::path::Path::new(s)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or(s)
+    }
+
+    command
+        .windows(2)
+        .any(|pair| basename(pair[0].as_str()) == "git" && pair[1].eq_ignore_ascii_case("commit"))
+}
+
+pub(crate) fn rawr_command_looks_like_pr_checkpoint(command: &[String]) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+    let joined = command.join(" ").to_ascii_lowercase();
+
+    if joined.contains("gt submit") || joined.contains("gt ss") {
+        return true;
+    }
+    if joined.contains("gt create") || joined.contains("gt review") || joined.contains("gt land") {
+        return true;
+    }
+    if joined.contains("gh pr create")
+        || joined.contains("gh pr close")
+        || joined.contains("gh pr merge")
+        || joined.contains("gh pr reopen")
+        || joined.contains("gh pr review")
+    {
+        return true;
+    }
+
+    false
+}
+
+pub(crate) fn rawr_agent_message_looks_done(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    if lower.contains("not done")
+        || lower.contains("not completed")
+        || lower.contains("not finished")
+    {
+        return false;
+    }
+    ["done", "completed", "finished", "shipped", "pushed"]
+        .into_iter()
+        .any(|needle| lower.contains(needle))
+}
+
+pub(crate) fn rawr_agent_message_looks_like_topic_shift(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    [
+        "moving on",
+        "switching to",
+        "next,",
+        "next:",
+        "next up",
+        "now, let's",
+        "now let's",
+        "we'll now",
+    ]
+    .into_iter()
+    .any(|needle| lower.contains(needle))
+}
+
+pub(crate) fn rawr_agent_message_looks_like_concluding_thought(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    [
+        "in summary",
+        "to summarize",
+        "to wrap up",
+        "wrapping up",
+        "conclusion",
+        "concluding",
+        "final thoughts",
+        "next steps",
+    ]
+    .into_iter()
+    .any(|needle| lower.contains(needle))
 }
 
 pub(crate) fn rawr_load_agent_packet_prompt(codex_home: &Path) -> String {
@@ -509,24 +714,21 @@ fn rawr_expand_prompt_template(
 
 fn default_rawr_agent_packet_prompt() -> String {
     [
-        "[rawr] Before we compact this thread, produce a continuation context packet for yourself.",
+        "[rawr] Agent: before we compact this thread, you must self-reflect and write a continuation context packet for yourself.",
         "",
-        "Requirements:",
-        "- Keep it short and structured.",
-        "- Include: overarching goal, current state, next steps, invariants/decisions, and a final directive to continue after compaction.",
-        "- Do not include secrets; redact tokens/keys.",
+        "Keep it short and structured. Do not include secrets; redact tokens/keys.",
     ]
     .join("\n")
 }
 
 fn default_rawr_scratch_write_prompt() -> String {
     [
-        "[rawr] Before we compact this thread, write a scratchpad file with what you just worked on.",
+        "[rawr] Before auto-compaction, write a verbatim scratchpad of the work you just completed so it survives compaction.",
         "",
         "Target file: `{scratch_file}`",
         "",
         "Requirements:",
-        "- Create the `.scratch/` directory if it doesn't exist.",
+        "- Create the `.context/` directory if it doesn't exist.",
         "- Append a new section; do not delete prior scratch content.",
         "- Prefer verbatim notes/drafts over summaries.",
         "- Include links/paths to any important files you edited or created.",
@@ -540,7 +742,15 @@ mod tests {
     use codex_config::types::RawrAutoCompactionPolicyToml;
     use codex_config::types::RawrAutoCompactionSettingsToml;
     use codex_config::types::RawrAutoCompactionToml;
+    use codex_protocol::plan_tool::PlanItemArg;
+    use codex_protocol::plan_tool::StepStatus;
+    use codex_protocol::plan_tool::UpdatePlanArgs;
+    use codex_protocol::protocol::ExecCommandEndEvent;
+    use codex_protocol::protocol::ExecCommandSource;
+    use codex_protocol::protocol::ExecCommandStatus;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn rawr_turn_complete_boundary_only_matches_turn_complete_path() {
@@ -571,6 +781,22 @@ mod tests {
         assert_eq!(
             rawr_should_compact_at_turn_complete(&config, 80, &signals),
             true
+        );
+    }
+
+    #[tokio::test]
+    async fn default_turn_complete_alone_is_not_a_boundary() {
+        let mut config = crate::config::test_config().await;
+        config
+            .features
+            .enable(Feature::RawrAutoCompaction)
+            .expect("enable feature");
+
+        let signals = RawrAutoCompactionSignals::default();
+
+        assert_eq!(
+            rawr_should_compact_at_turn_complete(&config, 80, &signals),
+            false
         );
     }
 
@@ -630,5 +856,141 @@ mod tests {
         assert!(handoff.starts_with(&format!("Scratchpad: `{scratch_file}`")));
         assert!(handoff.contains(&format!("write notes to {scratch_file}")));
         assert!(handoff.contains(&format!("continue using {scratch_file}")));
+    }
+
+    #[test]
+    fn plan_update_checkpoint_sets_plan_signals() {
+        let mut signals = RawrAutoCompactionSignals::default();
+        let mut completed_steps_seen = 0;
+        rawr_note_plan_update(
+            &mut signals,
+            &mut completed_steps_seen,
+            &UpdatePlanArgs {
+                explanation: None,
+                plan: vec![PlanItemArg {
+                    step: "done".to_string(),
+                    status: StepStatus::Completed,
+                }],
+            },
+        );
+
+        rawr_note_plan_update(
+            &mut signals,
+            &mut completed_steps_seen,
+            &UpdatePlanArgs {
+                explanation: None,
+                plan: vec![
+                    PlanItemArg {
+                        step: "done".to_string(),
+                        status: StepStatus::Completed,
+                    },
+                    PlanItemArg {
+                        step: "pending".to_string(),
+                        status: StepStatus::Pending,
+                    },
+                ],
+            },
+        );
+
+        assert_eq!(completed_steps_seen, 1);
+        assert!(signals.saw_plan_checkpoint);
+        assert!(signals.saw_plan_update);
+    }
+
+    #[test]
+    fn completed_exec_command_sets_commit_and_pr_signals() {
+        let mut commit_signals = RawrAutoCompactionSignals::default();
+        rawr_note_exec_command_end(
+            &mut commit_signals,
+            &ExecCommandEndEvent {
+                call_id: "call-1".to_string(),
+                process_id: None,
+                turn_id: "turn-1".to_string(),
+                command: vec![
+                    "git".to_string(),
+                    "commit".to_string(),
+                    "-m".to_string(),
+                    "x".to_string(),
+                ],
+                cwd: AbsolutePathBuf::try_from(std::path::PathBuf::from("/tmp"))
+                    .expect("absolute path"),
+                parsed_cmd: Vec::new(),
+                source: ExecCommandSource::Agent,
+                interaction_input: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                aggregated_output: String::new(),
+                exit_code: 0,
+                duration: Duration::from_secs(1),
+                formatted_output: String::new(),
+                status: ExecCommandStatus::Completed,
+            },
+        );
+        assert!(commit_signals.saw_commit);
+        assert!(!commit_signals.saw_pr_checkpoint);
+
+        let mut pr_signals = RawrAutoCompactionSignals::default();
+        rawr_note_exec_command_end(
+            &mut pr_signals,
+            &ExecCommandEndEvent {
+                call_id: "call-2".to_string(),
+                process_id: None,
+                turn_id: "turn-1".to_string(),
+                command: vec!["gh".to_string(), "pr".to_string(), "create".to_string()],
+                cwd: AbsolutePathBuf::try_from(std::path::PathBuf::from("/tmp"))
+                    .expect("absolute path"),
+                parsed_cmd: Vec::new(),
+                source: ExecCommandSource::Agent,
+                interaction_input: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                aggregated_output: String::new(),
+                exit_code: 0,
+                duration: Duration::from_secs(1),
+                formatted_output: String::new(),
+                status: ExecCommandStatus::Completed,
+            },
+        );
+        assert!(!pr_signals.saw_commit);
+        assert!(pr_signals.saw_pr_checkpoint);
+
+        let mut push_signals = RawrAutoCompactionSignals::default();
+        rawr_note_exec_command_end(
+            &mut push_signals,
+            &ExecCommandEndEvent {
+                call_id: "call-3".to_string(),
+                process_id: None,
+                turn_id: "turn-1".to_string(),
+                command: vec!["git".to_string(), "push".to_string()],
+                cwd: AbsolutePathBuf::try_from(std::path::PathBuf::from("/tmp"))
+                    .expect("absolute path"),
+                parsed_cmd: Vec::new(),
+                source: ExecCommandSource::Agent,
+                interaction_input: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                aggregated_output: String::new(),
+                exit_code: 0,
+                duration: Duration::from_secs(1),
+                formatted_output: String::new(),
+                status: ExecCommandStatus::Completed,
+            },
+        );
+        assert!(!push_signals.saw_pr_checkpoint);
+    }
+
+    #[test]
+    fn completion_message_sets_semantic_signals() {
+        let mut signals = RawrAutoCompactionSignals::default();
+        rawr_note_completion_message(
+            &mut signals,
+            Some(
+                "Completed the implementation. Next, let's update the docs. Final thoughts: keep the hook in tasks.",
+            ),
+        );
+
+        assert!(signals.saw_agent_done);
+        assert!(signals.saw_topic_shift);
+        assert!(signals.saw_concluding_thought);
     }
 }

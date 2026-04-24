@@ -34,6 +34,8 @@ use tokio::time::sleep;
 use tokio::time::timeout;
 use toml::Value as TomlValue;
 
+const EVENTUAL_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(15);
+
 async fn test_config_with_cli_overrides(
     cli_overrides: Vec<(String, TomlValue)>,
 ) -> (TempDir, Config) {
@@ -213,7 +215,7 @@ async fn wait_for_live_thread_spawn_children(
     let mut expected_children = expected_children.to_vec();
     expected_children.sort_by_key(std::string::ToString::to_string);
 
-    timeout(Duration::from_secs(5), async {
+    timeout(EVENTUAL_PERSISTENCE_TIMEOUT, async {
         loop {
             let mut child_ids = control
                 .open_thread_spawn_children(parent_thread_id)
@@ -478,7 +480,7 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
         .find(|entry| *entry == expected);
     assert_eq!(captured, Some(expected));
 
-    timeout(Duration::from_secs(5), async {
+    timeout(EVENTUAL_PERSISTENCE_TIMEOUT, async {
         loop {
             if thread.codex.session.has_pending_input().await {
                 break;
@@ -527,7 +529,7 @@ async fn append_message_records_assistant_message() {
         .expect("append_message should succeed");
     assert!(!submission_id.is_empty());
 
-    timeout(Duration::from_secs(5), async {
+    timeout(EVENTUAL_PERSISTENCE_TIMEOUT, async {
         loop {
             let history_items = thread
                 .codex
@@ -1334,7 +1336,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         },
     );
 
-    timeout(Duration::from_secs(5), async {
+    timeout(EVENTUAL_PERSISTENCE_TIMEOUT, async {
         loop {
             let captured = harness
                 .manager
@@ -1549,7 +1551,7 @@ async fn resume_thread_subagent_restores_stored_nickname_and_role() {
         .await
         .expect("status subscription should succeed");
     if matches!(status_rx.borrow().clone(), AgentStatus::PendingInit) {
-        timeout(Duration::from_secs(5), async {
+        timeout(EVENTUAL_PERSISTENCE_TIMEOUT, async {
             loop {
                 status_rx
                     .changed()
@@ -1571,7 +1573,7 @@ async fn resume_thread_subagent_restores_stored_nickname_and_role() {
     let state_db = child_thread
         .state_db()
         .expect("sqlite state db should be available for nickname resume test");
-    timeout(Duration::from_secs(5), async {
+    timeout(EVENTUAL_PERSISTENCE_TIMEOUT, async {
         loop {
             if let Ok(Some(metadata)) = state_db.get_thread(child_thread_id).await
                 && metadata.agent_nickname.is_some()

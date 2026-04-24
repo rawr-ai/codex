@@ -28,7 +28,9 @@ use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
+use codex_app_server_protocol::WarningNotification;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_features::Feature;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use core_test_support::responses;
@@ -47,6 +49,265 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const AUTO_COMPACT_LIMIT: i64 = 1_000;
 const COMPACT_PROMPT: &str = "Summarize the conversation.";
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rawr_turn_complete_auto_compaction_emits_started_and_completed_items() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let sse1 = responses::sse(vec![
+        responses::ev_assistant_message(
+            "m1",
+            "Completed the first step. Final thoughts: continue with the next task.",
+        ),
+        responses::ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
+    ]);
+    let sse2 = responses::sse(vec![
+        responses::ev_assistant_message("m2", "RAWR_SUMMARY"),
+        responses::ev_completed_with_tokens("r2", /*total_tokens*/ 200),
+    ]);
+    let responses_log = responses::mount_sse_sequence(&server, vec![sse1, sse2]).await;
+
+    let codex_home = TempDir::new()?;
+    write_mock_responses_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        &BTreeMap::from([(Feature::RawrAutoCompaction, true)]),
+        /*auto_compact_limit*/ i64::MAX,
+        /*requires_openai_auth*/ None,
+        "mock_provider",
+        COMPACT_PROMPT,
+    )?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        config.replacen(
+            "model_auto_compact_token_limit",
+            "model_context_window = 100000\nmodel_auto_compact_token_limit",
+            1,
+        ),
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_id = start_thread(&mut mcp).await?;
+    let turn_id = send_turn(&mut mcp, &thread_id, "first").await?;
+    wait_for_turn_completed_before_context_compaction_started(&mut mcp, &turn_id).await?;
+
+    let started = wait_for_context_compaction_started(&mut mcp).await?;
+    let completed = wait_for_context_compaction_completed(&mut mcp).await?;
+
+    let ThreadItem::ContextCompaction { id: started_id } = started.item else {
+        unreachable!("started item should be context compaction");
+    };
+    let ThreadItem::ContextCompaction { id: completed_id } = completed.item else {
+        unreachable!("completed item should be context compaction");
+    };
+
+    assert_eq!(started.thread_id, thread_id);
+    assert_eq!(completed.thread_id, thread_id);
+    assert_eq!(started_id, completed_id);
+    assert_eq!(responses_log.requests().len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rawr_judgment_denial_emits_warning_and_skips_compaction() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let sse1 = responses::sse(vec![
+        responses::ev_assistant_message("m1", "Completed the first step. Final thoughts follow."),
+        responses::ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
+    ]);
+    let sse2 = responses::sse(vec![
+        responses::ev_assistant_message(
+            "m2",
+            r#"{"should_compact":false,"reason":"critical handoff is incomplete"}"#,
+        ),
+        responses::ev_completed_with_tokens("r2", /*total_tokens*/ 200),
+    ]);
+    let responses_log = responses::mount_sse_sequence(&server, vec![sse1, sse2]).await;
+
+    let codex_home = TempDir::new()?;
+    write_rawr_config(codex_home.path(), &server.uri())?;
+    write_judgment_prompt(codex_home.path(), "judgment.md")?;
+    append_config_toml(
+        codex_home.path(),
+        r#"
+
+[rawr_auto_compaction.policy.asap]
+decision_prompt_path = "judgment.md"
+"#,
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_id = start_thread(&mut mcp).await?;
+    let turn_id = send_turn(&mut mcp, &thread_id, "first").await?;
+    wait_for_turn_completed(&mut mcp, &turn_id).await?;
+
+    let warning = wait_for_warning(&mut mcp, "rawr auto-compaction skipped by judgment").await?;
+    assert_eq!(warning.thread_id, Some(thread_id));
+    assert!(warning.message.contains("critical handoff is incomplete"));
+    assert_eq!(responses_log.requests().len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rawr_judgment_failure_emits_warning_and_compacts() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let sse1 = responses::sse(vec![
+        responses::ev_assistant_message("m1", "Completed the first step. Final thoughts follow."),
+        responses::ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
+    ]);
+    let sse2 = responses::sse(vec![
+        responses::ev_assistant_message("m2", "RAWR_SUMMARY"),
+        responses::ev_completed_with_tokens("r2", /*total_tokens*/ 200),
+    ]);
+    let responses_log = responses::mount_sse_sequence(&server, vec![sse1, sse2]).await;
+
+    let codex_home = TempDir::new()?;
+    write_rawr_config(codex_home.path(), &server.uri())?;
+    append_config_toml(
+        codex_home.path(),
+        r#"
+
+[rawr_auto_compaction.policy.asap]
+decision_prompt_path = "missing-judgment.md"
+"#,
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_id = start_thread(&mut mcp).await?;
+    let turn_id = send_turn(&mut mcp, &thread_id, "first").await?;
+    wait_for_turn_completed(&mut mcp, &turn_id).await?;
+
+    let warning = wait_for_warning(
+        &mut mcp,
+        "rawr auto-compaction judgment failed; continuing with static policy",
+    )
+    .await?;
+    assert_eq!(warning.thread_id, Some(thread_id.clone()));
+
+    let started = wait_for_context_compaction_started(&mut mcp).await?;
+    let completed = wait_for_context_compaction_completed(&mut mcp).await?;
+    assert_eq!(started.thread_id, thread_id);
+    assert_eq!(completed.thread_id, started.thread_id);
+    assert_eq!(responses_log.requests().len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rawr_artifact_generation_failure_emits_warning_and_compacts() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let sse1 = responses::sse(vec![
+        responses::ev_assistant_message("m1", "Completed the first step. Final thoughts follow."),
+        responses::ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
+    ]);
+    let sse2 = responses::sse(vec![
+        responses::ev_assistant_message("m2", "this is not json"),
+        responses::ev_completed_with_tokens("r2", /*total_tokens*/ 200),
+    ]);
+    let sse3 = responses::sse(vec![
+        responses::ev_assistant_message("m3", "RAWR_SUMMARY"),
+        responses::ev_completed_with_tokens("r3", /*total_tokens*/ 200),
+    ]);
+    let responses_log = responses::mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
+
+    let codex_home = TempDir::new()?;
+    write_rawr_config(codex_home.path(), &server.uri())?;
+    append_config_toml(
+        codex_home.path(),
+        r#"
+
+[rawr_auto_compaction]
+packet_author = "agent"
+"#,
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_id = start_thread(&mut mcp).await?;
+    let turn_id = send_turn(&mut mcp, &thread_id, "first").await?;
+    wait_for_turn_completed(&mut mcp, &turn_id).await?;
+
+    let warning = wait_for_warning(&mut mcp, "rawr pre-compact artifact generation failed").await?;
+    assert_eq!(warning.thread_id, Some(thread_id.clone()));
+
+    let started = wait_for_context_compaction_started(&mut mcp).await?;
+    let completed = wait_for_context_compaction_completed(&mut mcp).await?;
+    assert_eq!(started.thread_id, thread_id);
+    assert_eq!(completed.thread_id, started.thread_id);
+    assert_eq!(responses_log.requests().len(), 3);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rawr_scratch_write_failure_emits_warning_and_compacts() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let sse1 = responses::sse(vec![
+        responses::ev_assistant_message("m1", "Completed the first step. Final thoughts follow."),
+        responses::ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
+    ]);
+    let sse2 = responses::sse(vec![
+        responses::ev_assistant_message("m2", r#"{"scratchpad_contents":"verbatim notes"}"#),
+        responses::ev_completed_with_tokens("r2", /*total_tokens*/ 200),
+    ]);
+    let sse3 = responses::sse(vec![
+        responses::ev_assistant_message("m3", "RAWR_SUMMARY"),
+        responses::ev_completed_with_tokens("r3", /*total_tokens*/ 200),
+    ]);
+    let responses_log = responses::mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
+
+    let codex_home = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    std::fs::write(workspace.path().join(".scratch"), "not a directory")?;
+    write_rawr_config(codex_home.path(), &server.uri())?;
+    append_config_toml(
+        codex_home.path(),
+        r#"
+
+[rawr_auto_compaction]
+scratch_write_enabled = true
+"#,
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_id =
+        start_thread_with_cwd(&mut mcp, Some(workspace.path().display().to_string())).await?;
+    let turn_id = send_turn(&mut mcp, &thread_id, "first").await?;
+    wait_for_turn_completed(&mut mcp, &turn_id).await?;
+
+    let warning = wait_for_warning(&mut mcp, "rawr scratch write failed").await?;
+    assert_eq!(warning.thread_id, Some(thread_id.clone()));
+
+    let started = wait_for_context_compaction_started(&mut mcp).await?;
+    let completed = wait_for_context_compaction_completed(&mut mcp).await?;
+    assert_eq!(started.thread_id, thread_id);
+    assert_eq!(completed.thread_id, started.thread_id);
+    assert_eq!(responses_log.requests().len(), 3);
+
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()> {
@@ -324,9 +585,14 @@ async fn thread_compact_start_rejects_unknown_thread_id() -> Result<()> {
 }
 
 async fn start_thread(mcp: &mut McpProcess) -> Result<String> {
+    start_thread_with_cwd(mcp, /*cwd*/ None).await
+}
+
+async fn start_thread_with_cwd(mcp: &mut McpProcess, cwd: Option<String>) -> Result<String> {
     let thread_id = mcp
         .send_thread_start_request(ThreadStartParams {
             model: Some("mock-model".to_string()),
+            cwd,
             ..Default::default()
         })
         .await?;
@@ -339,7 +605,54 @@ async fn start_thread(mcp: &mut McpProcess) -> Result<String> {
     Ok(thread.id)
 }
 
+fn write_rawr_config(codex_home: &std::path::Path, server_uri: &str) -> Result<()> {
+    write_mock_responses_config_toml(
+        codex_home,
+        server_uri,
+        &BTreeMap::from([(Feature::RawrAutoCompaction, true)]),
+        /*auto_compact_limit*/ i64::MAX,
+        /*requires_openai_auth*/ None,
+        "mock_provider",
+        COMPACT_PROMPT,
+    )?;
+    let config_path = codex_home.join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        config.replacen(
+            "model_auto_compact_token_limit",
+            "model_context_window = 100000\nmodel_auto_compact_token_limit",
+            1,
+        ),
+    )?;
+    Ok(())
+}
+
+fn append_config_toml(codex_home: &std::path::Path, contents: &str) -> Result<()> {
+    let config_path = codex_home.join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path)?;
+    config.push_str(contents);
+    std::fs::write(config_path, config)?;
+    Ok(())
+}
+
+fn write_judgment_prompt(codex_home: &std::path::Path, file_name: &str) -> Result<()> {
+    let prompt_dir = codex_home.join("auto-compact");
+    std::fs::create_dir_all(&prompt_dir)?;
+    std::fs::write(
+        prompt_dir.join(file_name),
+        "Return JSON with should_compact and reason.",
+    )?;
+    Ok(())
+}
+
 async fn send_turn_and_wait(mcp: &mut McpProcess, thread_id: &str, text: &str) -> Result<String> {
+    let turn_id = send_turn(mcp, thread_id, text).await?;
+    wait_for_turn_completed(mcp, &turn_id).await?;
+    Ok(turn_id)
+}
+
+async fn send_turn(mcp: &mut McpProcess, thread_id: &str, text: &str) -> Result<String> {
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread_id.to_string(),
@@ -356,8 +669,40 @@ async fn send_turn_and_wait(mcp: &mut McpProcess, thread_id: &str, text: &str) -
     )
     .await??;
     let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
-    wait_for_turn_completed(mcp, &turn.id).await?;
     Ok(turn.id)
+}
+
+async fn wait_for_turn_completed_before_context_compaction_started(
+    mcp: &mut McpProcess,
+    turn_id: &str,
+) -> Result<()> {
+    let notification: JSONRPCNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_matching_notification(
+            "turn/completed or context compaction item/started",
+            |notification| {
+                if notification.method == "turn/completed" {
+                    return true;
+                }
+                notification.method == "item/started"
+                    && notification
+                        .params
+                        .as_ref()
+                        .and_then(|params| {
+                            serde_json::from_value::<ItemStartedNotification>(params.clone()).ok()
+                        })
+                        .is_some_and(|started| {
+                            matches!(started.item, ThreadItem::ContextCompaction { .. })
+                        })
+            },
+        ),
+    )
+    .await??;
+    assert_eq!(notification.method, "turn/completed");
+    let completed: TurnCompletedNotification =
+        serde_json::from_value(notification.params.expect("turn/completed params"))?;
+    assert_eq!(completed.turn.id, turn_id);
+    Ok(())
 }
 
 async fn wait_for_turn_completed(mcp: &mut McpProcess, turn_id: &str) -> Result<()> {
@@ -405,6 +750,24 @@ async fn wait_for_context_compaction_completed(
             serde_json::from_value(notification.params.clone().expect("item/completed params"))?;
         if let ThreadItem::ContextCompaction { .. } = completed.item {
             return Ok(completed);
+        }
+    }
+}
+
+async fn wait_for_warning(
+    mcp: &mut McpProcess,
+    message_prefix: &str,
+) -> Result<WarningNotification> {
+    loop {
+        let notification: JSONRPCNotification = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("warning"),
+        )
+        .await??;
+        let warning: WarningNotification =
+            serde_json::from_value(notification.params.expect("warning params"))?;
+        if warning.message.starts_with(message_prefix) {
+            return Ok(warning);
         }
     }
 }

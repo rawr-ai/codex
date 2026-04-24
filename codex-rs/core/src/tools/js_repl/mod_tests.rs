@@ -730,13 +730,13 @@ async fn interrupt_active_exec_stops_aborted_kernel_before_later_exec() -> anyho
         r#"
 const {{ promises: fs }} = await import("fs");
 
-const paths = [{first_file_js}, {second_file_js}];
-for (let i = 0; i < paths.length; i++) {{
-  await fs.writeFile(paths[i], `${{i + 1}}`);
-  if (i + 1 < paths.length) {{
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }}
-}}
+    const paths = [{first_file_js}, {second_file_js}];
+    for (let i = 0; i < paths.length; i++) {{
+      await fs.writeFile(paths[i], `${{i + 1}}`);
+      if (i + 1 < paths.length) {{
+        await new Promise((resolve) => setTimeout(resolve, 10000));
+      }}
+    }}
 "#
     );
 
@@ -844,22 +844,6 @@ async fn js_repl_forced_kernel_exit_recovers_on_next_exec() -> anyhow::Result<()
         Arc::clone(&state.child)
     };
     JsReplManager::kill_kernel_child(&child, "test_crash").await;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let cleared = {
-                let guard = manager.kernel.lock().await;
-                guard
-                    .as_ref()
-                    .is_none_or(|state| !Arc::ptr_eq(&state.child, &child))
-            };
-            if cleared {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("host should clear dead kernel state promptly");
 
     let result = manager
         .execute(

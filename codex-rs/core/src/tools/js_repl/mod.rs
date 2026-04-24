@@ -867,6 +867,13 @@ impl JsReplManager {
 
         let (stdin, pending_execs, exec_contexts, child, recent_stderr) = {
             let mut kernel = self.kernel.lock().await;
+            let stale_kernel = match kernel.as_ref() {
+                Some(state) => Self::kernel_child_has_exited(&state.child).await,
+                None => false,
+            };
+            if stale_kernel {
+                kernel.take();
+            }
             if kernel.is_none() {
                 let dependency_env = session.dependency_env().await;
                 let mut state = self
@@ -1233,6 +1240,18 @@ impl JsReplManager {
             pid,
             status,
             stderr_tail,
+        }
+    }
+
+    async fn kernel_child_has_exited(child: &Arc<Mutex<Child>>) -> bool {
+        let mut guard = child.lock().await;
+        match guard.try_wait() {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(err) => {
+                warn!(error = %err, "failed to inspect js_repl kernel before reuse");
+                false
+            }
         }
     }
 

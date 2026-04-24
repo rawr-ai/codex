@@ -139,6 +139,8 @@ jobs:
     runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     needs: changed
+    env:
+      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
     strategy:
       fail-fast: false
       matrix:
@@ -147,14 +149,11 @@ jobs:
             runner: ubuntu-24.04
             timeout_minutes: 30
           - name: macOS
-            runner: macos-15-xlarge
+            runner: macos-15
             timeout_minutes: 30
           - name: Windows
-            runner: windows-x64
+            runner: windows-latest
             timeout_minutes: 30
-            runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
     steps:
       - name: Check whether argument comment lint should run
         id: argument_comment_lint_gate
@@ -170,10 +169,15 @@ jobs:
 
           echo "No argument-comment-lint relevant changes."
           echo "run=false" >> "$GITHUB_OUTPUT"
+      - name: Skip macOS argument comment lint without BuildBuddy
+        if: steps.argument_comment_lint_gate.outputs.run == 'true' && runner.os == 'macOS' && env.BUILDBUDDY_API_KEY == ''
+        shell: bash
+        run: |
+          echo "::notice::Skipping macOS argument comment lint in this fork because the hermetic Apple SDK is only available through the authenticated BuildBuddy downloader/cache path."
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        if: ${{ steps.argument_comment_lint_gate.outputs.run == 'true' }}
+        if: steps.argument_comment_lint_gate.outputs.run == 'true' && (runner.os != 'macOS' || env.BUILDBUDDY_API_KEY != '')
       - name: Run argument comment lint on codex-rs via Bazel
-        if: ${{ steps.argument_comment_lint_gate.outputs.run == 'true' }}
+        if: steps.argument_comment_lint_gate.outputs.run == 'true' && (runner.os != 'macOS' || env.BUILDBUDDY_API_KEY != '')
         uses: ./.github/actions/run-argument-comment-lint
         with:
           target: ${{ runner.os }}

@@ -19,9 +19,11 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use rmcp::model::RequestId;
 use tokio::sync::oneshot;
 
+use crate::rawr_auto_compaction::RawrAutoCompactionSignals;
 use crate::session::turn_context::TurnContext;
 use crate::tasks::AnySessionTask;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsage;
 
@@ -85,9 +87,9 @@ impl ActiveTurn {
         self.tasks.insert(sub_id, task);
     }
 
-    pub(crate) fn remove_task(&mut self, sub_id: &str) -> bool {
-        self.tasks.swap_remove(sub_id);
-        self.tasks.is_empty()
+    pub(crate) fn detach_task(&mut self, sub_id: &str) -> (Option<RunningTask>, bool) {
+        let task = self.tasks.swap_remove(sub_id);
+        (task, self.tasks.is_empty())
     }
 
     pub(crate) fn drain_tasks(&mut self) -> Vec<RunningTask> {
@@ -107,6 +109,8 @@ pub(crate) struct TurnState {
     mailbox_delivery_phase: MailboxDeliveryPhase,
     granted_permissions: Option<AdditionalPermissionProfile>,
     strict_auto_review_enabled: bool,
+    rawr_auto_compaction_signals: RawrAutoCompactionSignals,
+    rawr_completed_plan_steps: usize,
     pub(crate) tool_calls: u64,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
@@ -262,6 +266,22 @@ impl TurnState {
 
     pub(crate) fn strict_auto_review_enabled(&self) -> bool {
         self.strict_auto_review_enabled
+    }
+
+    pub(crate) fn rawr_auto_compaction_signals(&self) -> RawrAutoCompactionSignals {
+        self.rawr_auto_compaction_signals.clone()
+    }
+
+    pub(crate) fn rawr_auto_compaction_signals_mut(&mut self) -> &mut RawrAutoCompactionSignals {
+        &mut self.rawr_auto_compaction_signals
+    }
+
+    pub(crate) fn note_rawr_plan_update(&mut self, update: &UpdatePlanArgs) {
+        crate::rawr_auto_compaction::rawr_note_plan_update(
+            &mut self.rawr_auto_compaction_signals,
+            &mut self.rawr_completed_plan_steps,
+            update,
+        );
     }
 }
 

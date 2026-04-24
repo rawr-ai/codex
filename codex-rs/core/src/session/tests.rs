@@ -6060,8 +6060,12 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     .await
     .expect("inject pending input into active turn");
 
-    sess.on_task_finished(Arc::clone(&tc), /*last_agent_message*/ None)
-        .await;
+    sess.on_task_finished(
+        Arc::clone(&tc),
+        /*last_agent_message*/ None,
+        TaskKind::Regular,
+    )
+    .await;
 
     let history = sess.clone_history().await;
     let expected = ResponseItem::Message {
@@ -6769,7 +6773,7 @@ async fn sample_rollout(
         std::iter::once(&user1),
         reconstruction_turn.truncation_policy,
     );
-    rollout_items.push(RolloutItem::ResponseItem(user1.clone()));
+    rollout_items.push(RolloutItem::ResponseItem(user1));
 
     let assistant1 = ResponseItem::Message {
         id: None,
@@ -6784,7 +6788,7 @@ async fn sample_rollout(
         std::iter::once(&assistant1),
         reconstruction_turn.truncation_policy,
     );
-    rollout_items.push(RolloutItem::ResponseItem(assistant1.clone()));
+    rollout_items.push(RolloutItem::ResponseItem(assistant1));
 
     let summary1 = "summary one";
     let snapshot1 = live_history
@@ -6811,7 +6815,7 @@ async fn sample_rollout(
         std::iter::once(&user2),
         reconstruction_turn.truncation_policy,
     );
-    rollout_items.push(RolloutItem::ResponseItem(user2.clone()));
+    rollout_items.push(RolloutItem::ResponseItem(user2));
 
     let assistant2 = ResponseItem::Message {
         id: None,
@@ -6826,7 +6830,7 @@ async fn sample_rollout(
         std::iter::once(&assistant2),
         reconstruction_turn.truncation_policy,
     );
-    rollout_items.push(RolloutItem::ResponseItem(assistant2.clone()));
+    rollout_items.push(RolloutItem::ResponseItem(assistant2));
 
     let summary2 = "summary two";
     let snapshot2 = live_history

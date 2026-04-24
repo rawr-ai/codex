@@ -179,6 +179,127 @@ pub struct ToolSuggestConfig {
     pub discoverables: Vec<ToolSuggestDiscoverable>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionMode {
+    Tag,
+    Suggest,
+    Auto,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionPacketAuthor {
+    Watcher,
+    Agent,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RawrAutoCompactionBoundary {
+    Commit,
+    PlanCheckpoint,
+    PlanUpdate,
+    PrCheckpoint,
+    AgentDone,
+    TopicShift,
+    ConcludingThought,
+    TurnComplete,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionPolicyToml {
+    pub early: Option<RawrAutoCompactionPolicyTierToml>,
+    pub ready: Option<RawrAutoCompactionPolicyTierToml>,
+    pub asap: Option<RawrAutoCompactionPolicyTierToml>,
+    pub emergency: Option<RawrAutoCompactionPolicyTierToml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionPolicyTierToml {
+    /// Trigger threshold for this tier. When `percent_remaining < percent_remaining_lt`,
+    /// this tier is eligible.
+    pub percent_remaining_lt: Option<i64>,
+    /// Boundaries that may trigger compaction for this tier. If unset, defaults are used.
+    pub requires_any_boundary: Option<Vec<RawrAutoCompactionBoundary>>,
+    /// When enabled, plan boundaries only count when there is a semantic break unless
+    /// a non-plan boundary is also present.
+    pub plan_boundaries_require_semantic_break: Option<bool>,
+    /// Optional prompt file used to make a judgment call before compaction triggers.
+    pub decision_prompt_path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionSemanticSignalsToml {
+    /// Phrases that mark finalized assistant output as an agent-done boundary.
+    pub agent_done_phrases: Option<Vec<String>>,
+    /// Phrases that prevent finalized assistant output from being treated as agent-done.
+    pub agent_done_negative_phrases: Option<Vec<String>>,
+    /// Phrases that mark finalized assistant output as a topic-shift boundary.
+    pub topic_shift_phrases: Option<Vec<String>>,
+    /// Phrases that mark finalized assistant output as a concluding-thought boundary.
+    pub concluding_thought_phrases: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct RawrAutoCompactionSettingsToml {
+    pub enabled: Option<bool>,
+    pub mode: Option<RawrAutoCompactionMode>,
+    pub packet_author: Option<RawrAutoCompactionPacketAuthor>,
+    /// When enabled, the watcher may ask the in-session agent to write a scratchpad file
+    /// before compaction so verbatim research notes survive history rewrite.
+    pub scratch_write_enabled: Option<bool>,
+    /// Max chars of tail context included in watcher-side packet prompts.
+    pub packet_max_tail_chars: Option<usize>,
+    /// Optional model override used for watcher-triggered compactions.
+    pub compaction_model: Option<String>,
+    /// Optional override for the agent-authored packet prompt path.
+    pub auto_compact_prompt_path: Option<String>,
+    /// Optional override for the scratch-write prompt path.
+    pub scratch_write_prompt_path: Option<String>,
+    /// Optional override for the watcher-authored packet prompt path.
+    pub watcher_packet_prompt_path: Option<String>,
+    /// Optional override for the judgment context template path.
+    pub judgment_context_prompt_path: Option<String>,
+    /// Relative scratch path template. Supports `{agentName}`, `{agent_name}`, and `{threadId}`.
+    pub scratch_file_template: Option<String>,
+    /// Phrase lists used to derive semantic natural-boundary signals from finalized output.
+    pub semantic_signals: Option<RawrAutoCompactionSemanticSignalsToml>,
+    /// Per-tier thresholds, boundary requirements, and optional judgment prompts.
+    pub policy: Option<RawrAutoCompactionPolicyToml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(untagged)]
+pub enum RawrAutoCompactionToml {
+    Enabled(bool),
+    Config(Box<RawrAutoCompactionSettingsToml>),
+}
+
+impl RawrAutoCompactionToml {
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::Enabled(enabled) => *enabled,
+            Self::Config(settings) => settings.enabled.unwrap_or(true),
+        }
+    }
+
+    pub fn settings(&self) -> Option<&RawrAutoCompactionSettingsToml> {
+        match self {
+            Self::Enabled(_) => None,
+            Self::Config(settings) => Some(settings),
+        }
+    }
+}
+
 /// Memories settings loaded from config.toml.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]

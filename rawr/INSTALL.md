@@ -81,8 +81,8 @@ rawr_auto_compaction = true
 
 When enabled:
 - This fork owns compaction timing (Codex’s built-in auto-compaction is bypassed).
-- The watcher can compact **mid-turn** (between sampling requests) at natural boundaries, and can also compact at turn completion.
-- Core writes a best-effort, side-channel structured state store under `~/.codex-rawr/rawr/auto_compaction/threads/<thread_id>/` for later inspectability (no transcript pollution).
+- The fork can compact at natural boundaries and at turn completion using current core session/task ownership.
+- Turn-complete RAWR runs after `TurnComplete`, evaluates live turn signals, optionally runs a non-transcript judgment gate, and then uses the normal local/remote compaction runners.
 
 Default behavior: suggest mode (prints a recommendation once context window drops below 75% remaining).
 
@@ -93,28 +93,32 @@ mode = "auto" # tag | suggest | auto
 packet_author = "agent" # watcher | agent
 scratch_write_enabled = true
 packet_max_tail_chars = 1200
-# Defaults to "GPT-5.2 (high)" for watcher-triggered compactions:
-# gpt-5.2 + ReasoningEffort::High.
 # compaction_model = "gpt-5.2"
-# compaction_reasoning_effort = "high"
-# compaction_verbosity = "high"
+# auto_compact_prompt_path = "auto-compact.md"
+# scratch_write_prompt_path = "scratch-write.md"
+# watcher_packet_prompt_path = "watcher-packet.md"
+# judgment_context_prompt_path = "judgment-context.md"
+# scratch_file_template = ".scratch/agent-{agentName}.scratch.md"
 
-[rawr_auto_compaction.repo_observation]
-graphite_enabled = true
-graphite_max_chars = 4096
+[rawr_auto_compaction.semantic_signals]
+# Override these lists when local workflow language differs from the defaults.
+# agent_done_phrases = ["done", "completed", "finished", "shipped", "pushed"]
+# agent_done_negative_phrases = ["not done", "not completed", "not finished"]
+# topic_shift_phrases = ["moving on", "switching to", "next:", "next up"]
+# concluding_thought_phrases = ["in summary", "final thoughts", "next steps"]
 
 # Preferred: config-driven per-tier policy matrix (overrides thresholds + boundaries).
 [rawr_auto_compaction.policy.early]
 percent_remaining_lt = 85
 requires_any_boundary = ["plan_checkpoint", "plan_update", "pr_checkpoint", "topic_shift"]
 plan_boundaries_require_semantic_break = true
-# decision_prompt_path = "~/.codex-rawr/prompts/rawr-auto-compaction-judgment.md"
+# decision_prompt_path = "judgment.md"
 
 [rawr_auto_compaction.policy.ready]
 percent_remaining_lt = 75
 requires_any_boundary = ["commit", "plan_checkpoint", "plan_update", "pr_checkpoint", "topic_shift"]
 plan_boundaries_require_semantic_break = true
-# decision_prompt_path = "~/.codex-rawr/prompts/rawr-auto-compaction-judgment.md"
+# decision_prompt_path = "judgment.md"
 
 [rawr_auto_compaction.policy.asap]
 percent_remaining_lt = 65
@@ -126,12 +130,20 @@ percent_remaining_lt = 15
 ```
 
 ## Packet prompt + defaults (auditable/editable)
-The prompt lives in-repo at `rawr/prompts/rawr-auto-compact.md` and is embedded into the binary at build time.
+At runtime, editable prompt files live under `CODEX_HOME/auto-compact/`:
 
-- YAML frontmatter: default thresholds/boundaries (config overrides win).
-- Markdown body: continuation packet prompt when `packet_author = "agent"`.
+- `auto-compact.md`: continuation packet prompt used for internal pre-compact artifact generation when `packet_author = "agent"`.
+- `scratch-write.md`: scratch-write prompt used for internal scratch generation when `scratch_write_enabled = true`.
+- `judgment.md`: optional judgment gate prompt referenced by `decision_prompt_path`.
+- `judgment-context.md`: template expanded into the judgment call context.
+- `watcher-packet.md`: watcher-authored fallback packet template used when `packet_author = "watcher"` or agent packet generation fails.
+
+If these files are missing, Codex creates them with built-in defaults. Config-driven thresholds and boundaries still live in `config.toml`; config overrides win.
+
 - Compaction decision: code-driven tier policy + boundary gating; plan-based boundaries additionally require a semantic break (agent-done/topic-shift/concluding) in Early/Ready tiers so we don’t compact mid-thought just because the plan tool ran.
-- Scratch write prompt: `rawr/prompts/rawr-scratch-write.md` (enabled by `scratch_write_enabled = true`).
+- `packet_author = "watcher"` keeps the continuation packet watcher-authored; `packet_author = "agent"` uses an internal non-transcript model call to generate the continuation packet before compaction.
+- Prompt path overrides are resolved relative to `CODEX_HOME/auto-compact/` unless absolute.
+- `scratch_file_template` is a safe relative path template with `{agentName}`, `{agent_name}`, and `{threadId}` placeholders.
 
 ## Using with Happy Coder
 Happy Coder’s CLI supports `happy codex` (Codex mode). If your `PATH` resolves `codex` to this fork (e.g. via the symlink above), `happy codex` will launch the fork.
@@ -184,6 +196,14 @@ The script verifies both versions and hashes after patching. If `/Applications/C
 ```bash
 sudo CODEX_RAWR_BIN="$HOME/.local/bin/codex-rawr-bin" bash rawr/patch-desktop-app.sh --apply
 ```
+
+For a post-update check that only patches when the Desktop helper no longer matches the rawr binary:
+
+```bash
+bash rawr/patch-desktop-app.sh --ensure
+```
+
+This is the preferred command for a manual post-update hook or LaunchAgent. It compares hashes first, so repeated runs do not create extra backups when the app bundle is already patched.
 
 ### Desktop rollback
 Use the latest backup created during patching:

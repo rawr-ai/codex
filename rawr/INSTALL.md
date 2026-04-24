@@ -197,6 +197,14 @@ The script verifies both versions and hashes after patching. If `/Applications/C
 sudo CODEX_RAWR_BIN="$HOME/.local/bin/codex-rawr-bin" bash rawr/patch-desktop-app.sh --apply
 ```
 
+For a post-update check that only patches when the Desktop helper no longer matches the rawr binary:
+
+```bash
+bash rawr/patch-desktop-app.sh --ensure
+```
+
+This is the preferred command for a manual post-update hook or LaunchAgent. It compares hashes first, so repeated runs do not create extra backups when the app bundle is already patched.
+
 ### Desktop rollback
 Use the latest backup created during patching:
 

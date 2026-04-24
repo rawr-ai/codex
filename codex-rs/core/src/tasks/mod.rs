@@ -1000,7 +1000,7 @@ impl Session {
         {
             Arc::new(
                 turn_context
-                    .with_model(model, self.services.models_manager.as_ref())
+                    .with_model(model, &self.services.models_manager)
                     .await,
             )
         } else {

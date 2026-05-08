@@ -1,13 +1,15 @@
 # RAWR Auto-Compaction — Canonical System + State Machine Spec
 
-Status: living spec (fork-specific, current behavior + intent)
+Status: living spec, but mixed history. The current durable branch uses core session/task lifecycle ownership for turn-complete RAWR plus internal non-transcript judgment/artifact calls. Older sections below that describe TUI watcher-owned orchestration or `Op::RawrAutoCompactionJudgment` are historical reference, not current implementation truth.
 
-This document is the **canonical packet** describing how RAWR auto-compaction works end-to-end in this fork:
+This document is the **canonical packet** describing how RAWR auto-compaction works end-to-end in this fork.
+Current implementation truth is the core session/task lifecycle path; older watcher-oriented sections are retained
+only as design history until this spec is fully collapsed:
 
-- **Actors / systems** (TUI watcher, core sampling loop, compaction task, model provider)
+- **Actors / systems** (core session/task lifecycle, compaction task, model provider)
 - **Config + prompts** (what exists, where it is loaded from, when it is used)
-- **State machines** (TUI watcher and core mid-turn), and the **decision policy** (tiers/boundaries/judgment)
-- **All major paths** (watcher auto, watcher suggest/tag, watcher preflight, core mid-turn, built-in auto-compact)
+- **State machines** (turn-complete lifecycle and mid-turn), and the **decision policy** (tiers/boundaries/judgment)
+- **All major paths** (turn-complete auto-compaction, mid-turn compaction, built-in auto-compact)
 - **Constraints + rationale** (what we optimized for, what we explicitly avoided)
 
 If the UX still feels bad (too eager, confusing, brittle), this doc is intended to make it obvious whether the root cause is:
@@ -26,18 +28,19 @@ If the UX still feels bad (too eager, confusing, brittle), this doc is intended 
 
 Fork-specific RAWR features (guarded behind `Feature::RawrAutoCompaction`):
 
-- TUI watcher compaction orchestration (turn-complete + preflight)
-  - `codex-rs/tui/src/chatwidget.rs`
+- Core session/task compaction orchestration after `EventMsg::TurnComplete`
+  - `codex-rs/core/src/session/mod.rs`
+  - `codex-rs/core/src/tasks/mod.rs`
 - Core mid-turn RAWR compaction orchestration (inside one user turn)
-  - `codex-rs/core/src/codex.rs`
   - `codex-rs/core/src/rawr_auto_compaction.rs`
 - Scratch-write pre-compact request (`.scratch/agent-<name>.scratch.md`)
-  - core + TUI
+  - core internal non-transcript model calls
 - Config-driven tier policy matrix: `rawr_auto_compaction.policy.<tier>`
-  - core + TUI
+  - core
 - Optional **internal / non-transcript** judgment decision step
-  - protocol `Op::RawrAutoCompactionJudgment` + `EventMsg::RawrAutoCompactionJudgmentResult`
-  - core implementation in `codex-rs/core/src/rawr_auto_compaction_judgment.rs`
+  - `codex-rs/core/src/rawr_auto_compaction_model.rs`
+- Prompt/config/path helpers
+  - `codex-rs/core/src/rawr_prompts.rs`
 
 ### What we do not alter (Codex-native / upstream behaviors)
 
@@ -54,24 +57,23 @@ Fork-specific RAWR features (guarded behind `Feature::RawrAutoCompaction`):
 
 - **User**: human driving the CLI.
 - **In-session agent**: the assistant responding to the user (model sampling loop).
-- **Watcher (TUI)**: deterministic orchestrator in the TUI that decides *when* to compact at turn completion.
+- **Core session/task lifecycle**: deterministic orchestrator that evaluates turn-complete signals and decides *when* to compact.
 - **Core**: the engine that runs sampling loops, executes tasks, and mutates session state/history.
 - **Model provider / backend**: OpenAI (or other providers) handling model requests.
 - **Filesystem**: scratchpad persistence under `.scratch/`.
 
 ### Components (where to look in code)
 
-- TUI watcher and injection:
-  - `codex-rs/tui/src/chatwidget.rs`
+- Turn-complete lifecycle hook and injection:
+  - `codex-rs/core/src/session/mod.rs`
+  - `codex-rs/core/src/tasks/mod.rs`
 - Core mid-turn RAWR compaction:
-  - `codex-rs/core/src/codex.rs` (sampling loop)
   - `codex-rs/core/src/rawr_auto_compaction.rs` (tier policy + prompt building)
 - Compaction task (history rewrite):
   - `codex-rs/core/src/compact.rs`
   - `codex-rs/core/src/compaction_audit.rs`
 - Judgment (internal model call, non-transcript):
-  - `codex-rs/core/src/rawr_auto_compaction_judgment.rs`
-  - protocol definitions in `codex-rs/protocol/src/protocol.rs`
+  - `codex-rs/core/src/rawr_auto_compaction_model.rs`
 
 ---
 
@@ -116,11 +118,21 @@ If this is `false`, RAWR watcher and mid-turn logic do not run (and built-in aut
 mode = "auto"          # tag | suggest | auto
 packet_author = "agent" # watcher | agent
 scratch_write_enabled = true
+packet_max_tail_chars = 1200
 
 # Optional overrides used for watcher-triggered compaction tasks
 # compaction_model = "gpt-5.2"
-# compaction_reasoning_effort = "high"
-# compaction_verbosity = "high"
+auto_compact_prompt_path = "auto-compact.md"
+scratch_write_prompt_path = "scratch-write.md"
+watcher_packet_prompt_path = "watcher-packet.md"
+judgment_context_prompt_path = "judgment-context.md"
+scratch_file_template = ".scratch/agent-{agentName}.scratch.md"
+
+[rawr_auto_compaction.semantic_signals]
+agent_done_phrases = ["done", "completed", "finished", "shipped", "pushed"]
+agent_done_negative_phrases = ["not done", "not completed", "not finished"]
+topic_shift_phrases = ["moving on", "switching to", "next:", "next up"]
+concluding_thought_phrases = ["in summary", "final thoughts", "next steps"]
 
 [rawr_auto_compaction.policy.early]
 percent_remaining_lt = 85
@@ -143,24 +155,20 @@ percent_remaining_lt = 15
 # Emergency tier is a hard bypass; boundaries/judgment are ignored
 ```
 
-### Optional: structured state store + repo observation (fork-only, best-effort)
+### Runtime signal collection (current durable path)
 
-When `Feature::RawrAutoCompaction` is enabled, core also writes a **side-channel** structured state store
-under `codex_home/rawr/auto_compaction/threads/<thread_id>/`:
+The durable branch no longer treats a side-channel JSONL store as the runtime control plane.
+Instead, turn-complete RAWR derives its boundary snapshot from current upstream-native session
+events:
 
-- `events.jsonl`: structured boundary events (turn start, plan update/checkpoint, commit, PR checkpoint, semantic boundaries, compaction completed), optionally including repo snapshots.
-- `decisions.jsonl`: shadow arbiter decisions derived from policy + state (record-only; not enforced yet). To avoid noise, decisions are only persisted when the system is under token-pressure (tier eligible) or after compaction completes.
-- `state.json`: latest snapshot (turn signals, last repo snapshot, last compaction, last decision).
+- `PlanUpdate` for plan update / checkpoint semantics
+- successful `ExecCommandEnd` for commit / PR checkpoint heuristics
+- finalized assistant output for semantic boundary heuristics (`agent_done`, `topic_shift`,
+  `concluding_thought`)
+- `TurnComplete` as the fallback natural boundary
 
-Note: token-pressure (mid-turn) shadow decisions are further deduped in-memory and only emitted when the tier escalates (e.g. `early` → `ready` → `asap` → `emergency`).
-
-Repo observation is lightweight and best-effort:
-
-```toml
-[rawr_auto_compaction.repo_observation]
-graphite_enabled = true
-graphite_max_chars = 4096
-```
+This keeps RAWR’s fork delta concentrated in policy and prompt behavior rather than maintaining a
+parallel event universe.
 
 #### Policy precedence rules (critical)
 
@@ -174,17 +182,21 @@ Both TUI watcher and core mid-turn use the same precedence:
 
 This lets you control “fires too often” primarily by adjusting config rather than code.
 
-### Important: `mode` only affects the TUI watcher
+### Important: `mode` affects turn-complete watcher orchestration
 
-`rawr_auto_compaction.mode` (`tag`/`suggest`/`auto`) is a **TUI watcher** behavior knob:
+`rawr_auto_compaction.mode` (`tag`/`suggest`/`auto`) is a watcher-style behavior knob for
+turn-complete orchestration:
 
 - `tag`: print “would compact” informational message
 - `suggest`: print “recommend compact” informational message
 - `auto`: actually run the watcher orchestration (packet/scratch/compact/handoff)
 
-Core mid-turn RAWR compaction **does not consult `mode`**; it is gated by the feature flag and the
-mid-turn decision policy (tiers/boundaries/judgment). This is intentional: mid-turn exists to prevent
-context exhaustion while the agent still needs follow-up inside the sampling loop.
+Core emergency/mid-turn RAWR compaction should not consult `mode`; it is gated by the feature flag
+and the mid-turn decision policy (tiers/boundaries/judgment). This is intentional: mid-turn exists
+to prevent context exhaustion while the agent still needs follow-up inside the sampling loop.
+
+The current session-lifecycle app-server parity hook runs after `TurnComplete`, so it follows the
+turn-complete watcher semantics above.
 
 ---
 
@@ -193,25 +205,43 @@ context exhaustion while the agent still needs follow-up inside the sampling loo
 ### Curated prompt files (codex_home/auto-compact)
 
 All RAWR auto-compaction prompts live under **codex_home/auto-compact/** at runtime. If the files
-do not exist, Codex seeds them from the in-repo defaults under `rawr/prompts/` so you can edit
-them without code changes.
+do not exist, Codex seeds them from embedded defaults in
+`codex-rs/core/src/rawr_prompts.rs` so you can edit them without code changes.
 
 | Prompt file | Used by | When used | How used |
 |---|---|---|---|
-| `codex_home/auto-compact/auto-compact.md` | Core + TUI | Pre-compact request: continuation packet | YAML frontmatter drives thresholds + packet rules; body becomes the packet prompt (supports `{scratchFile}` / `{scratch_file}` and `{threadId}`). |
-| `codex_home/auto-compact/scratch-write.md` | Core + TUI | Pre-compact request: scratch write | Template with `{scratchFile}` / `{scratch_file}` and `{threadId}`. Injected as a synthetic user turn (TUI watcher) or prepended before packet prompt (core mid-turn, and TUI when `packet_author="agent"`). |
-| `codex_home/auto-compact/judgment.md` | Core (executed), TUI (requests) | Optional decision step before compaction | Base instructions for the schema-constrained internal judgment call. TUI triggers via `Op::RawrAutoCompactionJudgment`, core emits `EventMsg::RawrAutoCompactionJudgmentResult`. |
+| `codex_home/auto-compact/auto-compact.md` | Core | Pre-compact request: continuation packet | Body becomes the agent-authored continuation packet instructions (supports `{scratchFile}` / `{scratch_file}` and `{threadId}`). |
+| `codex_home/auto-compact/scratch-write.md` | Core | Pre-compact request: scratch write | Template with `{scratchFile}` / `{scratch_file}` and `{threadId}` used for internal scratch generation before compaction. |
+| `codex_home/auto-compact/judgment.md` | Core | Optional decision step before compaction | Base instructions for the schema-constrained internal judgment call. |
 | `codex_home/auto-compact/judgment-context.md` | Core | Decision context template | Human-editable template expanded with runtime placeholders (see below). |
+| `codex_home/auto-compact/watcher-packet.md` | Core | Watcher-authored fallback packet | Template used for code-authored handoff packets. Supports `{triggerPercentRemaining}`, `{trigger_percent_remaining}`, `{boundarySignals}`, `{boundary_signals}`, `{lastAgentMessage}`, and `{last_agent_message}`. |
 | `rawr/prompts/rawr-auto-compact-heads-up.md` | Currently unused (spec only) | Proposed UX: heads-up before packet/compact | Exists as an artifact for a future “heads-up banner” UX. Not referenced by current code paths. |
+
+Each prompt path can be overridden in `config.toml` with:
+
+- `rawr_auto_compaction.auto_compact_prompt_path`
+- `rawr_auto_compaction.scratch_write_prompt_path`
+- `rawr_auto_compaction.watcher_packet_prompt_path`
+- `rawr_auto_compaction.judgment_context_prompt_path`
+
+Relative prompt paths resolve under `codex_home/auto-compact/`; absolute paths are read as given.
+
+Other externally tunable behavior controls:
+
+- `rawr_auto_compaction.semantic_signals.*` overrides the phrase lists used for `agent_done`,
+  `topic_shift`, and `concluding_thought` signal derivation.
+- `rawr_auto_compaction.scratch_file_template` controls the relative scratchpad path. It supports
+  `{agentName}`, `{agent_name}`, and `{threadId}`. Unsafe absolute or parent-traversing paths fall
+  back to `.scratch/agent-{agentName}.scratch.md`.
 
 ### Inline fallbacks (only if prompt files cannot be read)
 
 If the prompt directory is missing or unreadable, defaults embedded in the binary are used (and a
 warning is logged):
 
-- Defaults are embedded from `rawr/prompts/*` via `codex_core::rawr_prompts`.
-- Watcher-authored packet (when `packet_author="watcher"`) is still built in code:
-  - `ChatWidget::rawr_build_post_compact_packet(...)` in `codex-rs/tui/src/chatwidget.rs`
+- Defaults are embedded in `codex-rs/core/src/rawr_prompts.rs`.
+- Watcher-authored packet (when `packet_author="watcher"`) is still built in code from the live
+  signal snapshot after compaction completes.
 
 ### Judgment context placeholders (judgment-context.md)
 

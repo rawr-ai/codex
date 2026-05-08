@@ -48,6 +48,14 @@ def parse_args() -> argparse.Namespace:
         help="Optional workflow URL to reuse for native artifacts.",
     )
     parser.add_argument(
+        "--github-repo",
+        default=os.environ.get("CODEX_RELEASE_GITHUB_REPO", GITHUB_REPO),
+        help=(
+            "GitHub repo used to resolve rust-release workflow runs "
+            f"(default: {GITHUB_REPO}; env: CODEX_RELEASE_GITHUB_REPO)."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
@@ -78,12 +86,14 @@ def expand_packages(packages: list[str]) -> list[str]:
     return expanded
 
 
-def resolve_release_workflow(version: str) -> dict:
+def resolve_release_workflow(version: str, github_repo: str) -> dict:
     stdout = subprocess.check_output(
         [
             "gh",
             "run",
             "list",
+            "--repo",
+            github_repo,
             "--branch",
             f"rust-v{version}",
             "--json",
@@ -102,11 +112,13 @@ def resolve_release_workflow(version: str) -> dict:
     return workflow
 
 
-def resolve_workflow_url(version: str, override: str | None) -> tuple[str, str | None]:
+def resolve_workflow_url(
+    version: str, override: str | None, github_repo: str
+) -> tuple[str, str | None]:
     if override:
         return override, None
 
-    workflow = resolve_release_workflow(version)
+    workflow = resolve_release_workflow(version, github_repo)
     return workflow["url"], workflow.get("headSha")
 
 
@@ -157,7 +169,7 @@ def main() -> int:
     try:
         if native_components:
             workflow_url, resolved_head_sha = resolve_workflow_url(
-                args.release_version, args.workflow_url
+                args.release_version, args.workflow_url, args.github_repo
             )
             vendor_temp_root = Path(tempfile.mkdtemp(prefix="npm-native-", dir=runner_temp))
             install_native_components(workflow_url, native_components, vendor_temp_root)

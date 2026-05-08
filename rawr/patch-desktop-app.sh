@@ -18,6 +18,7 @@ Patch the local Desktop app bundle to run the current rawr CLI binary.
 Modes:
   --dry-run, --report       Report current state without changing files (default).
   --apply                   Backup bundled binary, install ~/.local/bin/codex-rawr-bin, then verify.
+  --ensure                  Apply only when bundled binary does not match rawr binary.
   --rollback [BACKUP_PATH]  Restore from a backup. Defaults to the latest rawr backup.
 
 Options:
@@ -162,6 +163,23 @@ apply_patch_to_app() {
   echo "Warning: Codex app updates can overwrite this local patch. Re-run --apply after updates."
 }
 
+ensure_patch() {
+  require_file "$BUNDLED_BIN" "bundled Codex binary"
+  require_file "$RAWR_BIN" "rawr Codex binary"
+
+  local bundled_hash rawr_hash
+  bundled_hash="$(hash_file "$BUNDLED_BIN")"
+  rawr_hash="$(hash_file "$RAWR_BIN")"
+
+  if [[ "$bundled_hash" == "$rawr_hash" ]]; then
+    log "Desktop app already uses rawr build: $(version_of "$BUNDLED_BIN")"
+    return 0
+  fi
+
+  log "Desktop app bundled binary differs from rawr build; patching"
+  apply_patch_to_app
+}
+
 rollback_patch() {
   local backup_path="$rollback_backup"
   if [[ -z "$backup_path" ]]; then
@@ -202,6 +220,10 @@ while [[ $# -gt 0 ]]; do
       mode="apply"
       shift
       ;;
+    --ensure)
+      mode="ensure"
+      shift
+      ;;
     --rollback)
       mode="rollback"
       rollback_backup="${2:-}"
@@ -230,6 +252,9 @@ case "$mode" in
     ;;
   apply)
     apply_patch_to_app
+    ;;
+  ensure)
+    ensure_patch
     ;;
   rollback)
     rollback_patch

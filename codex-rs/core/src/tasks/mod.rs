@@ -10,11 +10,14 @@ use std::time::Duration;
 use std::time::Instant;
 
 use futures::future::BoxFuture;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 use tokio::select;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
+use tracing::debug;
 use tracing::info_span;
 use tracing::trace;
 use tracing::warn;
@@ -50,6 +53,10 @@ use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 
+use codex_analytics::CompactionPhase;
+use codex_analytics::CompactionReason;
+use codex_config::types::RawrAutoCompactionMode;
+use codex_config::types::RawrAutoCompactionPacketAuthor;
 use codex_features::Feature;
 use codex_protocol::models::ContentItem;
 pub(crate) use compact::CompactTask;
@@ -378,8 +385,16 @@ impl Session {
                 }
                 if !task_cancellation_token.is_cancelled() {
                     // Emit completion uniformly from spawn site so all tasks share the same lifecycle.
-                    sess.on_task_finished(Arc::clone(&ctx_for_finish), last_agent_message)
+                    let finished_task = sess
+                        .on_task_finished(
+                            Arc::clone(&ctx_for_finish),
+                            last_agent_message,
+                            task_kind,
+                        )
                         .await;
+                    done_clone.notify_waiters();
+                    drop(finished_task);
+                    return;
                 }
                 done_clone.notify_waiters();
             }
@@ -495,27 +510,23 @@ impl Session {
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         last_agent_message: Option<String>,
-    ) {
+        task_kind: TaskKind,
+    ) -> Option<RunningTask> {
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
 
+        let last_agent_message_for_rawr = last_agent_message.clone();
         let mut pending_input = Vec::<ResponseInputItem>::new();
-        let mut should_clear_active_turn = false;
         let mut token_usage_at_turn_start = None;
         let mut turn_had_memory_citation = false;
         let mut turn_tool_calls = 0_u64;
         let turn_state = {
-            let mut active = self.active_turn.lock().await;
-            if let Some(at) = active.as_mut()
-                && at.remove_task(&turn_context.sub_id)
+            let active = self.active_turn.lock().await;
+            if let Some(at) = active.as_ref()
+                && at.tasks.contains_key(&turn_context.sub_id)
             {
-                should_clear_active_turn = true;
-                let turn_state = Arc::clone(&at.turn_state);
-                if should_clear_active_turn {
-                    *active = None;
-                }
-                Some(turn_state)
+                Some(Arc::clone(&at.turn_state))
             } else {
                 None
             }
@@ -654,6 +665,42 @@ impl Session {
             .lock()
             .await
             .clear_turn(&turn_context.sub_id);
+        let rawr_signals = if task_kind == TaskKind::Regular {
+            Some(
+                self.rawr_auto_compaction_signals_for_turn(&turn_context.sub_id)
+                    .await,
+            )
+        } else {
+            None
+        };
+
+        let (finished_task, should_clear_active_turn) = {
+            let mut active = self.active_turn.lock().await;
+            if let Some(at) = active.as_mut()
+                && at.tasks.contains_key(&turn_context.sub_id)
+            {
+                let (finished_task, should_clear) = at.detach_task(&turn_context.sub_id);
+                if should_clear {
+                    *active = None;
+                }
+                (finished_task, should_clear)
+            } else {
+                (None, false)
+            }
+        };
+
+        if task_kind == TaskKind::Regular {
+            debug!(
+                turn_id = %turn_context.sub_id,
+                "checking rawr post-turn auto-compaction"
+            );
+            self.maybe_run_rawr_post_turn_auto_compaction(
+                Arc::clone(&turn_context),
+                last_agent_message_for_rawr,
+                rawr_signals.unwrap_or_default(),
+            )
+            .await;
+        }
 
         if should_clear_active_turn {
             let session = Arc::clone(self);
@@ -663,6 +710,345 @@ impl Session {
                 });
             });
         }
+
+        finished_task
+    }
+
+    async fn maybe_run_rawr_post_turn_auto_compaction(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        last_agent_message: Option<String>,
+        signals: crate::rawr_auto_compaction::RawrAutoCompactionSignals,
+    ) {
+        if !turn_context.features.enabled(Feature::RawrAutoCompaction) {
+            debug!(
+                turn_id = %turn_context.sub_id,
+                "rawr auto-compaction skipped: feature disabled"
+            );
+            return;
+        }
+
+        let Some(model_context_window) = turn_context.model_context_window() else {
+            debug!(
+                turn_id = %turn_context.sub_id,
+                "rawr auto-compaction skipped: model context window missing"
+            );
+            return;
+        };
+        if model_context_window <= 0 {
+            debug!(
+                turn_id = %turn_context.sub_id,
+                model_context_window,
+                "rawr auto-compaction skipped: invalid model context window"
+            );
+            return;
+        }
+
+        let total_usage_tokens = self.get_total_token_usage().await;
+        let remaining = model_context_window.saturating_sub(total_usage_tokens);
+        let percent_remaining =
+            (remaining.saturating_mul(100) / model_context_window).clamp(0, 100);
+        if !crate::rawr_auto_compaction::rawr_should_compact_at_turn_complete(
+            turn_context.config.as_ref(),
+            percent_remaining,
+            &signals,
+        ) {
+            debug!(
+                turn_id = %turn_context.sub_id,
+                total_usage_tokens,
+                model_context_window,
+                percent_remaining,
+                "rawr auto-compaction skipped: policy not eligible"
+            );
+            return;
+        }
+        debug!(
+            turn_id = %turn_context.sub_id,
+            total_usage_tokens,
+            model_context_window,
+            percent_remaining,
+            "rawr auto-compaction eligible"
+        );
+        let Some(tier) = crate::rawr_auto_compaction::rawr_compaction_tier(
+            turn_context.config.as_ref(),
+            percent_remaining,
+        ) else {
+            debug!(
+                turn_id = %turn_context.sub_id,
+                percent_remaining,
+                "rawr auto-compaction skipped: eligible state had no tier"
+            );
+            return;
+        };
+        let is_emergency = matches!(
+            tier,
+            crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency
+        );
+        let boundaries_present =
+            crate::rawr_auto_compaction::rawr_boundaries_present(&signals, true);
+
+        match crate::rawr_auto_compaction::rawr_auto_compaction_mode(turn_context.config.as_ref()) {
+            RawrAutoCompactionMode::Tag | RawrAutoCompactionMode::Suggest => {
+                self.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::Warning(WarningEvent {
+                        message: format!(
+                            "rawr auto-compaction is eligible at {percent_remaining}% context remaining."
+                        ),
+                    }),
+                )
+                .await;
+                return;
+            }
+            RawrAutoCompactionMode::Auto => {}
+        }
+
+        if !is_emergency
+            && let Some(decision_prompt_path) =
+                crate::rawr_auto_compaction::rawr_policy_decision_prompt_path(
+                    turn_context.config.as_ref(),
+                    tier,
+                )
+        {
+            match crate::rawr_auto_compaction_model::request_rawr_auto_compaction_judgment(
+                self,
+                turn_context.as_ref(),
+                decision_prompt_path.as_str(),
+                rawr_tier_name(tier),
+                percent_remaining,
+                &boundaries_present,
+                last_agent_message.as_deref().unwrap_or(""),
+            )
+            .await
+            {
+                Ok(judgment) if !judgment.should_compact => {
+                    self.send_event(
+                        turn_context.as_ref(),
+                        EventMsg::Warning(WarningEvent {
+                            message: format!(
+                                "rawr auto-compaction skipped by judgment: {}",
+                                judgment.reason
+                            ),
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    self.send_event(
+                        turn_context.as_ref(),
+                        EventMsg::Warning(WarningEvent {
+                            message: format!(
+                                "rawr auto-compaction judgment failed; continuing with static policy: {err}"
+                            ),
+                        }),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        let do_scratch = crate::rawr_auto_compaction::rawr_should_schedule_scratch_write(
+            crate::rawr_auto_compaction::rawr_scratch_write_enabled(turn_context.config.as_ref()),
+            is_emergency,
+            &signals,
+        );
+        let configured_scratch_file = do_scratch.then(|| {
+            crate::rawr_auto_compaction::rawr_scratch_file_rel_path(
+                turn_context.config.as_ref(),
+                &turn_context.session_source,
+                &self.conversation_id,
+            )
+        });
+        let packet_author = crate::rawr_auto_compaction::rawr_auto_compaction_packet_author(
+            turn_context.config.as_ref(),
+        );
+        let agent_artifacts = if packet_author == RawrAutoCompactionPacketAuthor::Agent
+            || do_scratch
+        {
+            let packet_prompt = if packet_author == RawrAutoCompactionPacketAuthor::Agent {
+                let raw_packet_prompt = crate::rawr_auto_compaction::rawr_load_agent_packet_prompt(
+                    turn_context.config.as_ref(),
+                );
+                let raw_scratch_prompt = do_scratch.then(|| {
+                    crate::rawr_auto_compaction::rawr_load_scratch_write_prompt(
+                        turn_context.config.as_ref(),
+                    )
+                });
+                Some(
+                    crate::rawr_auto_compaction::rawr_build_agent_continuation_packet_prompt(
+                        raw_packet_prompt.as_str(),
+                        raw_scratch_prompt.as_deref().unwrap_or(""),
+                        do_scratch,
+                        configured_scratch_file.as_deref(),
+                        Some(self.conversation_id),
+                    ),
+                )
+            } else {
+                None
+            };
+            let scratch_prompt = if packet_author == RawrAutoCompactionPacketAuthor::Watcher {
+                configured_scratch_file.as_deref().map(|scratch_path| {
+                    crate::rawr_auto_compaction::rawr_build_scratch_write_prompt(
+                        crate::rawr_auto_compaction::rawr_load_scratch_write_prompt(
+                            turn_context.config.as_ref(),
+                        )
+                        .as_str(),
+                        scratch_path,
+                        Some(self.conversation_id),
+                    )
+                })
+            } else {
+                None
+            };
+            match crate::rawr_auto_compaction_model::request_rawr_auto_compaction_agent_artifacts(
+                self,
+                turn_context.as_ref(),
+                packet_prompt.as_deref(),
+                scratch_prompt.as_deref(),
+                rawr_tier_name(tier),
+                percent_remaining,
+                &boundaries_present,
+                last_agent_message.as_deref().unwrap_or(""),
+                configured_scratch_file.as_deref(),
+            )
+            .await
+            {
+                Ok(artifacts) => Some(artifacts),
+                Err(err) => {
+                    self.send_event(
+                        turn_context.as_ref(),
+                        EventMsg::Warning(WarningEvent {
+                            message: format!(
+                                "rawr pre-compact artifact generation failed; falling back: {err}"
+                            ),
+                        }),
+                    )
+                    .await;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let scratch_file = if let (Some(rel_path), Some(contents)) = (
+            configured_scratch_file.as_deref(),
+            agent_artifacts
+                .as_ref()
+                .and_then(|artifacts| artifacts.scratchpad_contents.as_deref())
+                .map(str::trim)
+                .filter(|contents| !contents.is_empty()),
+        ) {
+            match write_rawr_scratchpad(turn_context.as_ref(), rel_path, contents).await {
+                Ok(()) => Some(rel_path.to_string()),
+                Err(err) => {
+                    self.send_event(
+                        turn_context.as_ref(),
+                        EventMsg::Warning(WarningEvent {
+                            message: format!("rawr scratch write failed; continuing without scratch reference: {err}"),
+                        }),
+                    )
+                    .await;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let packet = match packet_author {
+            RawrAutoCompactionPacketAuthor::Watcher => {
+                crate::rawr_auto_compaction::rawr_build_watcher_post_compact_packet(
+                    crate::rawr_auto_compaction::rawr_load_watcher_packet_prompt(
+                        turn_context.config.as_ref(),
+                    )
+                    .as_str(),
+                    percent_remaining,
+                    &signals,
+                    last_agent_message.as_deref(),
+                    crate::rawr_auto_compaction::rawr_packet_max_tail_chars(
+                        turn_context.config.as_ref(),
+                    ),
+                )
+            }
+            RawrAutoCompactionPacketAuthor::Agent => agent_artifacts
+                .as_ref()
+                .and_then(|artifacts| artifacts.continuation_packet.as_deref())
+                .map(str::trim)
+                .filter(|packet| !packet.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    crate::rawr_auto_compaction::rawr_build_watcher_post_compact_packet(
+                        crate::rawr_auto_compaction::rawr_load_watcher_packet_prompt(
+                            turn_context.config.as_ref(),
+                        )
+                        .as_str(),
+                        percent_remaining,
+                        &signals,
+                        last_agent_message.as_deref(),
+                        crate::rawr_auto_compaction::rawr_packet_max_tail_chars(
+                            turn_context.config.as_ref(),
+                        ),
+                    )
+                }),
+        };
+
+        let compaction_context = if let Some(model) =
+            crate::rawr_auto_compaction::rawr_compaction_model(turn_context.config.as_ref())
+        {
+            Arc::new(
+                turn_context
+                    .with_model(model, &self.services.models_manager)
+                    .await,
+            )
+        } else {
+            Arc::clone(&turn_context)
+        };
+
+        let compaction_result =
+            if crate::compact::should_use_remote_compact_task(compaction_context.provider.info()) {
+                crate::compact_remote::run_inline_remote_auto_compact_task(
+                    Arc::clone(self),
+                    Arc::clone(&compaction_context),
+                    crate::compact::InitialContextInjection::BeforeLastUserMessage,
+                    CompactionReason::ContextLimit,
+                    CompactionPhase::StandaloneTurn,
+                )
+                .await
+            } else {
+                crate::compact::run_inline_auto_compact_task(
+                    Arc::clone(self),
+                    Arc::clone(&compaction_context),
+                    crate::compact::InitialContextInjection::BeforeLastUserMessage,
+                    CompactionReason::ContextLimit,
+                    CompactionPhase::StandaloneTurn,
+                )
+                .await
+            };
+
+        if let Err(err) = compaction_result {
+            self.send_event(
+                turn_context.as_ref(),
+                EventMsg::Warning(WarningEvent {
+                    message: format!("rawr auto-compaction failed: {err}"),
+                }),
+            )
+            .await;
+            return;
+        }
+        let handoff = crate::rawr_auto_compaction::rawr_build_post_compact_handoff_message(
+            packet,
+            scratch_file.as_deref(),
+        );
+        self.prepend_response_items_for_next_turn(vec![ResponseInputItem::from(vec![
+            UserInput::Text {
+                text: handoff,
+                text_elements: Vec::new(),
+            },
+        ])])
+        .await;
     }
 
     async fn take_active_turn(&self) -> Option<ActiveTurn> {
@@ -751,6 +1137,41 @@ impl Session {
             .await
             .clear_turn(&task.turn_context.sub_id);
     }
+}
+
+fn rawr_tier_name(tier: crate::rawr_auto_compaction::RawrAutoCompactionTier) -> &'static str {
+    match tier {
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Early => "early",
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Ready => "ready",
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Asap => "asap",
+        crate::rawr_auto_compaction::RawrAutoCompactionTier::Emergency => "emergency",
+    }
+}
+
+async fn write_rawr_scratchpad(
+    turn_context: &TurnContext,
+    rel_path: &str,
+    contents: &str,
+) -> std::io::Result<()> {
+    let path = turn_context.cwd.join(rel_path);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let existing_len = tokio::fs::metadata(&path)
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await?;
+    if existing_len > 0 {
+        file.write_all(b"\n\n").await?;
+    }
+    file.write_all(contents.trim().as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    Ok(())
 }
 
 #[cfg(test)]

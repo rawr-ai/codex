@@ -215,6 +215,8 @@ pub enum Feature {
     ResponsesWebsocketsV2,
     /// Enable workspace dependency support.
     WorkspaceDependencies,
+    /// Enable RAWR automatic post-turn compaction policy.
+    RawrAutoCompaction,
 }
 
 impl Feature {
@@ -1025,6 +1027,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "workspace_dependencies",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::RawrAutoCompaction,
+        key: "rawr_auto_compaction",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
 ];
 

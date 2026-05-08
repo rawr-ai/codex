@@ -20,6 +20,7 @@ use crate::types::Notice;
 use crate::types::OAuthCredentialsStoreMode;
 use crate::types::OtelConfigToml;
 use crate::types::PluginConfig;
+use crate::types::RawrAutoCompactionToml;
 use crate::types::SandboxWorkspaceWrite;
 use crate::types::ShellEnvironmentPolicyToml;
 use crate::types::SkillsConfig;
@@ -353,6 +354,9 @@ pub struct ConfigToml {
     // Injects known feature keys into the schema and forbids unknown keys.
     #[schemars(schema_with = "crate::schema::features_schema")]
     pub features: Option<FeaturesToml>,
+
+    /// RAWR fork automatic compaction policy.
+    pub rawr_auto_compaction: Option<RawrAutoCompactionToml>,
 
     /// Suppress warnings about unstable (under development) features.
     pub suppress_unstable_features_warning: Option<bool>,
@@ -870,5 +874,94 @@ pub fn validate_oss_provider(provider: &str) -> std::io::Result<()> {
                 "Invalid OSS provider '{provider}'. Must be one of: {LMSTUDIO_OSS_PROVIDER_ID}, {OLLAMA_OSS_PROVIDER_ID}"
             ),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::RawrAutoCompactionMode;
+    use crate::types::RawrAutoCompactionPacketAuthor;
+    use crate::types::RawrAutoCompactionToml;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn rawr_auto_compaction_accepts_legacy_bool() {
+        let config: ConfigToml =
+            toml::from_str("rawr_auto_compaction = true\n").expect("config should parse");
+        assert_eq!(
+            config.rawr_auto_compaction,
+            Some(RawrAutoCompactionToml::Enabled(true))
+        );
+    }
+
+    #[test]
+    fn rawr_auto_compaction_accepts_structured_policy() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+[rawr_auto_compaction]
+mode = "auto"
+packet_author = "agent"
+scratch_write_enabled = true
+packet_max_tail_chars = 1200
+auto_compact_prompt_path = "auto-compact.md"
+scratch_write_prompt_path = "scratch-write.md"
+watcher_packet_prompt_path = "watcher-packet.md"
+judgment_context_prompt_path = "judgment-context.md"
+scratch_file_template = ".scratch/agent-{agentName}.scratch.md"
+
+[rawr_auto_compaction.semantic_signals]
+agent_done_phrases = ["wrapped"]
+agent_done_negative_phrases = ["not wrapped"]
+topic_shift_phrases = ["moving next"]
+concluding_thought_phrases = ["carry forward"]
+
+[rawr_auto_compaction.policy.early]
+percent_remaining_lt = 90
+requires_any_boundary = ["turn_complete"]
+"#,
+        )
+        .expect("config should parse");
+        let Some(RawrAutoCompactionToml::Config(rawr)) = config.rawr_auto_compaction else {
+            panic!("expected structured rawr config");
+        };
+        assert_eq!(rawr.mode, Some(RawrAutoCompactionMode::Auto));
+        assert_eq!(
+            rawr.packet_author,
+            Some(RawrAutoCompactionPacketAuthor::Agent)
+        );
+        assert_eq!(rawr.scratch_write_enabled, Some(true));
+        assert_eq!(rawr.packet_max_tail_chars, Some(1200));
+        assert_eq!(
+            rawr.auto_compact_prompt_path.as_deref(),
+            Some("auto-compact.md")
+        );
+        assert_eq!(
+            rawr.scratch_write_prompt_path.as_deref(),
+            Some("scratch-write.md")
+        );
+        assert_eq!(
+            rawr.watcher_packet_prompt_path.as_deref(),
+            Some("watcher-packet.md")
+        );
+        assert_eq!(
+            rawr.judgment_context_prompt_path.as_deref(),
+            Some("judgment-context.md")
+        );
+        assert_eq!(
+            rawr.scratch_file_template.as_deref(),
+            Some(".scratch/agent-{agentName}.scratch.md")
+        );
+        let semantic_signals = rawr.semantic_signals.as_ref().expect("semantic signals");
+        assert_eq!(
+            semantic_signals.agent_done_phrases.as_deref(),
+            Some(&["wrapped".to_string()][..])
+        );
+        let early = rawr
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.early.as_ref())
+            .expect("early policy");
+        assert_eq!(early.percent_remaining_lt, Some(90));
     }
 }

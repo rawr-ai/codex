@@ -1462,6 +1462,8 @@ impl Session {
         self.services
             .rollout_thread_trace
             .record_tool_call_event(turn_context.sub_id.clone(), &legacy_source);
+        self.record_rawr_auto_compaction_signal(turn_context, &legacy_source)
+            .await;
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
@@ -1481,6 +1483,43 @@ impl Session {
                 msg: legacy,
             };
             self.send_event_raw(legacy_event).await;
+        }
+    }
+
+    async fn record_rawr_auto_compaction_signal(&self, turn_context: &TurnContext, msg: &EventMsg) {
+        if !turn_context.features.enabled(Feature::RawrAutoCompaction) {
+            return;
+        }
+
+        if !matches!(
+            msg,
+            EventMsg::PlanUpdate(_) | EventMsg::ExecCommandEnd(_) | EventMsg::TurnComplete(_)
+        ) {
+            return;
+        }
+
+        let Some(turn_state) = self.turn_state_for_sub_id(&turn_context.sub_id).await else {
+            return;
+        };
+        let mut turn_state = turn_state.lock().await;
+        match msg {
+            EventMsg::PlanUpdate(update) => {
+                turn_state.note_rawr_plan_update(update);
+            }
+            EventMsg::ExecCommandEnd(event) => {
+                crate::rawr_auto_compaction::rawr_note_exec_command_end(
+                    turn_state.rawr_auto_compaction_signals_mut(),
+                    event,
+                );
+            }
+            EventMsg::TurnComplete(event) => {
+                crate::rawr_auto_compaction::rawr_note_completion_message(
+                    turn_state.rawr_auto_compaction_signals_mut(),
+                    turn_context.config.as_ref(),
+                    event.last_agent_message.as_deref(),
+                );
+            }
+            _ => {}
         }
     }
 
@@ -3091,6 +3130,17 @@ impl Session {
         turn_state.lock().await.has_memory_citation = true;
     }
 
+    pub(crate) async fn rawr_auto_compaction_signals_for_turn(
+        &self,
+        sub_id: &str,
+    ) -> crate::rawr_auto_compaction::RawrAutoCompactionSignals {
+        let turn_state = self.turn_state_for_sub_id(sub_id).await;
+        let Some(turn_state) = turn_state else {
+            return crate::rawr_auto_compaction::RawrAutoCompactionSignals::default();
+        };
+        turn_state.lock().await.rawr_auto_compaction_signals()
+    }
+
     async fn turn_state_for_sub_id(
         &self,
         sub_id: &str,
@@ -3184,6 +3234,18 @@ impl Session {
 
         let mut idle_pending_input = self.idle_pending_input.lock().await;
         idle_pending_input.extend(items);
+    }
+
+    /// Queue response items ahead of any pending next-turn input.
+    pub(crate) async fn prepend_response_items_for_next_turn(&self, items: Vec<ResponseInputItem>) {
+        if items.is_empty() {
+            return;
+        }
+
+        let mut idle_pending_input = self.idle_pending_input.lock().await;
+        let mut next_items = items;
+        next_items.extend(std::mem::take(&mut *idle_pending_input));
+        *idle_pending_input = next_items;
     }
 
     pub(crate) async fn take_queued_response_items_for_next_turn(&self) -> Vec<ResponseInputItem> {

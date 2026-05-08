@@ -7,6 +7,49 @@ Goal: run the fork side-by-side with upstream Codex without sharing state by def
 - Install this fork as `codex-rawr`.
 - Fork wrappers/scripts default `CODEX_HOME=~/.codex-rawr` when `CODEX_HOME` is unset.
 
+## Reversible switchboard (preferred for switching all consumers)
+If you need a single command that flips local Codex consumers between upstream
+Codex and the RAWR fork, install the switchboard:
+
+```bash
+bash rawr/codex-switch/install.sh --target upstream
+```
+
+Then switch targets with:
+
+```bash
+~/.codex-switch/bin/codex-use upstream
+~/.codex-switch/bin/codex-use rawr
+~/.codex-switch/bin/codex-use status
+~/.codex-switch/bin/codex-use doctor
+```
+
+The switchboard controls both the binary and `CODEX_HOME`:
+
+| Target | Binary | Home |
+| --- | --- | --- |
+| `upstream` | Homebrew `codex` at `/opt/homebrew/bin/codex` or `/usr/local/bin/codex` when present, otherwise `~/.volta/bin/codex` | `~/.codex` |
+| `rawr` | `~/.local/bin/codex-rawr-bin` | `~/.codex-rawr` |
+
+It installs a stable selector at `~/.codex-switch/bin/codex`, then reconciles
+known consumers to that selector: shell startup blocks, `~/.local/bin/codex`,
+`~/.bun/bin/codex`, VS Code's `chatgpt.cliExecutable`, launchd GUI env, Happy
+daemon restarts, and the Codex Desktop helper on macOS.
+
+Use `doctor` after every switch. Running processes do not change retroactively:
+Happy is restarted by default, while Codex Desktop is reported as
+`Needs restart` until the app-server is restarted.
+
+Uninstall is manifest-backed and non-destructive toward config homes and stale
+global installs:
+
+```bash
+~/.codex-switch/bin/codex-use uninstall
+```
+
+See `rawr/codex-switch/README.md` for details and path override environment
+variables.
+
 ## Launcher surfaces are separate
 Changing one launcher does not automatically change the others:
 
@@ -16,6 +59,11 @@ Changing one launcher does not automatically change the others:
 | Happy Coder | The `codex` resolved by Happy's daemon environment | Use `rawr/publish-local.sh --happy --force` or `rawr/release-local.sh`, then restart Happy so it sees the wrapper/symlink. |
 | VS Code / IDE extensions | Extension-managed Codex integration, not the Desktop app bundle | Configure the extension separately; shell `PATH` and Desktop bundle patching do not guarantee the IDE uses the fork. |
 | Codex Desktop | The helper binary bundled inside `Codex.app` | Patch `/Applications/Codex.app/Contents/Resources/codex` explicitly; shell wrappers do not affect it. |
+
+The switchboard is the preferred way to coordinate those separate surfaces when
+you want reversible `upstream`/`rawr` switching. The lower-level commands below
+remain useful for one-off installs, manual debugging, or legacy RAWR-only
+adoption.
 
 ## Local install (macOS/Linux)
 ```bash
